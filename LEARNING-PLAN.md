@@ -76,13 +76,62 @@ npm run check    # lint + format + 类型检查，改完 core 代码必跑
 
 用的是 DashScope（阿里百炼）的 OpenAI 兼容端点，模型 `qwen3.7-plus`。配置在 `~/.pi/agent/models.json`：
 
-- **密钥不落第二份**：`apiKey` 用了 pi 支持的 `"!command"` 形式，在每次请求时从 `helloagents-ch10/.env` 的 `LLM_API_KEY` 现读。改 .env 即生效，不存在两处密钥不同步的问题。
+- **密钥存在 macOS 钥匙串**，配置里不含明文（详见下方「密钥存储」）。
 - **compat 参数不是猜的**：直接抄自 pi 内置的 `qwen-token-plan` provider（`packages/ai/src/providers/data/qwen-token-plan.json`），它用的是同为阿里 `compatible-mode/v1` 的端点：`thinkingFormat: "qwen"`、`supportsDeveloperRole: false`、`supportsStore: false`、`supportsReasoningEffort: false`。
 - **模型参数同样抄自内置目录**：ctx 1M / maxTokens 65536 / reasoning / text+image。
 
 验证：`./pi-test.sh --list-models | grep dashscope` 能看到该模型且状态可用。
 
 > 顺带一提：这套 `models.json` 的解析逻辑（`$ENV_VAR` 插值、`!command` 执行、provider 级与 model 级 compat 覆盖）本身就是阶段 1 的好材料——它是 `packages/ai` provider 抽象层暴露给用户的那一面。
+
+### 密钥存储
+
+`~/.pi/agent/models.json` 里的 `apiKey` 字段存的**不是密钥本身，而是一条取密钥的命令**：
+
+```json
+"apiKey": "!security find-generic-password -ws pi-dashscope"
+```
+
+开头的 `!` 是 pi 的语法（见 `docs/models.md` 的 Value Resolution 一节）：把整个字符串当 shell 命令执行，用 stdout 作为密钥，**每次发请求时才现取**。所以配置文件里没有任何明文凭据。
+
+**密钥实际存放位置**：macOS 登录钥匙串 `~/Library/Keychains/login.keychain-db`，条目服务名 `pi-dashscope`。这是个加密的二进制文件，解密密钥来自你的登录密码，macOS 在登录时自动解锁。
+
+**为什么是登录钥匙串而不是系统钥匙串**：
+
+| | login.keychain-db | System.keychain |
+|---|---|---|
+| 归属 | 当前用户 | 整台机器（root） |
+| 解锁时机 | 用户登录时自动解锁 | 开机即可用，无需登录 |
+| 可读范围 | 只有你 | 所有用户和后台守护进程 |
+| 写入 | 直接写 | 需要 sudo |
+
+WiFi 密码必须放 System，因为登录界面就要连网，那时 login 钥匙串还锁着。个人 API key 情况相反——只有你跑 pi 时才需要，放 System 会把可读范围扩大到全机所有用户和进程，**放大了权限却换不来任何好处**。
+
+**常用命令**：
+
+```bash
+security find-generic-password -s  pi-dashscope        # 看元数据，不弹窗
+security find-generic-password -ws pi-dashscope        # 看明文，会要求授权
+security add-generic-password -a "$USER" -s pi-dashscope -w "新密钥" -U   # 更新
+security delete-generic-password -s pi-dashscope       # 删除
+```
+
+**GUI 里为什么看不到**：要用「钥匙串访问」App（`open -a "Keychain Access"` → 左侧「登录」→ 搜 `pi-dashscope`），**不是**「密码」App。
+
+「密码」App 不是钥匙串浏览器，它只展示 Apple 定义的几个固定类别：密码（网站/App 登录）、通行密钥、Wi-Fi、验证码、安全建议。Wi-Fi 是被专门做成一个类别才显示的；`pi-dashscope` 这种第三方 CLI 用自定义服务名创建的通用密码在这套分类里没有归属，所以不展示——不是没存成功，是那个 App 不负责展示它。实测两者其实是同一类别（都是 `genp`，generic password），区别只在 Apple 有没有为它做专门的展示类别。
+
+**换到 Windows / Linux 怎么办**：`~/.pi/agent/models.json` 在用户目录下，**不在本仓库里，也不被 git 跟踪**，所以它天然是每台机器一份。换系统不是"迁移"，而是在新机器上重写一份，只需把 `apiKey` 那一行换成该平台的取法：
+
+```jsonc
+// macOS
+"apiKey": "!security find-generic-password -ws pi-dashscope"
+// Linux（libsecret / GNOME Keyring）
+"apiKey": "!secret-tool lookup service pi-dashscope"
+// Windows（凭据管理器）
+"apiKey": "!powershell -c \"(Get-StoredCredential -Target pi-dashscope).GetNetworkCredential().Password\""
+```
+
+想要一份三平台通用的配置，就改用环境变量引用 `"apiKey": "$DASHSCOPE_API_KEY"`，把平台差异隔离到各自的 shell 配置里。但**在单机学习阶段没必要提前做这层抽象**——真需要时改一行的成本几乎为零。
 
 其他可选路径：
 
