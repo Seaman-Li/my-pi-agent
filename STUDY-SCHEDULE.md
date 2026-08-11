@@ -55,9 +55,37 @@ cd /Users/simonli/Downloads/MyProjects/PiAgent
 
 ### Day 2 — `ai` 层：项目的词汇表
 
-- **主线**：`packages/ai/src/types.ts`（821 行，全读）
-- **重点**：Message / Content block 的联合类型、Tool 定义、Stream 事件类型
-- **验证**：把 Day 1 三份 JSONL 里出现的**每一个** block 类型（`text` / `thinking` / `toolCall` / `toolResult`），都在 `types.ts` 里找到对应定义。找不全说明没读透。
+> **只读 `packages/ai/src/types.ts` 的 332–537 行**（206 行），不要通读全文 821 行。
+> 类型定义文件是词典不是教材——通读记不住，查着用才记得住。其余 600 行按下表用到再查。
+
+- **主线**：`types.ts:332-537`。这一段恰好连续，且与 session JSONL 一一对应：
+
+  | 行 | 类型 | JSONL 里的对应物 |
+  |---|---|---|
+  | 338 | `TextContent` | `blocks=text` |
+  | 344 | `ThinkingContent` | `blocks=thinking` |
+  | 354 | `ImageContent` | 图片附件 |
+  | 360 | `ToolCall` | `blocks=toolCall` |
+  | 368 | `Usage` | `[in=1550 out=38]` |
+  | 391 | `StopReason` | 循环终止原因 |
+  | 407 | `UserMessage` | `role=user` |
+  | 413 | `AssistantMessage` | `role=assistant` |
+  | 430 | `ToolResultMessage` | `role=toolResult` |
+  | 448 | `Message` | 三者的联合类型 |
+  | 495 | `Tool` | 工具定义 |
+  | 502 | `Context` | 发给模型的完整上下文 |
+  | 516 | `AssistantMessageEvent` | 流式事件 |
+
+- **其余部分，用到再查**（不要提前读）：
+
+  | 区段 | 内容 | 何时查 |
+  |---|---|---|
+  | 17–120 | provider/api 标识符、thinking 档位、`ThinkingLevelMap` | Day 3 读模型目录 |
+  | 120–330 | `StreamOptions`、`ProviderRequestOptions`、`onPayload` 钩子 | Day 4 读 adapter |
+  | 538–821 | `OpenAICompletionsCompat`（`models.json` 里那些 compat 字段） | 配 provider 出问题时 |
+
+- **方法（比顺序更重要）**：**从数据反查类型，不要从类型想象数据。** 打开 Day 1 的 JSONL，看到不认识的字段再回 `types.ts` 搜定义。这样每个类型都挂在一个你亲眼见过的具体值上。
+- **验证**：Day 1 三份 JSONL 里出现的每一个 block 类型（`text` / `thinking` / `toolCall` / `toolResult`），都能在上表里指出定义位置。
 
 ### Day 3 — `ai` 层：模型目录与 provider 注册
 
