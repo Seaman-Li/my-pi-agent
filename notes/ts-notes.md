@@ -40,6 +40,26 @@ type ReadToolInput = Static<typeof readSchema>;           // 值 →(typeof)→ 
 
 > Python 类比：Python 没有这么强的分离。`TypedDict` 类既是类型也是运行时对象，`typing.get_type_hints()` 勉强对应 `typeof`。
 
+**可运行验证**：[examples/type-erasure.ts](examples/type-erasure.ts)
+
+```bash
+node --experimental-strip-types notes/examples/type-erasure.ts
+```
+
+编译前后对比（`type` 开头的整行消失，`const` 保留）：
+
+| 源码 | 编译产物 |
+|---|---|
+| `type A = { path: string };` | **整行消失** |
+| `type C = Static<typeof B>;` | **整行消失** |
+| `const B = Type.Object({...})` | ✅ 原样保留 |
+| `import { Type, type Static }` | → `import { Type }` |
+| `const a1: A = {...}` | → `const a1 = {...}` |
+
+`JSON.stringify(B)` 能跑；`JSON.stringify(A)` **连编译都过不了**——`A` 不是值。**这就是 pi 必须用 typebox 而不能只用 TS 类型的原因：工具定义要发给模型，发送需要值。**
+
+`import { Type, type Static }` 里那个 `type` 前缀，作用是告诉编译器"这个导入只用于类型，编译时删掉"。`types.ts:471` 的 `import type { TSchema } from "typebox"` 是同一件事的完整形式——整行编译后消失。
+
 ---
 
 ## 2. 泛型的三段式：`T extends C = D`
@@ -243,6 +263,112 @@ CLI 和 SDK 都用不到那个分支（`agent-session.ts:1399` 一律包装成�
 > **类型描述的是可能性空间，数据才是事实。**
 
 `packages/ai` 为兼容 N 家 provider 故意留了大量宽松分支，实际走到的往往只有一条。看到联合类型的分支，先 `grep -c` 数调用点再下结论。详见 [agent-factcheck.md](agent-factcheck.md)。
+
+---
+
+## 9. typebox 不是 TS 自带的
+
+读 `types.ts` 时最容易混的一点。**分清三类东西**：
+
+| 类别 | 例子 | 来源 | 要 import 吗 |
+|---|---|---|---|
+| **TS 语法** | `interface` / `type` / `extends` / `\|` / `[]` / 泛型 `<T>` | 语言本身 | 不需要 |
+| **TS 内置工具类型** | `Partial<>` / `Record<>` / `Pick<>` / `Omit<>` / `ReturnType<>` | 语言本身（全局可用） | 不需要 |
+| **typebox 提供的** | `TSchema` / `TObject` / `Type.Object` / `Static<>` | **第三方 npm 包** | **必须 import** |
+
+**判别方法：要不要 import。** 同一个 `types.ts` 里，`Partial`/`Record` 白用（第 84 行），`TSchema` 必须导入（第 471 行）。
+
+`typebox: "1.3.7"` 是 `packages/ai/package.json` 里明写的依赖。
+
+### `Type.Object` 不是「TS 的对象」
+
+名字有迷惑性。`Type` 是 typebox 导出的一个**普通 JS 对象**，上面挂着 `Object` / `String` / `Number` / `Array` / `Optional` 等一堆**构造 JSON Schema 的函数**。它和 TS 的对象类型 `{ path: string }` 毫无关系。
+
+### `TSchema` / `TObject` / `readSchema` 三者的关系
+
+```
+interface TSchema {}                    ← 空的基接口（纯标记）
+        ▲ extends
+interface TObject extends TSchema {     ← 具体种类，有真实字段
+    '~kind': 'Object';
+    type: 'object';
+    properties: Properties;
+    required: TRequiredArray<Properties>;
+}
+        ▲ 类型是
+const readSchema = Type.Object({...})   ← 你的那个值
+```
+
+`Type.Object()` 的返回类型是 **`TObject<Properties>`**，不是 `TSchema`。所以 `readSchema` 和 `TSchema` 之间**隔了两层**——说"满足 `TSchema`"没错，但真正描述它形状的是中间那层 `TObject`。
+
+**`Static<>` 靠的正是 `TObject` 这层的具体字段**：它读 `properties` 和 `required` 才能推出 `{path: string; offset?: number}`。如果返回类型真的只是空的 `TSchema`，`Static<>` 什么都推不出来。
+
+### 为什么基接口是空的
+
+`interface TSchema {}` 空着不是偷懒——它要容纳所有 schema 种类，而这些子类型**字段互不相同**（`TObject` 有 `properties`，`TArray` 有 `items`，`TUnion` 有 `anyOf`），公共字段是空集。
+
+代价：`extends TSchema` 这个约束在编译期几乎不设防。
+
+```ts
+Tool<{ foo: 1 }>   // ✅ 能过，空接口拦不住普通对象
+Tool<string>       // ❌ 报错，基本类型不是对象
+```
+
+真正的校验靠运行时的类型守卫 `IsSchema(value): value is TSchema`。**约束的实际强度比看起来弱。**
+
+### 运行时长什么样
+
+`Type.Object({...})` 求值后就是一个普通对象（`constructor === Object`），内容是标准 JSON Schema：
+
+```json
+{
+  "type": "object",
+  "required": ["path"],
+  "properties": {
+    "path":   { "type": "string", "description": "..." },
+    "offset": { "type": "number", "description": "..." },
+    "limit":  { "type": "number", "description": "..." }
+  }
+}
+```
+
+`TObject` 声明的 `'~kind': 'Object'` **不在 JSON 里**——`~` 前缀是 typebox 标记"非 JSON Schema 标准字段"的约定，序列化时剔除，保证发给 LLM 的是干净的标准 schema。
+
+`Type.Optional(...)` 做的事就是**把该字段排除出 `required` 数组**，对应到派生类型就是 `offset?: number`。
+
+### 一份定义，两处生效
+
+```
+        readSchema（运行时对象）
+              ├──→ JSON.stringify 后塞进 HTTP 请求体，告诉 LLM 工具怎么调
+              │     （见 openai-completions.ts:1366，注释写着
+              │      "TypeBox already generates JSON Schema"）
+              └──→ Static<typeof readSchema>，工具实现里 input.path 有补全和检查
+```
+
+### 和 Python 的 `@dataclass` / Pydantic 对比
+
+| | `@dataclass` | Pydantic | typebox |
+|---|---|---|---|
+| 生成 `__init__`/`__repr__` | ✅ 核心功能 | ✅ | ❌ 完全不做 |
+| 产出 JSON Schema | ❌ | ✅ `.model_json_schema()` | ✅ **本体就是** |
+| 运行时校验 | ❌ | ✅ | 有能力，但 **pi 没用**（只 import 了 `Type`/`Static`/`TSchema`，没导入 `Value`） |
+
+**最接近的是 Pydantic，不是 `@dataclass`。而且派生方向是反的**：
+
+```python
+# Python：先有类，再导出 schema（类是运行时对象，可反射）
+class ReadInput(BaseModel): path: str
+schema = ReadInput.model_json_schema()      # 类 → schema
+```
+
+```ts
+// TS：先有 schema，再导出类型（类型运行时不存在，无从反射）
+const readSchema = Type.Object({ path: Type.String() });
+type ReadToolInput = Static<typeof readSchema>;   // schema → 类型
+```
+
+**方向必须反过来，是被类型擦除逼的。** 同类库还有 zod（更流行）——pi 选 typebox 是因为它直接产出标准 JSON Schema，而 zod 需要 `zod-to-json-schema` 多转一层，而 LLM 工具定义要的正是 JSON Schema。
 
 ---
 
