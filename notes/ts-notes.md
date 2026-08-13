@@ -25,10 +25,63 @@ interface Tool<TParameters extends TSchema = TSchema>   // 类型空间：默认
 | `readSchema` | **值**（对象） | `Type.Object({...})` 的返回结果，真实的 JSON Schema |
 | `ReadToolInput` | **类型** | 由 `Static<typeof readSchema>` 提取 |
 
+### 哪些声明进入哪个空间
+
+| 声明 | 值空间 | 类型空间 |
+|---|---|---|
+| `type A = ...` | ❌ | ✅ |
+| `interface I {}` | ❌ | ✅ |
+| `const` / `let` / `var` | ✅ | ❌ |
+| `function` | ✅ | ❌ |
+| `class C {}` | ✅ | ✅ **两个都进** |
+| `enum E {}` | ✅ | ✅ 两个都进 |
+
+`class` 的双身份让这行合法：`const c: C = new C()`——左边当类型（实例形状），右边当值（构造函数）。**这正是 Java/Python 背景的人用 class 不别扭、一碰 interface 就懵的原因。**
+
+### 位置决定空间
+
+判断标准是**语法位置**，不是名字：
+
+```ts
+const x: A = ...        // 冒号右边        → 类型空间
+function f(p: A): A     // 参数标注/返回值  → 类型空间
+type B = A              // type 等号右边    → 类型空间
+expr as A               // 断言            → 类型空间
+Tool<A>                 // 尖括号内         → 类型空间
+
+console.log(A)          // 函数实参        → 值空间
+const y = A             // 等号右边（非 type）→ 值空间
+new A()                 // new 后面        → 值空间
+```
+
+### 越界的两个方向
+
+| 错误码 | 消息 | 方向 | 有救吗 |
+|---|---|---|---|
+| `TS2693` | `'A' only refers to a type, but is being used as a value here` | 类型 → 值 | **无解** |
+| `TS2749` | `'b' refers to a value, but is being used as a type here. Did you mean 'typeof b'?` | 值 → 类型 | 用 `typeof` |
+
+`TS2693` 无解，因为**类型编译后真的不存在**。跑 [examples/value-vs-type-space.ts](examples/value-vs-type-space.ts) 能看到实证：
+
+```
+运行时访问类型 A → ReferenceError: A is not defined
+```
+
+编译器那句报错拦截的正是这个必然发生的 `ReferenceError`——**不是语法不允许，是运行时没有那个东西**。
+
 **跨越两个空间的桥梁**：
 
-- `typeof value` —— 从**值**反推**类型**（注意：与 JS 运行时的 `typeof` 是两回事，只是长得一样）
+- `typeof value` —— 从**值**反推**类型**。**单向**，只有值→类型这一条路。
 - `Static<T>` —— typebox 提供，把 schema 类型转成普通 TS 类型
+
+⚠️ **两个 `typeof` 是完全不同的东西**，只是长得一样：
+
+```ts
+console.log(typeof b);   // 值空间：运行时求值 → 字符串 "object"
+type TB = typeof b;      // 类型空间：编译期提取 → { path: string }
+```
+
+`Static<typeof readSchema>` 用的是类型空间那个。
 
 ```ts
 const readSchema = Type.Object({ path: Type.String() });  // 值

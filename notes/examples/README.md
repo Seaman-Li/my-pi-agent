@@ -5,13 +5,23 @@
 | 文件 | 验证什么 | 对应笔记 |
 |---|---|---|
 | [type-erasure.ts](type-erasure.ts) | TS 类型编译后消失，typebox 的 schema 是运行时的值 | ts-notes 第 1 条 |
+| [value-vs-type-space.ts](value-vs-type-space.ts) | 值空间/类型空间的边界，`TS2693` 与 `TS2749` 两个方向的越界 | ts-notes 第 1 条 |
 
 ## 运行
 
 ```bash
 cd /Users/simonli/Downloads/MyProjects/PiAgent
 node --experimental-strip-types notes/examples/type-erasure.ts
+node --experimental-strip-types notes/examples/value-vs-type-space.ts
 ```
+
+`value-vs-type-space.ts` 的最后一行输出是重点：
+
+```
+运行时访问类型 A → ReferenceError: A is not defined
+```
+
+编译器那句 `'A' only refers to a type, but is being used as a value here`，拦截的正是这个必然发生的 `ReferenceError`。**不是语法不允许，是运行时真的没有那个东西。**
 
 `--experimental-strip-types` 是 Node 22+ 的类型剥离模式——**只删类型，不做类型检查**，所以跑得很快。pi 自己也用这个模式（见 `AGENTS.md` 里"只用 erasable TypeScript 语法"那条规则的由来）。
 
