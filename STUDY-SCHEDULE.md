@@ -44,6 +44,7 @@ cd /Users/simonli/Downloads/MyProjects/PiAgent
   - `type` / `interface` 的区别
   - 泛型 `<T>`
   - **可辨识联合（discriminated union）**——最重要，pi 用它表达所有消息和事件类型，对应 Python 的 `Union` + `Literal` 标签字段
+- **随时查**：[notes/ts-notes.md](notes/ts-notes.md) 汇总了读源码过程中撞到的 TS 疑难点（类型空间 vs 值空间、结构化类型、`(A|B)[]` 优先级、`Partial<Record<>>` 三态等），每条都附 pi 里的真实出处和 Python 类比。**遇到不懂的语法先查它，查不到再问**，问完补进去。
 - **验证动作**：跑三个复杂度递增的 prompt，各导一份 session JSONL 对比：
   ```bash
   # 1 无工具  2 单轮工具  3 多轮工具
