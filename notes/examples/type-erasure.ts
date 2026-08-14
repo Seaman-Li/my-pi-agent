@@ -30,13 +30,13 @@ console.log("a1 =", a1, " c1 =", c1);
 // 关键：B 能被序列化发给 LLM，A 不能——它在运行时根本不存在
 console.log("能发给 LLM 的：", JSON.stringify(B));
 
-/* ─────────────────────────────────────────────────────────────
- * 取消注释逐个试，三个都会在「编译期」被拦下：
- *
- * console.log(A);              // ❌ "A" 只表示类型，不能用作值
- * const bad: A = { path: 1 };  // ❌ number 不能赋给 string
- * const c2: C = { path: 1 };   // ❌ 同样被拦
- *
+// 取消注释逐个试，三个都会在「编译期」被拦下：
+ 
+//  console.log(A);              // ❌ "A" 只表示类型，不能用作值
+//  const bad: A = { path: 1 };  // ❌ number 不能赋给 string
+//  const c2: C = { path: 1 };   // ❌ 同样被拦
+ 
+ /* ─────────────────────────────────────────────────────────────
  * 第三个最值得试：它证明 Static<typeof B> 不是退化成 any，
  * 而是真的从 B 里提取出了 { path: string }。
  * 因为 Type.Object() 返回的是 TObject<Properties> 而非 TSchema，

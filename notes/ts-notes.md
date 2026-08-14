@@ -425,6 +425,88 @@ type ReadToolInput = Static<typeof readSchema>;   // schema → 类型
 
 ---
 
+## 10. 有标注 vs 靠推断
+
+`const a: A = {...}` 和 `const a = {...}` 差在哪。**可运行验证**：[examples/annotation-vs-inference.ts](examples/annotation-vs-inference.ts)
+
+### 形状相同时，两者等价
+
+```ts
+const x1: A = { path: "/tmp" };   // 类型 A
+const x2   = { path: "/tmp" };    // 推断为 { path: string }，能赋给 A
+```
+
+差异出现在下面三种情况。
+
+### ① 缺字段：标注把错误提前到「声明处」
+
+```ts
+const y1: A = {};   // ❌ TS2741: Property 'path' is missing
+const y2   = {};    // ✅ 不报错，类型就是 {}——等到用的时候才炸
+```
+
+出问题时离现场更近，是加标注的主要收益之一。
+
+### ② 多字段：标注触发多余属性检查
+
+```ts
+const z1: A = { path: "/t", extra: 1 };   // ❌ TS2353: 'extra' does not exist in type 'A'
+const z2   = { path: "/t", extra: 1 };    // ✅ 类型是 { path: string; extra: number }
+const z3: A = z2;                          // ✅ 通过——中转后就不查了
+```
+
+多余属性检查**只作用于直接字面量赋值**（详见第 3 条）。设计意图是抓 `text` 写成 `txt` 这类拼写错误。
+
+### ③ 字面量拓宽（widening）—— pi 里最要命的一条
+
+```ts
+type TextContent = { type: "text"; text: string };
+
+const w2 = { type: "text", text: "hi" };   // 推断为 { type: string; text: string }
+//                                                        ↑ "text" 被拓宽成 string
+const w3: TextContent = w2;                // ❌ Type 'string' is not assignable to type '"text"'
+```
+
+**无标注时字符串字面量会被拓宽成 `string`**（TS 假设你以后可能改这个值）。而 `TextContent.type` 要的是字面量类型 `"text"`，`string` 太宽，赋不回去。
+
+**这直接影响 pi 里所有可辨识联合**（第 4 条）。`w1` 和 `w2` 运行时输出完全一样，差异纯在编译期——所以这个坑不容易发现。
+
+绕过拓宽的两种写法：
+
+```ts
+const w4 = { type: "text", text: "hi" } as const;   // 整个对象只读 + 字面量
+const w5 = { type: "text" as const, text: "hi" };   // 只锁 type 一个字段
+```
+
+### pi 的实际做法
+
+```ts
+// openai-completions.ts:274,352 —— 先声明带类型的变量，再赋值
+let textBlock: TextContent | null = null;
+textBlock = { type: "text", text: "" };     // 有上下文类型，不拓宽
+
+// agent-session.ts:1399 —— 数组加标注，保证元素类型精确
+const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
+
+// read.ts:16 —— 不加标注
+const readSchema = Type.Object({ ... });
+```
+
+最后一个**故意不加**：`Type.Object()` 返回 `TObject<Properties>`，泛型参数已把结构带出来。**加标注反而丢信息**——标成 `TSchema` 的话 `Static<>` 就什么都推不出来了（见第 9 条）。
+
+### 什么时候加
+
+| 场景 | 建议 |
+|---|---|
+| 值要参与**可辨识联合** | **必须加**，否则字面量被拓宽 |
+| 想让错误早点暴露 | 加 |
+| 想启用多余属性检查 | 加 |
+| 函数返回值（对外契约） | 通常加 |
+| 局部临时变量、类型显而易见 | 不加，让推断做事 |
+| 返回值已带精确泛型（如 `Type.Object()`） | **不加**，加了丢信息 |
+
+---
+
 ## 待补
 
 遇到再加：
