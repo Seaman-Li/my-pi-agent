@@ -92,18 +92,28 @@ cd /Users/simonli/Downloads/MyProjects/PiAgent
 
 > **不要细读 `models.ts` 的 944 行。** 唯一目标：**能说清 `~/.pi/agent/models.json` 里的 dashscope 是怎么进入模型目录的**。说得出这条链路就算过。
 
-- **只追一条链路**（都在 `packages/coding-agent/src/core/`）：
+- **只追一条链路**（行号已核对，基于 `v0.84.1`）：
 
-  ```
-  ~/.pi/agent/models.json
-    → config.ts:530            getModelsPath()
-    → model-runtime.ts:176     ModelConfig.load(modelsPath)
-    → model-runtime.ts:269     rebuildProviders()
-    → model-runtime.ts:~240    recomposeProvider("dashscope")
-    → provider-composer.ts:420 composeModelProvider()
-    → this.models.setProvider()   注册进目录
-    → model-runtime.ts:276     updateModelSnapshot()
-    → --list-models 显示出来
+  | # | 文件（仓库相对路径） | 行 | 做什么 |
+  |---|---|---|---|
+  | 0 | `~/.pi/agent/models.json` | — | 你写的配置 |
+  | 1 | `packages/coding-agent/src/config.ts` | **529** | `getModelsPath()` 拼出路径 |
+  | 2 | `packages/coding-agent/src/core/model-config.ts` | **245** | `ModelConfig.load()` 读文件、解析 JSON |
+  | 3 | `packages/coding-agent/src/core/model-runtime.ts` | **176** | `ModelRuntime.create()` 里调用上一步 |
+  | 4 | `packages/coding-agent/src/core/model-runtime.ts` | **269** | `rebuildProviders()` 遍历所有 providerId |
+  | 5 | `packages/coding-agent/src/core/model-runtime.ts` | **245** | `recomposeProvider("dashscope")` 三条分支在此 |
+  | 6 | `packages/coding-agent/src/core/provider-composer.ts` | **420** | `composeModelProvider()` 构造 Provider 对象 |
+  | 7 | `packages/coding-agent/src/core/model-runtime.ts` | **260** | `this.models.setProvider(...)` 注册进目录 |
+  | 8 | `packages/coding-agent/src/core/model-runtime.ts` | **276** | `updateModelSnapshot()` 算出 `all` / `available` |
+  | 9 | — | — | `--list-models` 读快照显示出来 |
+
+  绝对路径前缀统一是 `/Users/simonli/Downloads/MyProjects/PiAgent/`。
+
+  一条命令跳到关键那步：
+
+  ```bash
+  cd /Users/simonli/Downloads/MyProjects/PiAgent
+  sed -n '245,268p' packages/coding-agent/src/core/model-runtime.ts   # 三条分支
   ```
 
 - **要理解的核心（三条分支）**：`recomposeProvider` 决定配置与内置目录如何结合——
