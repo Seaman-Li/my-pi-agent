@@ -7,6 +7,7 @@
 | [type-erasure.ts](type-erasure.ts) | TS 类型编译后消失，typebox 的 schema 是运行时的值 | ts-notes 第 1 条 |
 | [value-vs-type-space.ts](value-vs-type-space.ts) | 值空间/类型空间的边界，`TS2693` 与 `TS2749` 两个方向的越界 | ts-notes 第 1 条 |
 | [annotation-vs-inference.ts](annotation-vs-inference.ts) | 加不加类型标注的四个差异，重点是字面量拓宽对可辨识联合的影响 | ts-notes 第 10 条 |
+| [which-space.ts](which-space.ts) | **怎么判断自己在类型空间还是值空间**——同一个 `typeof` 四个位置两种行为 | ts-notes 第 1 条 |
 
 ## 运行
 

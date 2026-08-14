@@ -38,21 +38,73 @@ interface Tool<TParameters extends TSchema = TSchema>   // 类型空间：默认
 
 `class` 的双身份让这行合法：`const c: C = new C()`——左边当类型（实例形状），右边当值（构造函数）。**这正是 Java/Python 背景的人用 class 不别扭、一碰 interface 就懵的原因。**
 
-### 位置决定空间
+### 怎么判断自己在哪个空间 ⭐
 
-判断标准是**语法位置**，不是名字：
+**判据是「语法位置」，不是「声明还是使用」。**
+
+常见误解：声明是编译时、使用是运行时。两个反例就推翻：
+
+- `const b = {...}` 是**声明**，但完全属于值空间
+- `class C {}` 是**声明**，但两个空间都进
+
+**只有这几个记号会打开类型空间，其余一切都是值空间**：
+
+| 记号 | 例子 | 类型空间范围 |
+|---|---|---|
+| `type X =` | `type C = ...` | 等号右边全部 |
+| `:` 标注 | `const a: A`、`function f(p: A): A` | 冒号右边 |
+| `<...>` 类型实参 | `Static<...>`、`Tool<...>` | 尖括号内 |
+| `as` / `satisfies` | `x as A` | 关键字右边 |
+| `interface` 体 | `interface I { n: number }` | 花括号内 |
+| `extends` / `implements` | `<T extends TSchema>` | 关键字右边 |
+
+**不确定时的实用判据**：问「这段代码编译成 JS 后还在吗」——
+
+- 还在 → 值空间（`console.log(typeof B)` 原样保留）
+- 没了 → 类型空间（`type C = ...` 整行消失）
+
+### 同一个 `typeof`，位置决定行为
 
 ```ts
-const x: A = ...        // 冒号右边        → 类型空间
-function f(p: A): A     // 参数标注/返回值  → 类型空间
-type B = A              // type 等号右边    → 类型空间
-expr as A               // 断言            → 类型空间
-Tool<A>                 // 尖括号内         → 类型空间
+const B = { path: "/tmp" };
 
-console.log(A)          // 函数实参        → 值空间
-const y = A             // 等号右边（非 type）→ 值空间
-new A()                 // new 后面        → 值空间
+type T1 = typeof B;                  // type 等号右边   → 类型空间 → { path: string }
+const v1: typeof B = { path: "x" };  // 冒号右边        → 类型空间 → 用作标注
+const v2 = typeof B;                 // 等号右边(非 type) → 值空间  → 字符串 "object"
+console.log(typeof B);               // 实参位置        → 值空间  → 字符串 "object"
 ```
+
+四个写法完全一样，行为分成两组。**落在哪个空间由周围位置决定，与 `typeof` 自己无关。**
+
+回到最初那两行：
+
+```ts
+type C = Static<typeof B>;          // type 打开类型空间 → 类型运算符 → TObject<{path: TString}>
+console.log("typeof B =", typeof B); // 实参位置        → JS 运算符   → "object"
+```
+
+**可运行验证**：[examples/which-space.ts](examples/which-space.ts)
+
+### 为什么运行时的 `typeof` 给不出形状
+
+JS 的 `typeof` 只有 8 种返回值（`object` / `string` / `number` / `boolean` / `undefined` / `function` / `symbol` / `bigint`），**天生无法区分对象形状**：
+
+```ts
+typeof Type.Object({...}) === typeof { path: "/tmp" } === typeof [1,2,3]  // 全是 "object"
+```
+
+三者 `constructor` 也都是 `Object`。**这正是 typebox 必须存在的根**——运行时反射不出形状，只能显式构造一个"自带形状描述"的对象（见第 9 条）。
+
+### 和 Python 的根本差异
+
+| | 类型信息在运行时 | 标注是否求值 | 独立类型空间 |
+|---|---|---|---|
+| **Python** | ✅ 保留在 `__annotations__` | ✅ 是普通表达式 | ❌ 只有一个空间 |
+| **TypeScript** | ❌ 全部擦除 | ❌ 编译时删掉 | ✅ 两个独立空间 |
+
+Python 里 `f.__annotations__['x'] is A` 为 `True`——**标注里的 `A` 和值 `A` 就是同一个对象**。而且标注会在运行时求值：`def g(x: Undefined)` 直接抛 `NameError`（Python 3.11 默认行为）。TS 里类型写错只有编译期报错，运行时无事，因为那行根本不存在。
+
+**Python 是「一个空间，类型也是值」，TS 是「两个空间，类型不是值」。** 所以 Pydantic 能读类生成 schema，而 TS 只能反过来——先造 schema 值，再派生类型。
 
 ### 越界的两个方向
 
