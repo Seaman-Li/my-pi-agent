@@ -559,11 +559,149 @@ const readSchema = Type.Object({ ... });
 
 ---
 
+## 11. 穷尽性检查：`const _exhaustive: never = m`
+
+pi 里 9 处，出处如 `coding-agent/src/core/messages.ts:190`、`agent/src/proxy.ts:364`。
+
+```ts
+switch (m.role) {
+	case "user":       return ...;
+	case "assistant":  return ...;
+	case "toolResult": return ...;
+	default:
+		const _exhaustiveCheck: never = m;   // ← 编译期断言
+		return undefined;
+}
+```
+
+**机制**：`never` 是空类型，没有任何值属于它。`switch` 每处理一个 `case`，TS 就从 `m` 的类型里减去那一支：
+
+| 位置 | `m` 的类型 |
+|---|---|
+| `case "user"` 内 | `{ role: "user"; ... }` |
+| `default` 内（全处理完） | `never` → 赋值成功 ✅ |
+| `default` 内（漏了一支） | 剩下那支 → 赋值失败 ❌ |
+
+报错会**直接点名漏掉的是哪一个**：`Type 'ReminderMessage' is not assignable to type 'never'`。
+
+**三个部分**：变量名随意（`_` 开头是"故意不用"的约定）；`: never` 才是干活的；`= m` 提供待检查的类型。
+
+**运行时它还在**：`const _exhaustive: never = m` 编译成 `const _exhaustive = m`——只有标注被擦除，赋值语句是值空间的（第 1 条判据）。这是一行永不执行的死代码，所以 pi 加了 `// biome-ignore lint/correctness/noSwitchDeclarations: fine`。
+
+**价值**：把"加新类型时忘了更新某处"从线上 bug 变成编译失败。这是纯 JS 无法表达的东西——JS 里新类型会静默走 `default`，信息悄悄丢失。
+
+---
+
+## 12. `keyof` + 索引访问 + 声明合并 = 开放式联合
+
+pi 用这三样组合出了消息类型的扩展机制，值得整套抄。
+
+### `keyof T` 与 `T[K]`
+
+```ts
+interface CustomAgentMessages {
+	bashExecution:     BashExecutionMessage;
+	custom:            CustomMessage;
+	branchSummary:     BranchSummaryMessage;
+	compactionSummary: CompactionSummaryMessage;
+}
+
+keyof CustomAgentMessages
+// = "bashExecution" | "custom" | "branchSummary" | "compactionSummary"
+
+CustomAgentMessages["custom"]                    // → CustomMessage（索引访问）
+CustomAgentMessages["custom" | "branchSummary"]  // → CustomMessage | BranchSummaryMessage
+//                                                   索引访问对联合会「分配」
+```
+
+所以 `T[keyof T]` 的含义是——**取出接口所有值类型的联合**。实测展开结果：
+
+```
+CustomAgentMessages[keyof CustomAgentMessages]
+  = CustomMessage<unknown> | BashExecutionMessage | BranchSummaryMessage | CompactionSummaryMessage
+```
+
+### 开放式联合的完整套路
+
+`packages/agent/src/types.ts:316,325`：
+
+```ts
+export interface CustomAgentMessages {}                                    // 空的注册表
+export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];
+```
+
+下游注册（`coding-agent/src/core/messages.ts:69`）：
+
+```ts
+declare module "@earendil-works/pi-agent-core" {
+	interface CustomAgentMessages {
+		bashExecution: BashExecutionMessage;
+	}
+}
+```
+
+**为什么要绕这一圈**：那些消息类型定义在 coding-agent 里，agent 包不认识也不该认识（依赖方向是 coding-agent → agent，反过来就循环了）。空接口 + `T[keyof T]` 让底层包说出"所有注册进来的都算一支"，而无需知道注册了什么。
+
+### 声明合并 ≠ 继承
+
+| | 继承 `extends` | 声明合并 `declare module` |
+|---|---|---|
+| 产生什么 | **新类型**，原类型不变 | **修改原类型本身** |
+| 影响范围 | 只有子类 | **全局**，所有引用处 |
+| 原包能否感知 | 感知不到 | 被动接受，无法拒绝 |
+
+继承是"基于你造个新的"，声明合并是"**伸手进你家里加个字段**"。
+
+实测：在 coding-agent 里注册第 5 种消息 `reminder`，**agent 包内部的 `AgentMessage` 也跟着变**——而 agent 包对 coding-agent 一无所知。继承做不到。
+
+### 路径要和 import 一致
+
+```ts
+// 包内部（agent/src/harness/messages.ts:53）
+declare module "../types.ts" { ... }                      // 相对路径
+
+// 跨包（coding-agent/src/core/messages.ts:69）
+declare module "@earendil-works/pi-agent-core" { ... }    // 包名
+```
+
+`declare module` 按**模块说明符**匹配，所以路径必须和 `import` 时写的字符串一致。
+
+### 只有 `interface` 能合并
+
+```ts
+interface I { a: number }
+interface I { b: string }   // ✅ 合并成 { a: number; b: string }
+
+type T = { a: number }
+type T = { b: string }      // ❌ 重复标识符
+```
+
+**这就是 pi 在扩展点用 `interface` 而非 `type` 的原因**——可合并性正是扩展机制的实现基础。
+
+> Python 类比：最接近的是猴子补丁（`somelib.SomeClass.new_field = ...`），但有本质差别——猴子补丁在**运行时**改行为，声明合并**只在类型层**，编译后什么都不剩，不改变任何运行时行为。
+
+### 两条链路合起来
+
+```
+declare module 注册新消息
+      ↓
+AgentMessage = Message | CustomAgentMessages[keyof ...]   自动多一支
+      ↓
+convertToLlm 的 switch 没有对应 case
+      ↓
+messages.ts:190 的 never 断言 ❌ 编译失败，并点名缺哪个
+```
+
+**agent 包提供开放扩展点，coding-agent 用 `never` 断言给自己上锁**——可以自由加消息类型，但加了就必须说明"它怎么变成 LLM 能懂的形式"。没有这行断言，新类型会静默走 `default` 返回 `undefined` 被 `filter` 掉，LLM 永远看不到，且无任何报错。
+
+---
+
 ## 待补
 
 遇到再加：
 
 - `satisfies` 运算符（`openrouter-images.ts:93` 用到）
-- 条件类型 / 映射类型（`ApiOptionsMap`、`ApiStreamOptions<TApi>` 里有）
+- 条件类型 / `infer`（`Static<>` 内部大量使用，见第 9 条）
+- 映射类型 `[P in K]`（`Record<K,V>` 的实现原理，与第 12 条的 `keyof` 是一套机制的两面）
 - `asserts` 断言函数
 - 模块解析与 `.ts` 后缀导入（pi 用的 Node strip-only 模式，见 `AGENTS.md`）
