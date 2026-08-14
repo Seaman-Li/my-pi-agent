@@ -90,9 +90,43 @@ cd /Users/simonli/Downloads/MyProjects/PiAgent
 
 ### Day 3 — `ai` 层：模型目录与 provider 注册
 
-- **主线**：`src/models.ts`（944）、`src/providers/all.ts`（155）、`src/providers/anthropic.ts`（很小，看注册模式）
-- **对照你已有的配置**：`~/.pi/agent/models.json` 里的 dashscope 是怎么被加载进这套目录的
-- **验证**：给 `models.json` 再加一个模型（如 `qwen3.7-max`，参数抄 `providers/data/qwen-token-plan.json`），`./pi-test.sh --list-models` 能看到它
+> **不要细读 `models.ts` 的 944 行。** 唯一目标：**能说清 `~/.pi/agent/models.json` 里的 dashscope 是怎么进入模型目录的**。说得出这条链路就算过。
+
+- **只追一条链路**（都在 `packages/coding-agent/src/core/`）：
+
+  ```
+  ~/.pi/agent/models.json
+    → config.ts:530            getModelsPath()
+    → model-runtime.ts:176     ModelConfig.load(modelsPath)
+    → model-runtime.ts:269     rebuildProviders()
+    → model-runtime.ts:~240    recomposeProvider("dashscope")
+    → provider-composer.ts:420 composeModelProvider()
+    → this.models.setProvider()   注册进目录
+    → model-runtime.ts:276     updateModelSnapshot()
+    → --list-models 显示出来
+  ```
+
+- **要理解的核心（三条分支）**：`recomposeProvider` 决定配置与内置目录如何结合——
+
+  | 情况 | 行为 | 例子 |
+  |---|---|---|
+  | 有内置、无配置 | **直接用内置，原样不动** | `anthropic` |
+  | 有内置、有配置 | `composeModelProvider` 叠加覆盖 | 用 `modelOverrides` 时 |
+  | **无内置、有配置** | 纯配置构造 | **你的 `dashscope`** |
+
+  源码注释点破了第一条的用意：`// No overlays: use the builtin untouched so its auth/login/stream behavior is exact.`——没有覆盖时刻意绕开合成，防止意外改变内置行为。
+
+- **一句话结论**：`models.json` 不是另一套目录，而是**同一个目录的一层覆盖**。
+
+- **顺带记住 `available` 的过滤**（`model-runtime.ts:281`）：
+
+  ```ts
+  available: all.filter((model) => this.snapshot.configuredProviders.has(model.provider))
+  ```
+
+  **模型在目录里 ≠ 可用**。`--list-models` 只显示 dashscope，是因为只有它配了凭证；其他内置 provider 的模型在 `all` 里但不在 `available` 里。
+
+- **验证**：给 `models.json` 再加一个模型（如 `qwen3.7-max`，参数抄 `providers/data/qwen-token-plan.json`），`./pi-test.sh --list-models` 能看到它。不用重启 pi——文档说 "The file reloads each time you open `/model`"，就是重新 `load` + `rebuildProviders`。
 
 ### Day 4 — `ai` 层：适配器精读
 
