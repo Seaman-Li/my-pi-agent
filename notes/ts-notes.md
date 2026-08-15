@@ -813,6 +813,85 @@ class C implements Greeter { greett() {...} }  // ❌ TS2420，拼错方法名�
 
 ---
 
+## 14. TS 与 Python 的严格性：分布在不同阶段
+
+读了几天的直觉是「TS 比 Python 严格得多」。**只对一半**——两者的严格性在不同阶段。
+
+| | 编译期 | 运行期 |
+|---|---|---|
+| **TypeScript** | ⭐⭐⭐ 严格 | **零检查**，静默产出 `undefined` / `NaN` |
+| **Python** | 默认**完全不检查**（标注被忽略） | ⭐⭐⭐ 立刻抛 `KeyError` / `AttributeError` |
+
+### 实证
+
+```ts
+interface User { name: string; age: number }
+const raw: unknown = { name: "simon" };   // 缺 age
+const user = raw as User;                  // 断言：我说它是 User
+
+console.log(user.age);      // undefined
+console.log(user.age + 1);  // NaN
+```
+
+**类型检查全绿，运行时静默产出 `NaN`。** 同样的错误在 Python：
+
+```python
+raw = {'name': 'simon'}
+raw['age'] + 1          # KeyError: 'age'      ← 立刻炸
+
+class User:
+    def __init__(self, name): self.name = name
+User('simon').age       # AttributeError       ← 立刻炸
+
+def f(x: int) -> int: return x
+f("字符串")              # '字符串'  ← 标注被完全忽略，不报错
+```
+
+### 三个让 TS 没那么严的因素
+
+**① 类型会撒谎**——逃生舱有一整套：
+
+```ts
+value as T      // 断言：我说是就是
+value!          // 非空断言
+: any           // 彻底放弃检查
+// @ts-ignore   // 直接闭嘴
+```
+
+`AGENTS.md` 禁 `any`，正因为一个口子就能打穿整个类型系统。而 Python 里**骗不过运行时**——属性不存在就是不存在。
+
+**② JS 底座本身极宽松**，TS 管不了：`"1" + 1 === "11"`、`[] == false`、`undefined + 1 === NaN`。
+
+**③ 外部数据零保护**：`JSON.parse()` 返回 `any`，API 响应、用户输入、读文件——**类型系统对边界之外一无所知**。
+
+> 这正是 pi 必须用 typebox 的根本原因（第 9 条）：TS 的类型在运行时保护不了工具参数这个边界。
+
+### 反过来，Python 也没那么松
+
+mypy / pyright 开严格模式后表达力和 TS 接近，`Literal` / `TypedDict` / `Protocol` 一应俱全。差别在**默认值**：
+
+| | 默认状态 |
+|---|---|
+| TS | 类型检查**内建**，不写标注也推断，编译不过不给跑 |
+| Python | 标注**默认纯装饰**，要额外装 mypy 并主动跑 |
+
+**是「默认开」和「默认关」的区别，不是「有」和「没有」的区别。**
+
+### 实用结论：两边姿势一样
+
+```
+外部数据 ──→ [运行时校验] ──→ 内部代码
+                 │                │
+   TS:      typebox / zod      静态类型
+ Python:    Pydantic           mypy 标注
+```
+
+pi 就是这么做的：`packages/ai` 内部全靠 TS 类型，工具参数这个边界用 typebox schema 兜住。
+
+**一句话**：TS 给的是「写代码时的严格」，Python 给的是「跑起来时的诚实」。前者能在改 4 万行代码时救你，后者能在数据不对时立刻告诉你。**两者都不能替代边界处的运行时校验。**
+
+---
+
 ## 待补
 
 遇到再加：
