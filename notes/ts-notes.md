@@ -696,6 +696,123 @@ messages.ts:190 的 never 断言 ❌ 编译失败，并点名缺哪个
 
 ---
 
+## 13. `static` 的三种含义 + 静态工厂方法
+
+**可运行验证**：[examples/static-factory.ts](examples/static-factory.ts)
+
+### ⚠️ 先消歧：三个 static 互不相干
+
+| 写法 | 是什么 | 来源 |
+|---|---|---|
+| `static` 小写关键字 | 类的静态成员 | TS/JS 语言 |
+| `Static<T>` 大写泛型 | 从 typebox schema 提取编译期类型（第 9 条） | **typebox 库**，需 import |
+| C 的 `static` | 存储期 / 链接性 | 与前两者都无关 |
+
+typebox 用 `Static` 这个词，取的是 **static typing（静态类型）** 里的"静态"——**编译期已知**，对应"动态"（运行时才知道）。和"静态成员"毫无关系。
+
+### `static` 成员：挂在类上，不在实例上
+
+```ts
+class Runtime {
+	static readonly VERSION = "1.0";   // 静态字段
+	private static instances = 0;      // 私有静态字段，全类共享
+	private readonly config: string;   // 实例字段
+
+	static async create(...) { }       // 静态方法
+	static { /* 静态初始化块，ES2022 */ }
+}
+
+Runtime.VERSION      // ✅ 从类上访问
+new Runtime().VERSION // ❌ TS2339: 实例上没有
+```
+
+**关键：`static` 成员是运行时真实存在的**（挂在构造函数对象上），属于**值空间**。对比同一行的 `implements Models`——那部分纯属类型空间，编译后消失：
+
+```ts
+export class ModelRuntime implements Models { static async create() {} }
+// 编译后：export class ModelRuntime { static async create() {} }
+//                                  ↑ implements 整段蒸发，static 原样保留
+```
+
+**一行代码，一半保留一半蒸发**（第 1 条的判据）。
+
+静态方法里的 `this` 指向类本身，所以 `new this(...)` 可行；pi 直接写 `new ModelRuntime(...)`，更明确。
+
+### 静态工厂方法：pi 的 `ModelRuntime.create()`
+
+`core/model-runtime.ts:154,172`：
+
+```ts
+private constructor(...)                          // 154：私有，外部造不出来
+static async create(...): Promise<ModelRuntime>   // 172：唯一入口
+```
+
+**为什么必须异步**——构造函数不能 `async`（必须返回实例，不能返回 Promise），而 `create()` 里有：
+
+| 工作 | 能否同步 |
+|---|---|
+| 读 `models.json` | ✅ `readFileSync` 可以 |
+| **联网刷新模型目录**（`model-runtime.ts:205` 的 `await runtime.refresh(...)`） | ❌ **不可能** |
+| 读凭证（钥匙串 / OAuth 刷新） | ❌ 通常也不行 |
+
+**Node 里网络 I/O 没有同步形态**（没有 `fetchSync`）。只要这一步存在，`create()` 就必须 async，无从选择。还有 `model-runtime.ts:200-207` 那套 `AbortController` + `setTimeout` 超时取消——同步调用没法"等 3 秒还没好就放弃"。
+
+**"逻辑上阻塞" ≠ "阻塞线程"**：
+
+```
+await create()          当前逻辑等待，事件循环空闲，其他启动任务可并发
+readFileSync + 同步网络   整个进程卡死
+```
+
+pi 启动时并行做很多事（加载设置、扫扩展、检查项目信任、读会话历史），同步 I/O 会强制串行。
+
+**为什么不用 `new` + `init()`**：
+
+```ts
+const rt = new Runtime();   // 同步造空壳
+await rt.init();            // 再异步初始化
+```
+
+会留下「拿到实例但还不能用」的窗口期，调用方可能忘记 `await init()`。`private constructor` + `static async create` **在类型层面杜绝了这种状态**——能拿到实例，就意味着它准备好了。这是"用类型和可见性让非法状态不可表达"的又一例。
+
+### ⚠️ 这不是 GoF 的「工厂模式」
+
+| | GoF **工厂方法模式** | 这里的**静态工厂方法** |
+|---|---|---|
+| 目的 | 让**子类**决定实例化哪个类 | 给构造过程一个有名字的入口 |
+| 结构 | 抽象方法 + 多个子类实现 | 一个静态方法 |
+| 返回 | 接口/基类，具体类型可变 | **就是自己这个类** |
+| 出处 | GoF《设计模式》 | Effective Java 第 1 条 |
+
+`ModelRuntime.create()` 总是返回 `ModelRuntime`，无子类、无多态选择——是**静态工厂方法**，不是 GoF 工厂模式。中文语境里"工厂模式"常被泛化，区分的意义在于：GoF 工厂方法为了**多态和扩展性**，静态工厂方法为了**构造过程的可控性**。
+
+pi 里同套路的还有 `ModelConfig.load()`、`SettingsManager.create()`、`SessionManager.inMemory()`。
+
+### `extends` / `implements` 和 Java 的差异
+
+| | Java | TypeScript |
+|---|---|---|
+| `class A extends B` | 继承，单继承 | 一致 |
+| `class A implements I` | **必须写**，否则类型关系不存在 | **可以不写**，写了只是编译期断言 |
+| `interface I extends J` | 接口继承 | 一致 |
+| `<T extends X>` 泛型约束 | 有界类型参数 | 一致，读作"必须满足"（第 2 条） |
+
+差异源于**名义类型 vs 结构类型**（第 3 条）。TS 里类只要形状对上，不写 `implements` 也自动满足接口：
+
+```ts
+interface Greeter { greet(): string }
+class A implements Greeter { greet() { return "A"; } }
+class B                     { greet() { return "B"; } }   // 没写 implements
+
+const g1: Greeter = new A();   // ✅
+const g2: Greeter = new B();   // ✅ 照样能过
+class C implements Greeter { greett() {...} }  // ❌ TS2420，拼错方法名被抓住
+```
+
+**TS 的 `implements` 是「自检」而非「注册」**。`export class ModelRuntime implements Models` 去掉照样能跑，它的价值是：哪天 `Models` 接口加了方法而 `ModelRuntime` 没跟上，**这里立刻报错**。
+
+---
+
 ## 待补
 
 遇到再加：
