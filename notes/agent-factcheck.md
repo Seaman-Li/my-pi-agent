@@ -114,15 +114,101 @@ const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 
 **做自己的 agent 时记这一笔**：类型里每多一个可选形态，下游每个消费点就多一个分支。宽容的 API 不免费，成本被推给所有实现者。`coding-agent` 层的做法反而值得学——**上层自己收窄，只用一种形态**，把宽容度留在下层不去碰。
 
-## 两个案例的共同结论
+---
 
-| | 案例 1（pi 生成架构笔记） | 案例 2（Claude 解释类型） |
-|---|---|---|
-| 对的部分 | 逐字读自 `package.json` 的事实 | 逐行读自 `types.ts` 的语法拆解 |
-| 错的部分 | 从包名/文件名推断的职责 | 从类型分支推断的实际用法 |
-| 共同错因 | **符号的存在 ≠ 事实** | 同左 |
+# 案例 3：`grep -c` 也不够 —— 符号存在 ≠ 主路径在用
 
-**可操作的防御**：任何关于"X 是干什么用的"的断言，先跑一次 `grep -c` 数调用点。成本几秒钟，能拦住这一整类错误。
+案例 2 给出的防御是「先 `grep -c` 数调用点」。Day 3–5 连着撞上六次同类问题后，发现**这条防御本身有漏洞**。
+
+## 六个实例
+
+| # | 符号 | src 引用 | test 引用 | 真实地位 |
+|---|---|---|---|---|
+| 1 | `getModelsPath()` | **0**（只有自身定义） | 37 | 死代码，路径逻辑在别处 |
+| 2 | `UserMessage.content` 的 `string` 分支 | 1 | 181 | 测试便利，非 SDK 口子 |
+| 3 | `agent/harness/tools/`（bash/read/edit/write） | pi CLI 不用 | — | 给 SDK 的最小实现 |
+| 4 | `createCodingAgentHarness` | **0** | 6 | 对外入口 |
+| 5 | `agentLoop` / `agentLoopContinue` | **0**（唯一一处是注释） | 24 | 公开 API，pi 走 `Agent` 类 |
+| 6 | `getDefaultStreamFn()` | 3 处 `??` 兜底，**全是死分支** | 0 | 老扩展的兜底门 |
+
+复核命令：
+
+```bash
+for s in getModelsPath createCodingAgentHarness agentLoop getDefaultStreamFn; do
+  src=$(grep -rn "\b$s\b" packages/*/src | grep -v "export function" | wc -l)
+  tst=$(grep -rn "\b$s\b" packages/*/test | wc -l)
+  printf "%-26s src=%-4s test=%s\n" "$s" "$src" "$tst"
+done
+```
+
+## 漏洞在哪
+
+`getModelsPath` 有 **37 处**引用。光看 `grep -c` 的数字，它像是个核心函数——**但 37 处全在 `test/`，`src/` 里一处都没有。**
+
+> **数量回答不了「谁在用」，只回答了「有多少人提到」。**
+
+案例 1、2 的错因是「符号存在 ≠ 事实」；案例 3 是它更隐蔽的一个特化：**符号确实被用了，只是用它的不是主路径。**
+
+## 修正后的防御
+
+```bash
+# ❌ 不够
+grep -rc "symbol" packages/
+
+# ✅ 分目录数，看比例
+grep -rn "symbol" packages/*/src  | grep -v "export function\|export \*" | wc -l
+grep -rn "symbol" packages/*/test | wc -l
+```
+
+三条判据，按可靠性排序：
+
+1. **`src` 计数为 0** → 一定不是主路径（可能是公开 API 或死代码，看它有没有从 `index.ts` 导出）
+2. **`src` 计数远小于 `test`** → 大概率是测试便利设施
+3. **`src` 里的引用全是 `??` / `if` 兜底分支** → 是降级路径，不是主路径 ← **最隐蔽的一种，计数看不出来，必须读上下文**
+
+第 3 条是 `getDefaultStreamFn` 那次踩到的：它在 `src` 里有 3 处调用，数字上完全正常，但 `agent-loop.ts:116/141` 的调用方永远传非空值，`agent.ts:222` 也被 `sdk.ts:302` 的显式 `streamFn` 短路。**三处全部不可达。**
+
+## 根因：这个仓库同时是产品和 SDK
+
+```
+packages/agent   ─┬─→ pi 自己用（走 Agent 类 + coding-agent 的厚包装）
+                  └─→ 对外暴露（index.ts 全量 export *）
+```
+
+`packages/agent/src/index.ts:45` 一句 `export * from "./agent-loop.ts"` 就把四个入口全部公开了。**公开 API 面比自用面大得多**，所以：
+
+> **凡是看起来"基础"「默认」「最小实现"的东西，往往是给外部用的；pi 自己走的是更厚的那条路。**
+
+- 基础工具集（`agent/harness/tools/`）↔ pi 用的是带权限和渲染的完整版
+- 默认 streamFn ↔ pi 用的是带重试、超时、header 注入的包装器
+- `agentLoop`（EventStream 风格）↔ pi 用的是 `Agent` 类的事件分发
+
+## 对做 agent 的启示
+
+案例 1 得出的第 4 条是「能用工具确定性获取的，就不要让模型去总结」。案例 3 把它推进一步：
+
+**工具本身也可能给出误导性的确定性数字。** `grep -c` 返回 37 是一个精确、可复现、完全正确的数字——但用它回答"这个函数重要吗"就是错的。
+
+设计 agent 的检索工具时，这意味着：
+
+- 返回**分组后的**计数（按目录/按用途），而不是一个总数
+- 对"是否被使用"这类问题，把**调用点上下文**一起返回，让模型能看出是不是死分支
+- 一个数字加一句结论，比十行原始输出更容易骗过自己
+
+---
+
+## 三个案例的共同结论
+
+| | 案例 1（pi 生成架构笔记） | 案例 2（Claude 解释类型） | 案例 3（Claude 判断地位） |
+|---|---|---|---|
+| 对的部分 | 逐字读自 `package.json` | 逐行读自 `types.ts` 的语法 | 符号确实存在、确实被引用 |
+| 错的部分 | 从包名/文件名推断职责 | 从类型分支推断实际用法 | 从引用计数推断重要性 |
+| 错因 | 符号存在 ≠ 事实 | 类型允许 ≠ 实际这么用 | **被引用 ≠ 主路径在用** |
+| 防御 | 打开文件读 | `grep -c` 数调用点 | **分 src/test 数，并读调用点上下文** |
+
+三条是层层递进的：每一条防御都能挡住上一层的错误，然后在下一层失效。
+
+**当前最强的可操作防御**：任何关于"X 是干什么用的 / 重不重要"的断言，跑一次分目录计数，并**打开 `src` 里的调用点确认它不是兜底分支**。成本十几秒，能拦住这三整类错误。
 
 ---
 
