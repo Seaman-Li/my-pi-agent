@@ -892,6 +892,234 @@ pi 就是这么做的：`packages/ai` 内部全靠 TS 类型，工具参数这�
 
 ---
 
+## 15. Promise 是急切的（Python 直觉会出错）
+
+### 基本盘
+
+Promise 是"值还没到，但迟早会到"的占位对象，三种状态不可逆：
+
+```
+pending ──┬──→ fulfilled（有值）  ← await 拿到它
+          └──→ rejected （有错）  ← await 抛出它
+```
+
+`async`/`await` 的写法和 Python 几乎一样，对应关系：
+
+| Python | JS |
+|---|---|
+| `async def f()` | `async function f()` |
+| `asyncio.gather(a, b)` | `Promise.all([a, b])` |
+| `asyncio.Future` | `Promise` |
+
+### 唯一必须记的差异
+
+**Python 的协程是懒的**——调用不等于开始：
+
+```python
+c = fetch(url)      # 什么都没发生，只造了个 coroutine 对象
+await c             # 到这里才真正开始执行
+```
+
+**JS 的 Promise 是急的**——函数一调用就已经在跑了：
+
+```js
+const p = fetch(url);   // ← 请求此刻已经发出去了
+await p;                // 只是「等它结束」，不是「让它开始」
+```
+
+> `await` 在 JS 里**只负责等待，不负责启动**。
+
+验证：
+
+```bash
+node -e '
+const mk = n => new Promise(r => { console.log("开始", n); setTimeout(() => r(n), 100) });
+const eager = [mk(1), mk(2)];              // 立刻打印「开始 1」「开始 2」
+console.log("--- 数组构造完了 ---");
+const lazy  = [() => mk(3), () => mk(4)];  // 什么都不打印
+console.log("--- thunk 数组构造完了 ---");
+Promise.all(lazy.map(f => f()));           // 此刻才打印「开始 3」「开始 4」
+'
+```
+
+### 后果：JS 需要 thunk，Python 不需要
+
+想「先排好队、之后再一起开跑」，JS 只能包一层函数（**thunk**，延迟求值的壳）。这就是 [agent-loop.md](agent-loop.md) 里 `agent-loop.ts:522` 的写法：
+
+```ts
+finalizedCalls.push(async () => { ... });   // :522 推的是「函数」，此刻不执行
+const ordered = await Promise.all(          // :540 这里才调用它们
+  finalizedCalls.map(e => typeof e === "function" ? e() : Promise.resolve(e)));
+```
+
+直接推 Promise 就废了：`for` 循环还在逐个做权限确认，前面已确认的工具早跑起来了——「准备串行、执行并行」的设计不成立。
+
+### `Promise.all` 的两个性质
+
+- **保序**：`results[0]` 永远对应 `p1`，与谁先完成无关
+- **快速失败**：任一 reject，整体立刻 reject
+
+agent-loop 敢用它，正因为工具错误从不 reject（都被 catch 成正常返回值）。**两个设计是配套的。**
+
+---
+
+## 16. `void` 运算符：故意丢弃一个 Promise
+
+```ts
+// agent-loop.ts:40
+void runAgentLoop(prompts, context, config, emit, signal, streamFn)
+    .then((messages) => { stream.end(messages); });
+```
+
+这里的 `void` **不是返回类型 `void`**，是一元运算符：求值右边的表达式，然后丢弃结果、返回 `undefined`。
+
+三个 `void` 的区别（又一组同名不同物，参考第 13 条的 `static`）：
+
+| 写法 | 空间 | 含义 |
+|---|---|---|
+| `function f(): void` | 类型 | 返回类型：没有有意义的返回值 |
+| `void expr` | 值 | 运算符：算完丢掉 |
+| `void 0` | 值 | 拿 `undefined` 的老写法（压缩器爱用） |
+
+优先级：`void` 是 14，`.` 和函数调用是 17，所以 `void a().then(b)` 解析成 `void ((a()).then(b))`——**整条链被丢弃，不是只丢 `a()`**。
+
+### 为什么要写它
+
+不写 `void` 代码也能跑，写它是给**人和 lint 看的信号**：
+
+> 「我知道这是个 Promise，我是**故意**不 await 的。」
+
+这类没人接住的 Promise 叫 **floating promise**。危险在于它 reject 时会变成 `unhandledRejection`，Node 默认直接终止进程。写 `void` 相当于留个记号——但**记号本身不提供任何保护**。
+
+pi 里 `void` 用了十几处，写法分两类：
+
+```ts
+void this.refresh({ allowNetwork: false });          // model-runtime.ts:739  裸丢，失败即崩
+void rawStdoutWriteTail.catch(() => {});             // output-guard.ts:90    带 catch，安全
+void waitForChildProcess(child).then(ok, err);       // env/nodejs.ts:481     两个回调都给了
+```
+
+**只有后两种是真安全的。** `void X` 本身不吞异常——想安全就必须自己接上 `.catch()`。
+
+Python 里的对应物是 `asyncio.create_task(coro)` 而不加引用：同样的悬空问题，同样需要显式处理异常。
+
+---
+
+## 17. `=>` 在两个空间里是两个东西（函数类型 vs 箭头函数）
+
+```ts
+export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
+```
+
+**这不是 lambda，是一个类型。** 它描述"函数长什么样"，不产生任何函数。
+
+判别方法还是第 1 条那套——看 `=` 左边是 `type` 还是 `const`：
+
+```ts
+type F  = (x: number) => string;    // 类型空间：描述形状，编译后整行消失
+const f = (x: number) => "hi";      // 值空间：真造了个函数，运行时存在
+```
+
+同样的 `(...) => ...` 写法，一个是名词（"这种函数"），一个是动词（"造一个函数"）。**`type X = ` 之后的一切都在类型空间**，所以 `AgentEventSink` 里的箭头只是语法借用。
+
+对应 Python：
+
+```python
+AgentEventSink = Callable[[AgentEvent], Awaitable[None] | None]   # 类型
+sink = lambda event: None                                          # 值
+```
+
+Python 用两套完全不同的写法（`Callable[...]` vs `lambda`），TS 复用同一套符号——**这是 TS 更容易搞混的地方，也是必须靠位置判别的原因。**
+
+### 整个箭头才是一个类型（别把返回部分当成整体）
+
+容易读错成"`EventSink` 是 `Promise<void>|void` 类型，只是带个入参"。**不是。**
+
+```ts
+type EventSink = (event: Ev) => Promise<void> | void;
+//               └──────────────────────────────────┘
+//                    这一整串 = 一个类型：「函数」
+```
+
+`Promise<void>|void` 只是**返回部分**，是零件不是整体。类比：
+
+```ts
+type Point = { x: number; y: number };
+```
+
+不会说"Point 是 number 类型但带 x 和 y"。Point 是**对象**类型，number 是字段类型。同理 EventSink 是**函数**类型。
+
+```ts
+const a: EventSink = (e) => {};          // ✅ 必须是函数
+const c: EventSink = Promise.resolve();  // ❌ TS2322
+const r = a(someEvent);                  // r 的类型才是 Promise<void> | void
+```
+
+三层结构：
+
+```
+EventSink                        ← 函数类型
+├── 参数：event: Ev               ← 输入
+└── 返回：Promise<void> | void    ← 输出（联合在这一层内部）
+```
+
+### 返回类型是贪婪的
+
+```ts
+(event: AgentEvent) => Promise<void> | void
+```
+
+读作 `(event) => (Promise<void> | void)`，**不是** `((event) => Promise<void>) | void`。
+
+函数类型的返回部分**一直向右吃到底**。想切断必须加括号：
+
+```ts
+type A = ((e: E) => Promise<void>) | void;   // 「函数」或「void」，完全不同的东西
+```
+
+和第 5 条 `(TextContent | ImageContent)[]` 是同一类优先级坑：**联合在类型里没有想当然的边界，看不清就补括号。**
+
+### 参数名是文档；参数可以少写，不能多写
+
+实测（两处 `@ts-expect-error` 都真实触发，`tsc` 通过）：
+
+```ts
+type Ev = { type: string };
+type EventSink = (event: Ev) => Promise<void> | void;
+
+const a: EventSink = (whatever) => { void whatever; };   // ✅ 参数名随便叫
+const b: EventSink = () => {};                            // ✅ 少写参数也行
+// @ts-expect-error 不是函数
+const c: EventSink = Promise.resolve();
+// @ts-expect-error 多出来的参数不行
+const d: EventSink = (e: Ev, extra: number) => { void e; void extra; };
+```
+
+**① 类型里的参数名纯属文档。** `event` 这个名字不参与任何匹配，实现方叫 `e` / `whatever` / `x` 都行。TS 的函数类型**按位置**匹配——不像 Python 的关键字参数，名字在这里没有语义。
+
+**② 可以少写参数，不能多写。** 调用方传了你不接，没问题；你要求的调用方没有，才是问题。`arr.map(x => x * 2)` 能省略 `index`、`array` 两个参数，就是同一条规则。
+
+（注意别把类型名起作 `Event`——它和 DOM lib 的全局 `Event` 撞名，报 `TS2300: Duplicate identifier`。）
+
+### `Promise<void> | void` 为什么这么写
+
+意思是"**同步异步都行**"。实现方可以两种都写：
+
+```ts
+const a: AgentEventSink = (e) => { console.log(e); };          // 同步，返回 void
+const b: AgentEventSink = async (e) => { await save(e); };     // 异步，返回 Promise<void>
+```
+
+调用方统一 `await emit(...)` 就能兼容两者——**`await` 一个非 Promise 值是合法的**，它会立即 resolve（只让出一个微任务 tick）：
+
+```bash
+node -e 'const f = () => 42; (async () => { console.log(await f()) })()'   # 42
+```
+
+pi 靠这一条同时支持两类消费者：`Agent.processEvents` 是真 async（有背压），`stream.push` 是同步 void（无背压）。见 [agent-loop.md](agent-loop.md) 第七节。
+
+---
+
 ## 待补
 
 遇到再加：
