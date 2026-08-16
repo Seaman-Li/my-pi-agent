@@ -114,6 +114,120 @@ available: all.filter((model) => this.snapshot.configuredProviders.has(model.pro
 
 ---
 
+## 收尾：从配置到发请求，三层各管一件事
+
+上面九步解决的是"`models.json` 怎么进目录"。真正发请求时还要再走三层，**三层的缺省行为完全不同**——这是 Day 5 读 `agent-loop.ts` 时补上的。
+
+| 层 | 决定什么 | 缺省行为 | 出错时机 |
+|---|---|---|---|
+| **调用器** `StreamFn` | 用哪个函数调 LLM | **注入**，没装就 throw | 启动/构造时 |
+| **协议** `model.api` | 用哪家的 HTTP 规范 | **查表**，查不到就 throw | 首次请求时 |
+| **方言** `model.compat` | 同协议下的细节差异 | **从 baseUrl 推断** | ⚠️ 不报错 |
+
+### ① 调用器：注入，不推断
+
+```ts
+// agent-loop.ts:116 / :141 / agent.ts:222
+streamFn ?? getDefaultStreamFn()
+```
+
+```ts
+// stream-fn.ts:15
+if (!defaultStreamFn) throw new Error("No default stream function configured. Pass streamFn explicitly or call setDefaultStreamFn().");
+```
+
+**要么你传，要么用装好的，要么报错。** 这个 `??` 管的是"有没有调用器"，**不是"用哪家协议"**——容易看混。
+
+`stream-fn.ts` 全文 20 行，模块级变量加一对 getter/setter，意义是**兼容**而非功能：0.81 把 `agent` 改成 provider-agnostic 后，老扩展的 `new Agent({...})`（不传 streamFn）会全挂，于是留一个插槽让顶层启动时填。
+
+```ts
+// coding-agent/src/core/sdk.ts:33-36
+// Preserve the pre-0.81 fallback for extensions that construct Agent instances
+// or invoke low-level agent loops without supplying streamFn. Agent core remains
+// provider-agnostic and does not import pi-ai/compat itself.
+setDefaultStreamFn(streamSimple);
+```
+
+**pi 自己不走这条路**——`sdk.ts:302` 显式传了一个包装器（带重试、超时、attribution header、扩展钩子），最后转给 `modelRuntime.streamSimple`。所以那三处 `??` 在当前代码里全是死分支，详见 [agent-factcheck.md](agent-factcheck.md) 案例 3。
+
+三类用户，各走各的门：
+
+| 谁 | 怎么拿 streamFn |
+|---|---|
+| pi 自己 | `sdk.ts:302` 显式传包装器 |
+| 测试 | `setDefaultStreamFn(假流)`（`agent/test/` 两个文件） |
+| 第三方扩展 | 不传 → 落到默认值 ← **它存在的唯一理由** |
+
+> **`stream-fn.ts` 的意义不是"提供默认实现"，而是"在把依赖踢出去之后，给回不来的老调用方留一个门"。pi 自己走大门，这是侧门。**
+
+代价也要记住：**全局可变状态**（一个进程只有一个默认值）+ **顺序敏感**（必须在任何 `new Agent()` 之前装好）。这是 Service Locator 模式的固有代价——`sdk.ts:36` 那行是模块顶层副作用（import 即执行），正是为了抢在第三方代码之前就位。
+
+改造自己的项目时：要么启动时 `setDefaultStreamFn(myOwnStreamFn)` 装一次，要么学 pi 每次显式传、把这 20 行整个删掉。**它是为兼容历史而存在的，新项目没有历史。**
+
+### ② 协议：查表，不推断
+
+```ts
+// compat.ts:275
+const provider = resolveApiProvider(model.api);   // 拿 api 字段查注册表
+```
+
+```ts
+// provider-composer.ts:470
+if (!api) throw new Error(`No API provider registered for api: ${model.api}`);
+```
+
+`api` 在 config schema 里是 `Type.Optional`（`model-config.ts:159`），但那是因为能三级继承，**每一级都是读别处写好的值，不是从 URL 猜**：
+
+```ts
+// provider-composer.ts:136
+const api = definition.api ?? providerConfig.api ?? defaults?.api;
+//          模型级        ?? provider 级       ?? 内置默认
+```
+
+三级全空 → `undefined` → 抛错。
+
+### ③ 方言：这一层才真的推断
+
+```ts
+/** Compatibility overrides for OpenAI-compatible APIs. If not set, auto-detected from baseUrl. */
+compat?: ...                                      // types.ts:804
+```
+
+推断函数 `detectCompat`（`openai-completions.ts:1443`）靠 URL 和 provider 名硬匹配：
+
+```ts
+const isZai = provider === "zai" || baseUrl.includes("api.z.ai") || baseUrl.includes("open.bigmodel.cn");
+const isMoonshot = provider === "moonshotai" || baseUrl.includes("api.moonshot.");
+const isOpenRouter = provider === "openrouter" || baseUrl.includes("openrouter.ai");
+// ... 十几个厂商
+```
+
+函数注释：*Used as the base when `model.compat` is not set; explicit `model.compat` entries override these detected values.* —— **推断出的是底座，你写的覆盖在上面。**
+
+**`detectCompat` 里没有 `dashscope.aliyuncs.com`。** 所以我们配置里那四行是必需的：
+
+```json
+"compat": { "thinkingFormat": "qwen", "supportsDeveloperRole": false,
+            "supportsStore": false, "supportsReasoningEffort": false }
+```
+
+不写不报错，只是按 OpenAI 标准格式发请求，DashScope 要么忽略要么 400。
+
+### 报错梯度是有意设计的
+
+> 前两层坏了**立刻炸**，第三层坏了要等**模型行为不对**才发现。
+
+```
+结构性错误（没调用器 / 协议不存在） → 快速失败
+兼容性差异（方言猜错）              → 宽容降级
+```
+
+自建 provider 踩的坑几乎都在第三层，加上 `reasoning`（默认 `false`，见 [adapter-layer.md](adapter-layer.md)），构成同一类问题：
+
+**配置漏一行 → 不报错 → 功能静默消失。**
+
+---
+
 ## `model-runtime.ts` 结构图（787 行，按需回查）
 
 | 行段 | 段落 | 何时读 |

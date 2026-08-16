@@ -51,6 +51,45 @@ if (compat.thinkingFormat === "qwen" && model.reasoning)
 
 少任何一个，`enable_thinking` 都不会发出去。`models.ts:903` 还有 `if (!model.reasoning) return ["off"]`——不支持推理的模型，`/model` 里思考档位选项直接消失。
 
+### ⚠️ 两个 `reasoning`，同名不同物
+
+grep 时最容易搞混的一处：
+
+```ts
+interface Model<TApi>  { reasoning: boolean; }        // types.ts:791  模型的静态能力，必填
+interface StreamOptions{ reasoning?: ThinkingLevel; } // types.ts:305  本次请求的档位，可选
+```
+
+一个是 `boolean`，一个是 `"minimal"|"low"|"medium"|"high"|"xhigh"|"max"`；一个描述模型，一个描述请求。上面那行守卫同时用到了两个：`model.reasoning` 是能力前提，`options?.reasoningEffort` 是本次档位。**全仓 `model.reasoning` 只有 8 处，`options.reasoning` 有几十处。**
+
+`model.reasoning` 的两类消费方：
+
+1. **能力查询** `models.ts:903` — `if (!model.reasoning) return ["off"]`，`/model` 菜单里思考档位直接消失
+2. **适配层守卫** — 六个协议族各一处（`openai-responses:312`、`anthropic-messages:1028`、`bedrock:1100`、`google:382/391`、`openai-completions:748/752`）。给不支持思考的模型发思考参数，多数厂商直接返回 400
+
+它的来源一路到你自己的配置：
+
+```
+~/.pi/agent/models.json  "reasoning": true
+  → model-config.ts:161   Type.Optional(Type.Boolean())      typebox 校验
+  → provider-composer.ts:156  definition.reasoning ?? false  ← 纯配置 provider 走这条
+  → Model.reasoning
+```
+
+`?? false` 的方向要记住：**配置里不写 = 不支持思考**。保守默认。dashscope 那行 `"reasoning": true` 删掉就静默失效——不报错，只是 `enable_thinking` 不再发出，模型退化成普通对话。**「配置漏一行 → 功能静默消失」是自建 provider 最常踩的坑。**
+
+（`provider-composer.ts:107` 是另一处赋值 `override.reasoning ?? model.reasoning`，对应覆盖内置 provider 的分支，见 [provider-loading.md](provider-loading.md)。）
+
+三个字段正交分工：
+
+| | 回答什么 |
+|---|---|
+| `model.reasoning` | **有没有**这个能力 |
+| `compat.thinkingFormat` | 用**什么格式**表达 |
+| `thinkingLevelMap` | 各档位**映射成什么值** |
+
+---
+
 `compat` 的类型是**条件类型**，随 `api` 变化：`openai-completions` → `OpenAICompletionsCompat`，`anthropic-messages` → `AnthropicMessagesCompat`。所以写配置时 IDE 只提示当前协议相关的字段。
 
 ---
