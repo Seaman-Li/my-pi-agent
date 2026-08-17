@@ -1120,12 +1120,239 @@ pi 靠这一条同时支持两类消费者：`Agent.processEvents` 是真 async�
 
 ---
 
+## 18. `satisfies`：既要检查，又不要拓宽
+
+### 它解决什么
+
+标注和推断各有一半缺陷（见第 10 条）：
+
+```ts
+const a: FinalizedToolCallOutcome = { toolCall, result, isError };
+//    ↑ 检查了，但 a 的类型被"压平"成 FinalizedToolCallOutcome，具体信息丢了
+
+const b = { toolCall, result, isError };
+//    ↑ 保留了具体类型，但拼错字段名不会被发现
+```
+
+`satisfies` 两个都要——**检查形状，但保留推断出的具体类型**：
+
+```ts
+// agent-loop.ts:513
+const finalized = {
+	toolCall,
+	result: preparation.result,
+	isError: preparation.isError,
+} satisfies FinalizedToolCallOutcome;
+```
+
+写错字段名立刻报错；同时 `finalized` 的类型仍是那个精确的对象字面量类型，不是被拓宽的接口。
+
+### 经典组合 `as const satisfies`
+
+```ts
+// harness/telemetry.ts:118
+} as const satisfies TelemetrySchemaDefinition;
+```
+
+`as const` 保住字面量类型（`"turn_start"` 而不是 `string`），`satisfies` 保证整体符合 schema。**两个都不用 `:` 标注,因为标注会把 `as const` 的效果抹掉。**
+
+### 和 `as` 的区别
+
+```ts
+const x = {...} as T;          // 断言：我说是 T 就是 T，编译器不查
+const y = {...} satisfies T;   // 校验：编译器查，不符合就报错
+```
+
+`as` 是**闭嘴**，`satisfies` 是**核对**。pi 里有一处两个连用：
+
+```ts
+// proxy.ts:319
+} satisfies ToolCall & { partialJson: string } as ToolCall;
+//  ↑ 先校验多带了 partialJson 的完整形状     ↑ 再抹掉多余字段对外宣称是 ToolCall
+```
+
+**先证明自己是对的，再降级暴露。** 这个顺序不能反。
+
+---
+
+## 19. 条件类型与 `infer`
+
+### 条件类型 = 类型层面的三元表达式
+
+```ts
+A extends B ? X : Y
+```
+
+`Model.compat`（`ai/src/types.ts:805`）是最直观的例子——**同一个字段，类型随 `api` 变化**：
+
+```ts
+compat?: TApi extends "openai-completions"
+	? OpenAICompletionsCompat
+	: TApi extends "openai-responses" | "azure-openai-responses" | "openai-codex-responses"
+		? OpenAIResponsesCompat
+		: TApi extends "anthropic-messages"
+			? AnthropicMessagesCompat
+			: TApi extends "bedrock-converse-stream"
+				? BedrockCompat
+				: never;
+```
+
+嵌套条件类型就是 `else if` 链，末尾的 `never` 是"都不匹配"。所以你写 dashscope（`api: "openai-completions"`）的配置时，IDE 只提示 `OpenAICompletionsCompat` 那几个字段。
+
+### `infer` = 在条件里给匹配到的部分起个名
+
+```ts
+// ai/src/providers/all.ts:58
+type ModelApi<TProvider, TModelId> =
+	(typeof MODELS)[TProvider][TModelId] extends { api: infer TApi }
+		? (TApi extends Api ? TApi : never)
+		: never;
+```
+
+读法：**"如果这个模型的类型长得像 `{ api: 某某 }`，把那个『某某』叫做 `TApi`"**。
+
+`infer` 只能出现在 `extends` 右边，作用域是 `?` 之后的分支。这就是 `Static<>`（第 9 条）内部的机制——从 typebox 的 schema 值类型里把对应的 TS 类型"抠"出来。
+
+Python 没有直接对应物。最近的类比是 `TypeVar` + 结构匹配，但 Python 的类型系统不能在类型层面做分支计算。
+
+---
+
+## 20. 映射类型 `[K in ...]`
+
+### `Record` 和 `Partial` 都是它做的
+
+```ts
+type Record<K extends keyof any, T> = { [P in K]: T };
+type Partial<T> = { [P in keyof T]?: T[P] };
+```
+
+所以第 6 条那个 `ThinkingLevelMap`：
+
+```ts
+type ThinkingLevelMap = Partial<Record<ModelThinkingLevel, string | null>>;
+```
+
+展开后就是 `{ off?: string|null; minimal?: string|null; ... }` —— **七个键各自可选**。三态（缺省 / `null` / 字符串）的来源就在这。
+
+### 仓库里最值得读的 27 行
+
+`ai/src/model-catalog.ts` 全文只有 27 行，把映射类型、`keyof`、索引访问、条件类型、`const` 类型参数全用上了：
+
+```ts
+type ModelId<TGroups extends ModelGroups> = {
+	[TApi in keyof TGroups]: keyof TGroups[TApi];
+}[keyof TGroups] & string;
+```
+
+拆开读：
+
+1. `{ [TApi in keyof TGroups]: keyof TGroups[TApi] }` —— 造一个"每个 api → 它下面所有 model id"的中间对象类型
+2. `[keyof TGroups]` —— 用索引访问把所有值**并成一个联合**（第 12 条那个套路）
+3. `& string` —— 收窄成字符串
+
+**"造一个临时对象类型，再用 `[keyof T]` 把它的值全部取出来变成联合"是类型体操最常见的手法**，值得记住形状。
+
+`-?` 这类修饰符也在仓库里出现过（`telemetry/src/index.ts:115`），意思是"去掉可选标记"，反向操作是 `+?`。
+
+---
+
+## 21. `asserts`：给运行时检查加上类型收窄
+
+全仓只有一处（`ai/src/api/openai-codex-responses.ts:117`）：
+
+```ts
+type SuccessfulAssistantMessage = AssistantMessage & { stopReason: "stop" | "length" | "toolUse" };
+
+function assertSuccessfulOutput(output: AssistantMessage): asserts output is SuccessfulAssistantMessage {
+	if (output.stopReason === "pending") throw new Error("Codex stream ended without a stop reason");
+	if (output.stopReason === "error" || output.stopReason === "aborted")
+		throw new Error(output.errorMessage || "An unknown error occurred");
+}
+```
+
+调用之后，**编译器认为 `output.stopReason` 只剩三种可能**：
+
+```ts
+assertSuccessfulOutput(output);
+// 这行之后 output 的类型自动变窄，不需要 if 包裹
+```
+
+和类型守卫（`x is T`）的区别：
+
+| | 写法 | 不满足时 |
+|---|---|---|
+| 类型守卫 | `function isX(v): v is X` | 返回 `false`，调用方自己分支 |
+| 断言函数 | `function assertX(v): asserts v is X` | **抛异常**，之后的代码直接享受窄类型 |
+
+⚠️ **两个坑**：
+
+1. **不能是"靠推断拿到类型"的函数**。写成箭头函数赋给 `const` 时，**调用点**会报错（不是声明处）：
+
+   ```ts
+   const assertArrow = (x: { s: string }): asserts x is Ok => { ... };
+   assertArrow(y);   // ❌ TS2775: Assertions require every name in the call target
+                     //    to be declared with an explicit type annotation
+   ```
+
+   修法是给 `const` 本身加类型标注，或者干脆用 `function` 声明——pi 那处就是 `function`。
+2. **编译器完全信任你**。函数体里不 throw 也不会被发现，收窄是凭签名给的，不是凭实现验证的。
+
+Python 的 `assert isinstance(x, T)` 在 mypy 下有类似效果，但那是内建行为；TS 的 `asserts` 是把这个能力开放给了自定义函数。
+
+---
+
+## 22. 模块解析：为什么 pi 的 import 都带 `.ts` 后缀
+
+```ts
+import { getDefaultStreamFn } from "./stream-fn.ts";   // 带后缀，且是 .ts 不是 .js
+```
+
+一般 TS 项目要么不写后缀，要么按 ESM 规范写 `.js`（哪怕源文件是 `.ts`）。pi 直接写 `.ts`，靠 `tsconfig.base.json` 两个选项：
+
+```jsonc
+"allowImportingTsExtensions": true,      // 允许 import 里写 .ts
+"rewriteRelativeImportExtensions": true, // 编译时把 .ts 改写成 .js
+```
+
+**源码里写你实际看到的文件名，构建时自动改写。** 这样 `node --experimental-strip-types` 能直接跑源码（剥掉类型后路径依然有效），`tsc` 构建出的 dist 里路径也正确。
+
+配套的还有：
+
+```jsonc
+"module": "NodeNext", "moduleResolution": "NodeNext",   // tsconfig.json:5-6
+"erasableSyntaxOnly": true,                              // tsconfig.base.json:7
+```
+
+### `erasableSyntaxOnly` 是编译器强制的
+
+第 1 条讲过 `enum` / `namespace` / 参数属性不可擦除。`AGENTS.md:20` 那条规则**不是靠自觉——`erasableSyntaxOnly: true` 会直接报错**：
+
+```
+Parameter property is only allowed in a .ts file when 'erasableSyntaxOnly' is disabled.
+```
+
+对比一下 `any`：`AGENTS.md:18` 说 "No `any` unless absolutely necessary"，但 `biome.json` 里 `noExplicitAny: "off"`——**那条是约定，这条是强制**（见 [adapter-layer.md](adapter-layer.md) 末尾）。
+
+**同一份 AGENTS.md 里的规则，强制力不一样。** 判断方法：去 `tsconfig` / `biome.json` 里找对应开关，找不到的就是纯约定。
+
+### 自己写示例时的注意
+
+`notes/examples/` 下的文件用 `node --experimental-strip-types` 跑，走的是 Node 的剥离模式而不是 tsconfig，所以：
+
+```bash
+# 顶层 await 需要额外标志（见 emit-backpressure.ts 头注释）
+npx tsc --noEmit --skipLibCheck --module esnext --target es2022 \
+        --moduleResolution bundler notes/examples/X.ts
+```
+
+**显式传文件路径时 `tsconfig.json` 是被忽略的**，所有选项得手动给。
+
+---
+
 ## 待补
 
 遇到再加：
 
-- `satisfies` 运算符（`openrouter-images.ts:93` 用到）
-- 条件类型 / `infer`（`Static<>` 内部大量使用，见第 9 条）
-- 映射类型 `[P in K]`（`Record<K,V>` 的实现原理，与第 12 条的 `keyof` 是一套机制的两面）
-- `asserts` 断言函数
-- 模块解析与 `.ts` 后缀导入（pi 用的 Node strip-only 模式，见 `AGENTS.md`）
+- 装饰器（`experimentalDecorators: true` 开着，但 `packages/*/src` 里一处未用——大概率是模板残留。注意装饰器**不可擦除**，真用了会和 `erasableSyntaxOnly` 冲突）
+- `const` 类型参数（`model-catalog.ts:23` 的 `<const TProvider>`，与第 20 条相关）
+- 变型（协变/逆变）在函数类型赋值上的表现（第 17 条"能少不能多"背后的规则）
