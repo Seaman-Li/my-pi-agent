@@ -3,6 +3,105 @@
 > Day 5 产出。`packages/agent/src/agent-loop.ts`（796 行），基于 `v0.84.1`。
 > 796 行里主循环 `runLoop` 只占 120 行（155–275），其余 670 行是工具执行的展开。
 
+## 零、五个验收问题的答案
+
+[STUDY-SCHEDULE.md](../STUDY-SCHEDULE.md) Day 5 要求回答的五个问题。细节见后面各节。
+
+### ① 循环在什么条件下继续？
+
+**只有 `hasMoreToolCalls`。** 条件里的第二项 `pendingMessages` 是人塞进来的（steering），不是循环自己的推进力。
+
+```ts
+let hasMoreToolCalls = true;                              // :171  外层进来先置真，为了至少跑一次
+    hasMoreToolCalls = false;                             // :206  进循环体立刻打回假
+    if (toolCalls.length > 0)
+        hasMoreToolCalls = !executedToolBatch.terminate;  // :216  唯一能翻回真的地方
+```
+
+> **默认是停。继续才需要理由，而理由只有一个：这一轮发出了工具调用，且没有全票要求终止。**
+
+这比 `if (有工具调用) continue` 更稳——**新增任何代码路径都不会意外让循环续跑**。
+
+### ② 什么条件下终止？
+
+四条出口，详见[第三节](#三四条终止路径)。要点：
+
+- **出口 ① 无 toolCall** 是日常 99%
+- **出口 ② `terminate` 内置工具一个都不用**——唯一生产者是扩展（`extensions/types.ts:1079`），且注释限定 *"when this call is blocked"*
+- **`stopReason` 的 7 个值里循环只判断 3 个**，`"stop"` 和 `"toolUse"` 一次都没出现
+
+> 终止不看模型「说」自己停了，只看它**有没有实际发出工具调用**——纯结构判定，不信任语义标记。
+
+即使某家厂商的 `finish_reason` 映射不准（`openai-completions.ts:578` 就在给不返回 `finish_reason` 的端点兜底），循环行为也不受影响。
+
+### ③ 工具结果怎么回灌？
+
+```ts
+currentContext.messages.push(result);   // :219  喂给下一轮 LLM
+newMessages.push(result);               // :220  返回给调用方持久化
+```
+
+**双写，不是引用共享。** 因为 `:234` 的 `prepareNextTurn` 能把 `currentContext` 整体换掉（压缩把 20 条换成 1 条摘要），此刻 `newMessages` 必须保住原始记录。详见[第六节](#六双写机制)。
+
+回灌内容带 `toolCallId`——模型靠它把结果对回自己发的哪个调用。
+
+### ④ 出错怎么处理？
+
+**8 处转成消息，4 处 `throw` 全在入口校验（71/75/128/132），循环内一次不抛。** 详见[第四节](#四错误哲学循环内一次都不-throw)。
+
+```
+普通程序：异常向上传播，找 handler
+agent：  异常向下传播，回模型
+```
+
+⚠️ **这条保护只覆盖工具。** 事件消费者的错误没有——`agent.ts:589` 的 listener 循环裸奔，一个 UI 订阅者抛异常会让整次运行被判定为失败，`errorMessage` 写进 assistant 消息，**看起来像模型出错了**。订阅者必须自己 try/catch，这个契约代码里没写。
+
+### ⑤ 中断怎么处理？
+
+**走一条和 `emit` 完全独立的通道，且传得更深。**
+
+```bash
+grep -c "signal: AbortSignal | undefined," agent-loop.ts   # 12
+grep -c "emit: AgentEventSink," agent-loop.ts              #  9
+```
+
+原因见[第七节](#七emit-为什么是回调而不是-yield)：`emit` 是回调，只能单向出。
+
+三个检查点：
+
+```
+① adapter 层         fetch 收到 signal → 断开 → stopReason = "aborted"
+② :196               循环发现 aborted → emit turn_end + agent_end → return（出口 ③）
+③ :478/516/535/629/648   工具执行的各个缝隙 → "Operation aborted" 消息
+```
+
+第三类值得注意：**工具执行到一半按 Esc 不是抛异常**，还是走 `createErrorToolResult("Operation aborted")`，和其他错误一个待遇。串行分支 `:478` 每执行完一个检查一次，中断后 `break`——**已完成的结果保留，未开始的不再执行**。
+
+别和 steering 混：
+
+| | 触发 | 当前工作 | 循环 |
+|---|---|---|---|
+| **steering** | 打字回车 | **正常跑完** | 继续，下一轮注入 |
+| **abort** | Esc | **被打断** | 出口 ③ 退出 |
+
+steering 的注释写得很明确：*"injected after the current assistant turn finishes"*——**它不是中断**。
+
+### 五条串起来
+
+```
+继续  ← 默认停，唯一理由是「发了工具调用」
+终止  ← 四条出口，主干是结构判定而非语义标记
+回灌  ← 双写，因为模型看的和真实发生的会分叉
+出错  ← 转成消息回喂模型，程序不崩（但只覆盖工具）
+中断  ← 独立的 signal 通道，因为 push 模型没有反向管道
+```
+
+> **这五条合起来定义了一件事：循环把「不确定性」全部推给模型，自己只保证结构正确。**
+
+它不判断内容对不对、不处理语义、不做重试策略——错误变成上下文，继续与否看结构，人要插话给通道，人要喊停给信号。796 行里真正的「逻辑」只有 120 行，剩下的全是把这四类信号可靠地传下去。
+
+---
+
 ## 一、数据类型 recap
 
 读循环前必须先分清这几个类型，否则 120 行代码看不懂。分三组。
