@@ -143,6 +143,203 @@ pi 依赖了 `@anthropic-ai/sdk`、`openai`、`@aws-sdk/client-bedrock-runtime`�
 
 ---
 
+## 响应方向：从 SSE 到 `AssistantMessage`
+
+上面讲的是**请求**方向。响应方向更能说明归一化在归一什么。
+
+### 六跳调用链
+
+我们那次 dashscope 请求，`agent-loop.ts:193` 的 `streamFunction(...)` 实际走了六跳：
+
+```
+runLoop:193                  streamFunction(config.model, llmContext, {...})
+  ▼  值 = 下面这个闭包
+sdk.ts:302                   async (model, context, options) => {...}
+  │                            + 超时、重试次数、attribution header、扩展钩子
+  ▼
+model-runtime.ts:636         ModelRuntime.streamSimple()
+  │                            + 凭证解析（此刻才跑 !security find-generic-password）、baseUrl 覆盖
+  ▼
+compat.ts:275                streamSimple<TApi>()
+  │                            按 model.api 查表分发
+  ▼
+openai-completions.ts:616    streamSimple           ← 翻译门面
+  │                            reasoning:"high" → reasoningEffort
+  ▼
+openai-completions.ts:200    stream                 ← 真正发 HTTP
+```
+
+`getDefaultStreamFn()` 一次都没出现——那是给第三方扩展的侧门，见 [provider-loading.md](provider-loading.md)。
+
+### `streamSimple` 是 `stream` 的翻译门面，不是替代品
+
+```ts
+// openai-completions.ts:616-634，全文 19 行
+export const streamSimple: StreamFunction<"openai-completions", SimpleStreamOptions> = (model, context, options) => {
+	const base = buildBaseOptions(model, context, options, options?.apiKey);
+	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
+	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
+	return stream(model, context, { ...base, reasoningEffort, toolChoice, thinkingBudgets } satisfies OpenAICompletionsOptions);
+};
+```
+
+| | options 类型 | 思考参数长什么样 |
+|---|---|---|
+| `streamSimple` | `SimpleStreamOptions` | `reasoning: "high"` ← **pi 的统一抽象** |
+| `stream` | `OpenAICompletionsOptions` | `reasoningEffort: <本协议的值>` ← **协议原生** |
+
+`clampThinkingLevel` 查 `model.thinkingLevelMap` 做映射。**agent 层只认识 pi 的抽象，所以必然用 `streamSimple`**；`stream` 留给"我明确知道在调 OpenAI"的调用方。六个协议族每家都有这一对。
+
+### 13 个事件不是 LLM 的出参，是 pi 自己的协议
+
+`types.ts:509` 的注释叫它 **"Event protocol for AssistantMessageEventStream"**。定义 13 种（`types.ts:516`）。原始 SSE 长这样：
+
+```json
+{"choices":[{"delta":{"content":"你"}}]}
+{"choices":[{"delta":{"reasoning_content":"嗯"}}]}
+```
+
+**OpenAI Chat Completions 的 chunk 全是同一个形状，没有任何事件类型字段。** 所以这里不是"类型映射"，是**合成**。对比 Anthropic——它的 SSE 自带 event type，adapter 就是个 switch：
+
+```
+anthropic-messages.ts:574/587/629/675/707
+  message_start / content_block_start / content_block_delta / content_block_stop / message_delta
+```
+
+**同样一套 13 个事件，Anthropic 是翻译出来的，OpenAI 兼容是造出来的。**
+
+### 全部 13 个发出点（openai-completions.ts）
+
+```
+:255  start          ← HTTP 响应头到手，chunk 循环之前
+      ┌ chunk 循环内 ────────────────────────────────
+:354  │ text_start        ensureTextBlock()      懒创建的副产品
+:366  │ thinking_start    ensureThinkingBlock()  同上
+:412  │ toolcall_start    toolCallBlocksByIndex 判重
+:481  │ text_delta        delta.content 非空
+:513  │ thinking_delta    delta.reasoning_content / reasoning / reasoning_text
+:543  │ toolcall_delta    delta.tool_calls[].function.arguments
+      └──────────────────────────────────────────────
+:569  for (const block of blocks) finishBlock(block);   ← 循环结束后统一收尾
+:311      text_end
+:318      thinking_end
+:343      toolcall_end
+:588  done           ← 四道校验通过后
+:608  error          ← catch 块
+```
+
+三种产生机制：
+
+**① `start` 的位置反直觉**——在 `for await` 之前。含义不是"模型开始说话"，是"连接就绪"。此时 `partial.content` 还是空数组，但已有 `model`/`provider`/`api`，UI 可以先画气泡。这解释了 `agent-loop.ts:319-323` 为什么在 `start` 时就 push 空占位。
+
+**② `*_start` 是懒创建的副产品**，不是"推断出该发 start"：
+
+```ts
+const ensureTextBlock = () => {
+	if (!textBlock) {                    // 还没有 → 这就是开始
+		textBlock = { type: "text", text: "" };
+		blocks.push(textBlock);
+		stream.push({ type: "text_start", contentIndex: getContentIndex(textBlock), partial: output });
+	}
+	return textBlock;                    // 已有 → 什么都不发
+};
+```
+
+**③ `*_end` 全部推迟到流结束后补发。** `finishBlock` 只有一个调用点（`:568-570`），在 chunk 循环**之后**。原因很实在：**这个协议无法知道一个块什么时候结束**——`delta.content` 停了，可能是结束，也可能只是这个 chunk 里没有。只有流断了才敢下结论。
+
+`finishBlock` 里的收尾才是重头：
+
+```ts
+} else if (block.type === "toolCall") {
+	block.arguments = parseStreamingJson(block.partialArgs);   // :335 累积的字符串 → 对象
+	delete block.partialArgs; delete block.customInput; delete block.streamIndex;   // :339 清临时缓冲
+	stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
+}
+```
+
+工具参数是分片流过来的字符串（`{"pa` → `th":"/tm` → `p"}`），流式期间只能往 `partialArgs` 里攒。**这正是 `stopReason === "length"` 要整批判错的原因**——`parseStreamingJson` 是尽力抢救，截断的参数可能"解析成功但内容不全"，见 [agent-loop.md](agent-loop.md) 第三节。
+
+> **真正流式的只有 `*_delta` 和 `*_start`；`*_end` 是事后补的。**「块生命周期完整」是 adapter 用状态机 + 事后收尾造出来的假象。
+
+---
+
+## `output` / `delta` / `partial` —— 一碗饭的比方
+
+```ts
+const output: AssistantMessage = { content: [], stopReason: "pending", ... };   // :208 循环外，只创建一次
+...
+block.text += choice.delta.content;                                              // :479 循环内，原地追加
+stream.push({ type: "text_delta", delta: choice.delta.content, partial: output });// :481 传的是引用
+```
+
+```
+delta   = 这一口饭（本次 chunk 的增量）
+output  = 碗（全程唯一一个，越吃越满）
+partial = 每次事件里递给你的那只碗的把手 —— 不是碗的照片
+```
+
+**`partial` 不是快照。** 从头到尾传的是同一个引用：第 3 个事件和第 300 个事件的 `partial`，`===` 为真，内容都是最终全文。
+
+### 用真实会话反推
+
+会话 `2026-08-10T05-11-12-537Z_019fea14…jsonl` 第 23 行是全场最小的一条 assistant 消息：
+
+```json
+[{"type":"thinking","thinking":"Done.\n","thinkingSignature":"reasoning_content"},
+ {"type":"text","text":"已创建 `notes/infra_learning.md`，包含了完整的架构分析内容。"}]
+```
+
+**注意：JSONL 里看不到流式过程。** 这个文件 48 行只有四种记录：
+
+```bash
+node -e 'const c={};require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n")
+  .forEach(l=>{const o=JSON.parse(l);c[o.type]=(c[o.type]||0)+1});console.log(c)' <file>
+# { session: 1, model_change: 1, thinking_level_change: 1, message: 45 }
+```
+
+落盘的只有 `message`——**`message_update` 一条都不存**。所以下面是按代码反推出的事件序列（假设 thinking 分 2 个 chunk、text 分 3 个）：
+
+| # | 事件 | `delta` | `output.content` 此刻的状态 |
+|---|---|---|---|
+| 1 | `start` | — | `[]` |
+| 2 | `thinking_start` | — | `[{thinking:""}]` |
+| 3 | `thinking_delta` | `"Done"` | `[{thinking:"Done"}]` |
+| 4 | `thinking_delta` | `".\n"` | `[{thinking:"Done.\n"}]` |
+| 5 | `text_start` | — | `[{thinking:"Done.\n"}, {text:""}]` |
+| 6 | `text_delta` | `"已创建 "` | `[…, {text:"已创建 "}]` |
+| 7 | `text_delta` | `` "`notes/infra_learning.md`，" `` | `[…, {text:"已创建 `notes/…md`，"}]` |
+| 8 | `text_delta` | `"包含了完整的架构分析内容。"` | `[…, {text: 全文}]` |
+| 9 | `thinking_end` | — | 同上（`finishBlock` 补发） |
+| 10 | `text_end` | — | 同上 |
+| 11 | `done` | — | `stopReason: "stop"` |
+
+**第 3 行和第 11 行拿到的 `partial` 是同一个对象。** 事件 3 发生时它的 `text` 还不存在；但如果你把那个引用存下来，等流跑完再打印，看到的是 JSONL 里那份完整内容。
+
+注意事件 9、10 的位置——`thinking_end` 排在所有 `text_delta` **之后**，因为 `finishBlock` 是循环结束后按 `blocks` 顺序一次性跑的。**块的 `end` 事件不在块内容结束时发出。**
+
+### 两个实际后果
+
+**① 消费者不需要自己拼字符串**
+
+```ts
+partialMessage = event.partial;    // agent-loop.ts:336  整个换掉，不是 +=
+```
+
+累积已经在 adapter 里做完了。UI 用 `delta` 做打字机效果，用 `partial` 拿完整状态。
+
+**② 但必须自己拷贝，否则"历史快照"会一起变**
+
+```ts
+await emit({ type: "message_update", assistantMessageEvent: event, message: { ...partialMessage } });
+//                                                                          ↑ agent-loop.ts:341
+```
+
+不拷的话，存下的所有快照最终都指向同一份最终内容。而且 `{...}` 只是**浅拷贝**——`content` 数组仍共享，UI 若缓存了 `message.content[0]` 照样会变。真要冻结得深拷。
+
+**这是 push 一个可变累积器的固有代价**：省掉了每个事件一次深拷贝的开销，把责任推给消费者。
+
+---
+
 ## 想细读时的六个锚点（约 200 行）
 
 按执行顺序，串起来是一次完整往返：
