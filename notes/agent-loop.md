@@ -203,6 +203,56 @@ tool_execution_start / _update / _end                一次工具调用
 
 ## 二、流程图
 
+### 速览：一步一句
+
+```
+① prompts + emit（在 runLoop 外）                       :109-114
+   ↓
+┌─ 外层 while(true) ───────────────────────────────────── :170
+│ ┌─ 内层 while(hasMoreToolCalls || pending) ──────────── :174
+│ │
+│ │ ② 注入 pendingMessages（steering 插队）               :182
+│ │
+│ │ ③ transformContext?()   上下文压缩挂这                :291
+│ │ ④ convertToLlm()        AgentMessage[] → Message[]    :295  ← 唯一转换点，单向
+│ │ ⑤ getApiKey?()          每轮重取（过期 token）        :306
+│ │ ⑥ 调 LLM + 消费事件流 + emit                          :308-371
+│ │ ⑦ newMessages.push(message)                           :194  ← 无转换，见下
+│ │
+│ │ ⑧ error / aborted？→ 提前 return             出口③    :196
+│ │ ⑨ filter 出 toolCalls                                 :203
+│ │ ⑩ hasMoreToolCalls = false（默认停）                  :206
+│ │ ⑪ 有工具 → 执行 → 双写回灌                            :207-222
+│ │      hasMoreToolCalls = !terminate          出口②     :216  ← 真正的续跑判定
+│ │ ⑫ prepareNextTurn?()    换上下文 / 换模型              :232
+│ │ ⑬ shouldStopAfterTurn?() → return           出口④     :247
+│ │ ⑭ 采集 steering → pendingMessages                     :259
+│ └──────────── 无 toolCall → 条件为假，退出    出口①
+│ ⑮ getFollowUpMessages?() 非空 → continue 回外层         :263
+└────────────────────────────────────────────────────────
+```
+
+**⚠️ 转换是单向的。** 没有「把 LLM 返回的消息转回 AgentMessage」这一步——因为它本来就是：
+
+```ts
+type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];   // agent/types.ts:325
+type Message      = UserMessage | AssistantMessage | ToolResultMessage;          // ai/types.ts:448
+```
+
+`AssistantMessage` ⊂ `Message` ⊂ `AgentMessage`，所以 `:194` 是裸 push。全仓 grep `convertFromLlm` / `fromLlm` / `toAgentMessage` **零结果**。
+
+`convertToLlm` 的作用是**扔掉**而不是转换——把宿主通过声明合并加进来的自定义消息（UI 通知、artifact）滤掉，LLM 不认识它们。回来的只有三种标准 role，天然合法。这就是文件头那句的含义：
+
+```ts
+* Agent loop that works with AgentMessage throughout.
+* Transforms to Message[] only at the LLM call boundary.
+```
+
+**另注意**：`currentContext.messages` / `newMessages` 是**累积的对话记录**（只增不减）；`steeringQueue` / `followUpQueue` 才是**队列**（drain 一次就空）。两者性质不同，别混称。
+
+### 完整版：带全部行号
+
+
 ```
 runAgentLoop(prompts, ...)                                          :95
   │  emit agent_start                                               :109
@@ -520,6 +570,60 @@ async *[Symbol.asyncIterator]() {                   // :50  拉的一端
 **队列 + 等待者数组**，push→pull 适配器的标准写法。注意 `push` 返回 `void` 且队列无上限——**这条路径没有背压**，消费慢了事件会在内存里堆积。CLI 量级无所谓，改造成长跑服务时要留意。
 
 ---
+
+## 八、读这份代码该从哪个方向进
+
+Day 5 反复撞的一个坑：**自底向上读依赖注入的代码，物理上看不到答案。**
+
+```ts
+config.getApiKey ? await config.getApiKey(...) : undefined      // :306
+```
+
+这行里**没有任何信息**能告诉你 `getApiKey` 是什么。往上找 `createLoopConfig` → `this.getApiKey` → `runtimeOptions.getApiKey` → **还是看不到**，因为那是构造函数参数。必须跳到 `sdk.ts:294` 才看见「根本没传」。
+
+**这不是四跳阅读，是四次跳空。** 而且这是依赖注入的固有性质，不是读法问题。
+
+### 分场景的规则
+
+| 你想搞清楚 | 方向 | 起手动作 |
+|---|---|---|
+| **某个值 / 配置从哪来** | **自顶向下** | 先 `grep` 注入点 |
+| 某个机制怎么运作 | 自底向上 | 直接读，`runLoop` 是自足的 |
+
+`runLoop` 的 120 行是**自足**的——终止条件、双写、错误转换全在文件里，自底向上读没问题。
+
+而 `getApiKey` / `streamFn` / `terminate` / `shouldStopAfterTurn` 这些**注入点**，自底向上必然晕，因为答案按设计就不在那里。
+
+### 可操作判据
+
+看到一个**参数或可选字段**，先别顺着读，问「谁给的」：
+
+```bash
+grep -rn "new Agent(" packages/*/src          # → sdk.ts:294，全仓唯一生产调用点
+grep -rn "setDefaultStreamFn" packages/*/src
+grep -rn "\.getApiKey =" packages/*/src
+```
+
+**三秒钟能省十分钟跳空。** 这和 [agent-factcheck.md](agent-factcheck.md) 案例 3 的防御是同一个动作。
+
+### 为什么这个库特别容易踩
+
+七个「符号存在 ≠ 主路径在用」的实例，**全部**是自底向上读时撞上的。不是巧合：
+
+> **一个同时做产品和 SDK 的库，底层看到的是「所有可能性」，顶层才是「实际选择」。**
+
+底层每个扩展点都留了「你自己来」和「我帮你办」两条路（`streamFn ?? getDefaultStreamFn()`、`providerOptions.apiKey ?? resolution.auth.apiKey`、两套 tools），而 pi 自己**一律走后者**。
+
+### 闭包让依赖在类型上隐身
+
+更深一层的原因：`sdk.ts:302` 传下来的是**闭包**，捕获了 `modelRuntime` / `settingsManager` / `extensionRunnerRef`，但 `StreamFn` 的签名里这三个都不出现。
+
+```ts
+type StreamFn = (model, context, options?) => AssistantMessageEventStream | Promise<...>;
+//               ↑ 没有 ModelRuntime，没有 SettingsManager
+```
+
+所以 `:308` 那行代码里，**被捕获的依赖是不可见的**——你看到一个函数调用，看不出它背后连着凭证解析、重试策略、扩展钩子。这不是写得不好，是分层的必然代价：`agent` 不能 import `ModelRuntime`（会造成反向依赖），只能收一个已经捕获了它的函数。
 
 ## 待跟进
 
