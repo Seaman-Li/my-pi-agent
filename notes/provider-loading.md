@@ -213,6 +213,64 @@ const isOpenRouter = provider === "openrouter" || baseUrl.includes("openrouter.a
 
 不写不报错，只是按 OpenAI 标准格式发请求，DashScope 要么忽略要么 400。
 
+### ④ 凭证：agent 层恒为 `undefined`，真正的注入在 ModelRuntime
+
+`agent-loop.ts:305` 看起来是取 apiKey 的地方：
+
+```ts
+// Resolve API key (important for expiring tokens)
+const resolvedApiKey =
+	(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+```
+
+**但 pi 自己走到这里时，两个值都是 `undefined`。**
+
+```
+config.getApiKey  ← agent.ts:474  getApiKey: this.getApiKey
+                  ← agent.ts:223  this.getApiKey = runtimeOptions.getApiKey
+                  ← sdk.ts:294    new Agent({ ... })   ← 传了 12 个字段，没有 getApiKey
+config.apiKey     ← createLoopConfig（agent.ts:448-483）从未赋值
+                    （grep -n "apiKey" packages/agent/src/agent.ts → 零结果）
+```
+
+所以 `undefined || undefined` → `undefined`。**这两行在 pi 主路径上恒等于 `undefined`。**
+
+真正的注入点在下游，靠 `??` 让路：
+
+```ts
+// model-runtime.ts:583  —— 把上层的（undefined）传进去问
+const resolution = await this.getAuth(model, { apiKey: options?.apiKey, env, signal });
+//                       ↑ 这里才跑 !security find-generic-password -ws pi-dashscope
+
+// model-runtime.ts:602  —— 上层给了就用上层的，没给才用自己解析的
+apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
+```
+
+> **`undefined` 不是失败信号，是「这一层弃权」的表达。** 值带着 `undefined` 一路往下传，到有能力解析的那一层被填上。
+
+而且 `getAuth` 的返回值不只有 key——`:600` 用 `resolution.auth.baseUrl` 覆盖 model 的 baseUrl，`:591` 合并 headers。**凭证解析和 baseUrl 覆盖是同一次操作**，这就是它必须在 ModelRuntime 而不是 agent 层的原因：agent 层不知道 provider 配置，查不了这些。
+
+两层各服务一类调用方，和 `streamFn` 那套完全同构：
+
+| 层 | 谁用 | 怎么拿 key |
+|---|---|---|
+| `config.getApiKey`（agent 层） | **SDK 使用者** | 自己给个函数，每轮调一次 |
+| `prepareRequest`（ModelRuntime） | **pi 自己** | 读 `models.json` + 跑 `!command` + OAuth 刷新 |
+
+这是第 7 个「符号存在 ≠ 主路径在用」（见 [agent-factcheck.md](agent-factcheck.md) 案例 3），而且形态最隐蔽：**代码确实执行了，只是结果恒为 `undefined`，再靠下游的 `??` 兜住。** grep 不出来，只能顺着值追。
+
+顺带一处细节——`:308` 的展开顺序是唯一防线：
+
+```ts
+{
+	...config,                 // config 里可能已有 apiKey（StreamOptions:124）
+	apiKey: resolvedApiKey,    // ← 必须在展开之后，否则新 key 被旧的覆盖
+	signal,
+}
+```
+
+写反了，`important for expiring tokens` 那条注释就白写了，**而且没有任何类型能拦住**。
+
 ### 报错梯度是有意设计的
 
 > 前两层坏了**立刻炸**，第三层坏了要等**模型行为不对**才发现。

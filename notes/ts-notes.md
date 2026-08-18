@@ -892,9 +892,96 @@ pi 就是这么做的：`packages/ai` 内部全靠 TS 类型，工具参数这�
 
 ---
 
-## 15. Promise 是急切的（Python 直觉会出错）
+## 15. Promise：四条心智模型
 
-### 基本盘
+前两条是**类型层面**，后两条是**运行时层面**。四条互不相干，不要互相推导。
+
+```
+① Promise<T> 里的 T = 未来 resolve 出来的值的类型，不是 Promise 自身的类型
+② await 只剥壳，对非 Promise 恒等  → 所以 Promise<T> | T 这种签名可行
+③ Promise 是急切的：函数一调用就在跑，await 只负责等，不负责启动（≠ Python 协程）
+④ 想「先排队后开跑」只能包 thunk（agent-loop.ts:522）
+```
+
+---
+
+### ① `Promise<T>` 的 `T` 是脱壳后的类型
+
+```ts
+const p: Promise<string | undefined> = keychain.get("pi-dashscope");
+//    ↑ p 本身是 Promise 对象，现在就有
+const v: string | undefined = await p;
+//    ↑ v 是等到之后的值
+```
+
+对比 Python——说的是同一件事，但**壳的位置不同**：
+
+| | 声明写什么 | 实际返回的对象 |
+|---|---|---|
+| Python | `async def f() -> str \| None` | coroutine |
+| TS | `function f(): Promise<string \| undefined>` | Promise |
+
+**Python 的返回标注是「脱壳后」的，TS 的是「带壳」的。** 所以 TS 能写出 `Promise<T> | T` 这种签名（壳在类型里，可以选择性地不要），Python 没法在一个签名里表达「可能是 coroutine 也可能不是」。
+
+### ② `await` 只剥壳，对非 Promise 恒等
+
+类型规则叫 `Awaited<T>`：
+
+```ts
+type A = Awaited<Promise<string>>;   // string
+type B = Awaited<string>;            // string   ← 非 Promise 原样返回
+```
+
+对联合类型**逐支处理再合并去重**：
+
+```
+       Promise<string | undefined>  |  string  |  undefined
+await       ↓                          ↓          ↓
+         string | undefined         |  string  |  undefined
+                              合并 → string | undefined
+```
+
+**正因为「非 Promise 原样返回」，一个 `await` 才能吃掉同步和异步两种实现**：
+
+```ts
+// agent.ts:103
+getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+
+// agent-loop.ts:306  —— 实现方写 async 也行，写普通函数也行
+const k = config.getApiKey ? await config.getApiKey(provider) : undefined;
+```
+
+三支各对应一类实现：
+
+| 支 | 实现形态 | 例子 |
+|---|---|---|
+| `Promise<string \| undefined>` | 异步查 | 读钥匙串、刷 OAuth、发 HTTP |
+| `string` | 同步立刻有 | 从内存 Map 读 |
+| `undefined` | 明确表示「我没有」 | 让下游自己解析 |
+
+**三支的存在是为了不强迫实现方 `async`。** 只写 `Promise<string>` 的话，「我内存里就有」的实现也得包一层 `async`，白付一次微任务调度。和第 17 条的 `Promise<void> | void` 是同一个设计动机。
+
+### 忘写 `await` 会怎样
+
+```ts
+const k = config.getApiKey?.("p");        // 类型里还留着 Promise<...> 那一支
+streamFunction({ ...config, apiKey: k }); // ❌ 编译报错：Promise 不能赋给 string
+```
+
+**`apiKey?: string` 这个标注就是防线，TS 拦得住。** 实测只有值经过 `any` 才会溜到运行时：
+
+```ts
+const k = config.getApiKey?.("p") as any;
+streamFunction({ ...config, apiKey: k });   // ✅ 编译通过
+```
+
+那时 Promise 对象被当字符串用，请求头变成 `Bearer [object Promise]`，provider 返回 **401**。**不是无声失败，是症状指向错误方向**——你会去查钥匙串、查 key 过期没有，而真正原因是少写一个 `await`。「报错但报错原因误导」比完全无声更难查。
+
+注意这个 bug 和第 ③ 条（急切性）**无关**。Python 同样会犯（`k = get_api_key(p)` 拿到 coroutine），而且 Python 还多一层 `RuntimeWarning: coroutine was never awaited`。**TS 靠类型拦，Python 靠运行时警告拦，两边都有防线。**
+
+---
+
+### ③④ 运行时层面：Promise 是急切的（Python 直觉会出错）
 
 Promise 是"值还没到，但迟早会到"的占位对象，三种状态不可逆：
 
