@@ -159,9 +159,23 @@ cd /Users/simonli/Downloads/MyProjects/PiAgent
 
 ### Day 6 — `agent` 层：harness 与状态归约
 
-- **主线**：`src/harness/agent-harness.ts`（508）、`src/harness/reducer.ts`（667）、`src/harness/types.ts`（315）
+> ⚠️ **开工时的修正**：`agent-harness.ts`（508）**是脚手架，不是实现**。22 个方法直接
+> `Promise.reject(new HarnessNotImplemented(op))`（`:355` 的 `unavailable()`），能跑的
+> 只有 getter/setter。测试文件名就叫 `agent-harness-scaffold.test.ts`。
+> 唯一的生产调用方 `coding-agent/src/server/create-harness.ts` 也只有 test 在调。
+> **所以主线改为 `reducer.ts`，`agent-harness.ts` 降级为「读接口看设计意图」。**
+
+- **主线**：`src/harness/reducer.ts`（667）、`src/harness/types.ts`（315）、`src/harness/session/state.ts`（344）
 - **核心概念**：状态不是攒在变量里，而是从事件流 **reduce** 出来的。这是 pi 和玩具 agent 的分水岭——可回放、可分支、可持久化都源于此。Python 类比：类似 Redux/事件溯源，不是 ORM 式的可变对象。
+- **顺带（20 分钟）**：读 `agent-harness.ts` 的 `AgentLane` 接口（`:271-303`）当**设计意图声明**。里面四个 Day 5 没见过的概念，是 pi 的下一代架构：
+  - `navigateTree(targetId)` —— 会话是**树**，能跳到任意节点
+  - `lane()` / `createLane()` / `lanes()` —— **多条并行车道**
+  - `peekAction()` / `executeAction()` —— **单步执行**
+  - `nextRun()` —— 第三个队列（Day 5 只见到 steer / followUp）
+
+  当前 `AgentSession`（3342 行）走的还是老路，这些都是 `not implemented **yet**`。
 - **验证**：写个小脚本（Python 也行）读一份 session JSONL，自己 reduce 出"最终有几条消息、调了几次工具、总 token"，再和 pi 显示的对上
+  - **建议从这一步开始**，而不是先读 667 行代码——手上有 48 行真实会话（`~/.pi/agent/sessions/--Users-simonli-Downloads-MyProjects-PiAgent--/2026-08-10T05-11-12-537Z_*.jsonl`），先自己算，再看 pi 怎么算，比自底向上读更不容易晕（见 [notes/agent-loop.md](notes/agent-loop.md) 关于阅读方向的结论）
 
 ### Day 7 — `agent` 层：工具实现 + 第一周复盘
 
