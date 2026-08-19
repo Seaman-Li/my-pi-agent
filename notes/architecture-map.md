@@ -183,18 +183,121 @@ grep -rn "createCodingAgentHarness" packages | grep -v node_modules | grep -v di
 
 ---
 
+## `agent` vs `coding-agent`：能力清单
+
+Day 6 查清的。**核心结论：`packages/agent` 是通用 agent 库，`coding-agent` 是它的一个具体产品实例。你完全可以只用前者做别的类型的 agent——这就是它的主要用途。**
+
+`packages/agent/README.md` 的 Quick Start 就是干这个的，20 行造一个 agent：
+
+```ts
+const agent = new Agent({
+	initialState: { systemPrompt: "You are a helpful assistant.", model },
+	streamFn: models.streamSimple.bind(models),
+});
+agent.subscribe((event) => { /* 渲染 */ });
+await agent.prompt("Hello!");
+```
+
+**README 513 行里一次都没提 `harness`**——讲的全是 `Agent` 类、事件流、工具、自定义消息类型。印证那条规律：**`Agent` 类是现在给外部用的稳定 API，`AgentHarness` 是将来的。**
+
+### 两个包的分工
+
+| | `packages/agent`（12191） | `packages/coding-agent`（58672） |
+|---|---|---|
+| 定位 | **通用 agent 库** | **一个具体产品**（编码助手 CLI） |
+| npm 名 | `@earendil-works/pi-agent-core` | `@earendil-works/pi-coding-agent`（`bin: pi`） |
+| 核心 | `agent-loop.ts` 796 + `agent.ts` 592 | `agent-session.ts` 3342（缝合层） |
+| 工具 | 4 个最小实现（1190） | 10 个产品级（4142，带权限/渲染/截断） |
+| UI | ❌ 无 | ✅ `modes/interactive` 17362 + 依赖 tui |
+| 配置系统 | ❌ 无 | ✅ `settings-manager` 1272 + `models.json` |
+| 扩展机制 | ❌ 无 | ✅ `extensions/` 1414 |
+| 测试 | 20 文件 / 8260 行 | 221 文件 / 49251 行 |
+
+**后者是前者的 4.8 倍——这个比例说明「从内核到产品」要补多少东西。**
+
+### `agent` 现在**能**给你
+
+| 能力 | 在哪 | 状态 |
+|---|---|---|
+| Agent 循环（工具调用、终止、错误回喂） | `agent-loop.ts` | ✅ 见 [agent-loop.md](agent-loop.md) |
+| 状态管理 + 事件订阅 | `agent.ts` | ✅ |
+| steering / followUp 队列 | `agent.ts:125` | ✅ |
+| 中断（AbortSignal） | 全程 | ✅ |
+| 自定义消息类型（声明合并） | `types.ts:316` | ✅ |
+| 换模型 / 换上下文 | `prepareNextTurn` | ✅ |
+| 工具前后钩子（权限拦截、结果改写） | `beforeToolCall`/`afterToolCall` | ✅ |
+| bash / read / edit / write 四个基础工具 | `harness/tools/` | ✅ 可直接用 |
+| 上下文压缩 | `harness/compaction/` | ✅ 848 行 + 测试 |
+| 会话持久化（JSONL） | `harness/session/` | ✅ 993 行一致性测试 |
+| Skills / 提示词模板 | `harness/skills.ts`、`prompt-templates.ts` | ✅ |
+| 执行环境抽象（本地/容器/远端） | `harness/env/` | ✅ 695 行 |
+| 埋点 | `harness/telemetry.ts` | ✅ |
+
+### `agent` **不能**给你
+
+| 缺什么 | 后果 | 谁补 |
+|---|---|---|
+| **任何 UI** | 终端/Web/Slack 前端全自己写 | 你 |
+| **配置系统** | model 得代码里硬写或自己读文件 | 你 |
+| **凭证管理** | `getApiKey` 是空钩子（见 [provider-loading.md](provider-loading.md)） | 你 |
+| **provider 目录 + 覆盖** | 得自己组 `Model` 对象 | 你，或抄 `model-runtime.ts` |
+| **grep / find / ls 工具** | 只有 bash/read/edit/write | 你 |
+| **权限确认交互** | 钩子有了，UI 没有 | 你 |
+| **崩溃恢复 / 会话树 / 多 lane / 子 agent** | `AgentHarness` 22 方法 reject | **等 pi**，或按 `harness.md` 自己实现 |
+
+### 关于 `harness/` 的成熟度——一个要点
+
+「pi 不用 harness」≠「harness 没做完」。**除顶层 `agent-harness.ts` 外全部是真实现**：
+
+```
+模块                       行数   未实现标记   测试
+reducer.ts                  667      0        ✅
+compaction/compaction.ts    848      0        ✅
+session/（8 文件）          2000+     0        ✅ 含 993 行 conformance
+skills.ts / prompt-templates 637      0        ✅
+env/nodejs.ts               695      0        ✅
+tools/                     1190      0        ✅
+telemetry.ts                615      0        ✅
+──────────────────────────────────────────────────
+agent-harness.ts            508     22 处     ⚠️ scaffold
+```
+
+**积木都做好了，缺的是把它们串起来的指挥。** 上游（`v0.84.2`，比我们的锚点新 208 个提交）17 个 harness 提交全落在 `session/` 和新增的 `events.ts`，`reducer.ts` 与 `agent-harness.ts` **一个字未改**。
+
+开发顺序自下而上，对应 `packages/agent/docs/harness.md`（上游新增的 2941 行规格书，v0.84.1 里没有）：
+
+```
+Part 1 Storage         ← 现在在这（session/ 在猛改）
+Part 2 Tree            ← session/types.ts 在改
+Part 3 State machine   ← reducer.ts，写好了但没接
+Part 4 Recovery        ← 还没
+Part 5 Public surface  ← agent-harness.ts，接口定了，实现全空
+```
+
+---
+
 ## 改造成自己的项目时的取舍
 
 按「保留 / 替换 / 丢弃」分三档：
 
 **直接复用（约 3.5 万行，自己写不划算）**
-`ai` 全部 + `agent/agent-loop.ts` + `agent/harness/{session,compaction,reducer}`。协议适配和会话持久化是纯苦力活，没有产品特色。
+`ai` 全部 + `agent/agent-loop.ts` + `agent.ts` + `harness/{session,compaction,tools,env}`。协议适配和会话持久化是纯苦力活，没有产品特色。
 
 **参考后重写（约 1.5 万行）**
 `coding-agent/core/tools/` —— 工具集是产品定位的体现，你的场景大概率不是 coding。
-`coding-agent/core/agent-session.ts` —— 3342 行的缝合层，逻辑要看懂但代码要自己写。
+`coding-agent/core/model-runtime.ts` + `provider-composer.ts` —— **凭证与 provider 组合逻辑值得整段抄**，`agent` 层没有替代品。
+`coding-agent/core/agent-session.ts` —— 3342 行缝合层，逻辑要看懂但代码要自己写。
 
 **多半用不上（约 5 万行）**
 `tui` + `modes/interactive` + `package-manager` + `extensions`。除非也要做终端交互产品。
 
-**最小可用组合 ≈ `ai` + `agent` + 自己的工具集 + 自己的前端。**
+**⚠️ 不要动 `AgentHarness`** —— 半成品，接上去会跟着上游一起变。要崩溃恢复/会话树这些能力，按 `packages/agent/docs/harness.md` 自己实现，或者等它做完。
+
+```
+你的 agent = packages/ai                          原样用
+           + packages/agent 的 Agent + agent-loop  原样用
+           + harness/{tools, compaction, session}  挑着用
+           + 抄一份 model-runtime 的凭证/provider 逻辑
+           + 你自己的工具集      ← 产品定位在这
+           + 你自己的前端        ← 最大工作量
+```
