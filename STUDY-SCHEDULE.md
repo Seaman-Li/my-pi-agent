@@ -159,23 +159,83 @@ cd /Users/simonli/Downloads/MyProjects/PiAgent
 
 ### Day 6 — `agent` 层：harness 与状态归约
 
-> ⚠️ **开工时的修正**：`agent-harness.ts`（508）**是脚手架，不是实现**。22 个方法直接
-> `Promise.reject(new HarnessNotImplemented(op))`（`:355` 的 `unavailable()`），能跑的
-> 只有 getter/setter。测试文件名就叫 `agent-harness-scaffold.test.ts`。
-> 唯一的生产调用方 `coding-agent/src/server/create-harness.ts` 也只有 test 在调。
-> **所以主线改为 `reducer.ts`，`agent-harness.ts` 降级为「读接口看设计意图」。**
+> ⚠️ **开工时的重大修正：整个 `harness/` 目录 pi 都没在用。**
+>
+> ```bash
+> grep -rn "reduceLaneState\|validateRecordLog\|LaneState" packages | grep -v node_modules | grep -v /dist/
+> # → 只有 packages/agent/test/harness/reducer.test.ts
+> ```
+>
+> - `reducer.ts`（667）**零生产调用**，`agent/src/index.ts` 甚至没导出它
+> - `agent-harness.ts`（508）22 个方法 `Promise.reject(new HarnessNotImplemented(op))`，
+>   能跑的只有 getter/setter，测试文件名就叫 `agent-harness-scaffold.test.ts`
+> - `coding-agent` 有一整套**平行实现**，只从 agent 包 import 类型，实现一行不复用
+>
+> | 功能 | harness 层 | coding-agent 层 | pi 实际用 |
+> |---|---|---|---|
+> | 主控 | `agent-harness.ts` 508（22 方法 reject） | `agent-session.ts` 3342 | 后者 |
+> | 归约 | `reducer.ts` 667（零调用） | 状态散在 `agent-session` 里 | 后者 |
+> | 压缩 | `compaction/` 1128 | `core/compaction/` 969 | 后者 |
+> | 会话存储 | `session/` 2000+ | `core/session-manager.ts` 1714 | 后者 |
+> | 工具 | `tools/` 1190 | `core/tools/` 4142 | 后者 |
+>
+> **`harness/` = pi 正在写的第二代内核；`coding-agent/core/` = 现役的第一代。**
+> `HarnessNotImplemented` 消息里那个 **yet** 就是这个意思。
 
-- **主线**：`src/harness/reducer.ts`（667）、`src/harness/types.ts`（315）、`src/harness/session/state.ts`（344）
-- **核心概念**：状态不是攒在变量里，而是从事件流 **reduce** 出来的。这是 pi 和玩具 agent 的分水岭——可回放、可分支、可持久化都源于此。Python 类比：类似 Redux/事件溯源，不是 ORM 式的可变对象。
-- **顺带（20 分钟）**：读 `agent-harness.ts` 的 `AgentLane` 接口（`:271-303`）当**设计意图声明**。里面四个 Day 5 没见过的概念，是 pi 的下一代架构：
-  - `navigateTree(targetId)` —— 会话是**树**，能跳到任意节点
-  - `lane()` / `createLane()` / `lanes()` —— **多条并行车道**
-  - `peekAction()` / `executeAction()` —— **单步执行**
-  - `nextRun()` —— 第三个队列（Day 5 只见到 steer / followUp）
+### 什么是 harness
 
-  当前 `AgentSession`（3342 行）走的还是老路，这些都是 `not implemented **yet**`。
-- **验证**：写个小脚本（Python 也行）读一份 session JSONL，自己 reduce 出"最终有几条消息、调了几次工具、总 token"，再和 pi 显示的对上
-  - **建议从这一步开始**，而不是先读 667 行代码——手上有 48 行真实会话（`~/.pi/agent/sessions/--Users-simonli-Downloads-MyProjects-PiAgent--/2026-08-10T05-11-12-537Z_*.jsonl`），先自己算，再看 pi 怎么算，比自底向上读更不容易晕（见 [notes/agent-loop.md](notes/agent-loop.md) 关于阅读方向的结论）
+英文原意是**马具**——套在马身上、让人能驾驭它的装备。软件里指「把核心组件套起来、让它能被实际驱动的外围设施」。agent 至少三层：
+
+```
+模型      能生成文本和工具调用          ← packages/ai
+循环      反复调模型、执行工具、回灌    ← agent-loop.ts（Day 5）
+harness   会话存哪、上下文超了怎么办、
+          工具从哪来、崩了怎么恢复、
+          状态怎么给 UI 看              ← 这一层
+```
+
+**都不是「智能」的部分，但少一个 agent 就不能用。** 「同一个模型、不同 harness，表现差很多」说的就是这层——各家 agent 产品的差异主要在这里，不在模型。
+
+### 阅读顺序与方法
+
+**分两条线，方向相反。**
+
+| 顺序 | 读什么 | 方向 | 为什么 |
+|---|---|---|---|
+| **0** | 写 JSONL 归约脚本（见下方验证） | 从数据进 | 先建立直觉，再看代码 |
+| **1** | `src/harness/reducer.ts`（667） | **自底向上，完整读** | 它自足、干净、有完整测试，是**事件溯源的教学样本**。对「改造成自己的项目」价值最高——可以直接抄这套设计，不用背 3342 行的历史包袱 |
+| **2** | `coding-agent/src/core/agent-session.ts`（3342） | **自顶向下，只查三个问题** | ① 状态存在哪 ② 消息怎么落盘 ③ 压缩什么时候触发。**不要通读**，用 grep 定位即可 |
+| **3** | `agent-harness.ts` 的 `AgentLane` 接口（`:271-303`），20 分钟 | 只读接口 | 当**设计意图声明**看 |
+
+方向的依据见 [notes/agent-loop.md](notes/agent-loop.md) 第八节：**机制自足的代码自底向上读；要追某个值/配置从哪来的，一律自顶向下先 grep 注入点。**
+
+`reducer.ts` 属于前者（纯函数，输入输出都在签名里）；`agent-session.ts` 属于后者（缝合层，到处是注入和回调）。
+
+### 核心概念
+
+状态不是攒在变量里，而是从事件流 **reduce** 出来的。可回放、可分支、可持久化都源于此。Python 类比：Redux / 事件溯源，不是 ORM 式的可变对象。
+
+对照着看差异最清楚：
+
+- **第一代**（`AgentSession`）：状态攒在实例字段里 → 做不到回放和分支
+- **第二代**（`reduceLaneState`）：状态从记录日志算出来 → `navigateTree` / `resume` / 多 lane 才成为可能
+
+`AgentLane` 接口里四个 Day 5 没见过的概念，全都依赖第二代的归约模型：
+
+- `navigateTree(targetId)` —— 会话是**树**，能跳到任意节点重开分支
+- `lane()` / `createLane()` / `lanes()` —— **多条并行车道**
+- `peekAction()` / `executeAction()` —— **单步执行**（调试 / 审批场景）
+- `nextRun()` —— 第三个队列（Day 5 只见到 steer / followUp）
+
+### 验证（建议先做这一步）
+
+写个小脚本（Python 也行）读一份 session JSONL，自己 reduce 出「最终有几条消息、调了几次工具、总 token」，再和 pi 显示的对上。
+
+```
+~/.pi/agent/sessions/--Users-simonli-Downloads-MyProjects-PiAgent--/2026-08-10T05-11-12-537Z_*.jsonl
+```
+
+48 行，19 条 assistant 消息，含并行工具调用。**先自己算，再看 pi 怎么算**——比先读 667 行代码更不容易晕。
 
 ### Day 7 — `agent` 层：工具实现 + 第一周复盘
 
