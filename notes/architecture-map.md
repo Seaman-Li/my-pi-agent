@@ -247,6 +247,9 @@ await agent.prompt("Hello!");
 
 ### 关于 `harness/` 的成熟度——一个要点
 
+> 📖 harness 的数据模型（Session / Lane / Entry / Record、树与分支、恢复流程）
+> 单独记在 [harness-model.md](./harness-model.md)。
+
 「pi 不用 harness」≠「harness 没做完」。**除顶层 `agent-harness.ts` 外全部是真实现**：
 
 ```
