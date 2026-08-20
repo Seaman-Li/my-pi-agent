@@ -67,7 +67,7 @@ appendRecord(operation_finished)  ← 结算，Record
 
 ---
 
-## 二、Entry：7 种类型，两条消费通路
+## 二、Entry：7 种类型（上游已减到 4 种），两条消费通路
 
 ```ts
 export type Entry =
@@ -139,6 +139,40 @@ Entry 树（沿 leafId → parentId 回溯）
 
 配置若是可变字段，切分支就串味；放进树里它自动跟着分支走。
 这是**事件溯源 vs 可变字段**那组对立在这里的落地——同一个 `AgentSession` 用可变字段，`harness` 用事件溯源。
+
+### ⚠️ 但上游推翻了这个决定
+
+**v0.84.1（本地）**——配置是树上的 entry，`Entry` 有 **7 种**。
+
+**上游 v0.84.2（`packages/agent/docs/harness.md:621` §2.1）**——只剩 **4 种**：
+
+```ts
+type Entry = MessageEntry | CompactionEntry | BranchSummaryEntry | CustomEntry;
+```
+
+三个配置 entry 全没了，搬到 lane 自己的寄存器上（§2.3）：
+
+```
+lane.leaf/{name}    = entry id or null
+lane.config/{name}  = LaneConfiguration      // { model, thinkingLevel, activeToolNames }
+lane.state/{name}   = LaneState
+```
+
+> `LaneConfiguration` is **total**. A setter overwrites the whole register;
+> it is never a patch and **never a tree entry**.
+
+语义整个掉了个个儿：
+
+| | v0.84.1 | 上游 |
+|---|---|---|
+| 配置跟着谁走 | **分支** | **lane** |
+| `navigateTree` 之后模型是 | 目标节点当时的值 | **不变** |
+| 两条 lane 停在同一节点 | 配置必然相同 | **可以不同** |
+
+上面那段「配置必须进树否则切分支串味」是对 v0.84.1 代码的正确解读，
+但**pi 自己想清楚之后选了反面**——「这条车道用什么车」是车道的属性，不是路面的属性。
+
+📌 改造自己的项目时这条直接可用：**配置放 lane 上更简单，也是 pi 最终的选择。**
 
 ---
 
@@ -293,6 +327,46 @@ export interface LanePointer {
 | `git checkout <commit>` | `navigateTree(targetId)` |
 | commit 树 | Entry 树（`parentId`） |
 
+### 磁盘上 lane 只存一个字段
+
+v0.84.1 里 lane 持久化的东西**只有 `leafId`**。前面说的「lane 拥有配置、队列、operation」，
+在 v0.84.1 里全是**算出来的**：
+
+| lane 的东西 | 存哪 |
+|---|---|
+| `leafId` | ✅ 真存 |
+| 配置（模型 / thinking / 工具） | ❌ 从 entry 树重放算出（`deriveEffectiveConfiguration`） |
+| 三个队列 | ❌ 从 `queue_enqueued` record 算出 |
+| 当前 operation | ❌ 从 `operation_started` record 算出 |
+
+> **`LaneState` 是 reducer 的产物，不是磁盘上的东西。磁盘上只有一个指针。**
+
+内存里就是一个 Map：
+
+```ts
+this.lanes: Map<string, string | null>      // lane 名 → leafId
+lanes = { "main" → "e3" }
+```
+
+### 指针怎么动：追加时不写额外的行
+
+```ts
+case "entry": {
+	if (mutation.entry.parentId !== leafId) invalid("does not chain to the lane leaf");  // :112
+	...
+	if (mutation.lane !== undefined) this.lanes.set(mutation.lane, mutation.entry.id);   // :121
+}                                                                        // session/state.ts
+```
+
+- **`:112`** 新 entry 的 `parentId` **必须**等于当前 leafId，否则整个文件判无效。
+  「追加永远是直线」是硬校验，不是约定。
+- **`:121`** 追加完顺手挪指针，**不写额外日志行**——entry 那行自带 `lane` 和 `id`，重放能推出来。
+
+所以独立的 lane 行 `{"kind":"lane","seq":5,"lane":"main","leafId":"e2"}`
+**只在指针「不跟着追加走」时出现**——`createLane` / `moveLane`（`navigateTree` 的底层）。
+
+> **正常往下长 → 指针隐式跟着走，不留痕。回退开分支 → 必须显式写一行。**
+
 所有 Entry 共用**一棵树**，lane 只是树上的几个书签。
 所以 `session.appendCustomEntry()` 默认写 `"main"`（`session.ts:183`）——单 lane 场景感觉不到它存在。
 
@@ -431,16 +505,77 @@ export type ForkOptions =
 ③ 旁路数据        queue_enqueued / queue_cancelled / write_deferred / usage
 ```
 
-**它们身上都挂着一个指向 Entry 的字段**——这就是 Record 对上层的全部意义：
+### 心智模型：record 不在树里，别拿树去套它
 
-| Record | 指向 Entry 的字段 |
-|---|---|
-| `step_attempt` | `resultEntryId` |
-| `tool_started` | `assistantEntryId` + `resultEntryId` |
-| `queue_enqueued` | `target: ProvisionedEntry` |
-| `write_deferred` | `target: ProvisionedEntry` |
-| `usage` | `entryId` |
-| `operation_started` | `intent.initialMessages: ProvisionedEntry[]` |
+**entry 树是逻辑视图，不是存储形态。** 文件里 entry 也是平铺的，一行一条：
+
+```jsonl
+{"type":"message","id":"e1","parentId":null,...}
+{"type":"message","id":"e2","parentId":"e1",...}
+```
+
+record 长得**一模一样**，也是一行一条：
+
+```jsonl
+{"kind":"record","type":"tool_started","id":"r4","seq":4,"lane":"main","resultEntryId":"e3",...}
+```
+
+> **唯一的区别：record 没有 `parentId`。没有那根线就拼不成树，只能按 `seq` 排成一条直线。**
+
+record 彼此之间**没有指针**。`runId` 只是个**分组键**（「这几条属于同一次操作」），不是父子关系。
+所有箭头都是单向的 **record → entry**；entry 完全不知道有 record 存在。
+
+```
+        树（空间：会分叉）                    带子（时间：只增长）
+                                    │
+              e1                    │   seq 1  operation_started {r1}
+              ↑                     │   seq 2  step_attempt      ──→ e2
+              e2  ←─────────────────┼───────────────────────────────┘
+              ↑                     │   seq 3  usage             ──→ e2
+            ┌─┴─┐                   │   seq 4  tool_started      ──→ e3  ✗还不存在
+           e3   e5                  │   seq 5  operation_finished
+                                    │
+        parentId 连成树              │   （record 之间没有任何连线）
+```
+
+类比：**树 = 文件系统的目录树；lane = 当前工作目录；record = 文件系统的 journal。**
+ext4 的 journal 就是「我打算写这几个块」→ 真写 → 「写完了」，平时没人看，只有崩溃后 fsck 才读一遍。
+**你不会遍历 journal 去找文件。**
+
+最土的说法：**record 就是你平时写的 log，只不过是结构化的、而且程序自己会读回去。**
+pi 只多做一件事——**把结果的 id 提前写进 log 里**，于是 log 从「给人看的」变成「程序能对账的」。
+
+### 指针有三个方向，不是每条 record 都有预约
+
+| Record | 指向 entry 的字段 | 方向 |
+|---|---|---|
+| `operation_started` | `sourceLeafId` | ← 回指（起点，已存在） |
+| | `intent.initialMessages` / `resultEntryId` / `summaryEntryId` | → **预约** |
+| `step_attempt` | `resultEntryId` | → **预约** |
+| `tool_started` | `assistantEntryId` | ← 回指（哪条消息发的调用） |
+| | `resultEntryId` | → **预约** |
+| `queue_enqueued` | `target: ProvisionedEntry` | → **预约**（连内容一起带） |
+| `write_deferred` | `target: ProvisionedEntry` | → **预约** |
+| `queue_cancelled` | `entryId` | ✗ 作废一个预约（这 entry 永远不会存在） |
+| `usage` | `entryId` | ← 回指（给哪条消息记账） |
+| `abort_requested` | — | **没有** |
+| `operation_finished` | — | **没有** |
+
+**9 种里只有 4 种带前向预约。** `abort_requested` 和 `operation_finished` 是纯管理动作，不产出 entry。
+
+### 「record 是 entry 的载体」——方向反了
+
+载体意味着 entry 依附在 record 上。实际是**交叉引用，谁也不包含谁**：
+
+```
+有 record 没 entry：  abort_requested、operation_finished、被 cancel 掉的队列项
+有 entry 没 record：  session.appendMessage() 直接写、model_change、手工 appendCustomEntry
+```
+
+> **record = 工单，entry = 成品。工单上预先写好成品的编号。**
+> 有些成品不走工单直接就做出来了；有些工单不产出成品。
+
+两者唯一的关联就是那个 id 字符串。没有外键、没有嵌套、没有指针，就是两边写同一个字符串。
 
 ### ProvisionedEntry = 有内容、没位置
 
@@ -473,6 +608,53 @@ function validateResultEntry(entriesById, resultEntryId, matches, description) {
 ```
 
 `tool_started.replay: "never" | "safe"` 就是给这一刻用的——`read` 可以重跑，`git push` 不能。
+
+### 预约在什么阶段产生：**写 record 之前**
+
+id 由 session 的生成器现场分配：
+
+```ts
+readonly idGenerator: IdGenerator;                                   // session.ts:104
+this.idGenerator = options.idGenerator ?? { next: () => uuidv7() };  // session.ts:108
+```
+
+`readonly` 而且 **public**——就是给上层在写 record 之前先取 id 用的。
+
+```
+t0   const resultId = session.idGenerator.next()      ← 预约产生。纯内存，没落盘
+t1   appendRecord({ type:"tool_started", resultEntryId: resultId, ... })   ← 预约落盘
+        ─────────── 崩溃窗口 ───────────
+t2   真去执行工具
+        ─────────── 崩溃窗口 ───────────
+t3   appendEntry({ id: resultId, type:"message", message: 结果 })          ← 兑现
+```
+
+崩在 t1 之前 → 什么都没有，当没发生过。崩在 t1~t3 之间 → **有单号没包裹 = 断点**。
+
+用 `uuidv7` 不是随便挑的——它**时间有序**，提前分配的 id 天然带着分配时刻，不会和后来的 id 乱序。
+
+### 两种预约体制（上游 §2.2）
+
+区别在**内容什么时候有**：
+
+**A. 只订号，内容还不知道**——assistant 回复、工具结果
+
+```
+resultEntryId: "e7"     ← record 里就一个字符串
+```
+
+内容要等 LLM / 工具返回才有。「订号不要钱」（*Reserving costs nothing*）。
+
+**B. 内容先有，位置后定**——三个队列、延迟写
+
+```
+target: ProvisionedEntry { id: "e9", type: "message", message: {...} }
+                            ↑ 号        ↑ 完整内容都在 record 里了
+```
+
+你 `steer("等一下")` 的那一刻内容就确定了，缺的只是「挂在树上哪儿」——那得等当前这轮跑完。
+
+> **A 类：有位置没内容。B 类：有内容没位置。两类都靠同一个提前分配的 id 缝合。**
 
 > **Record 对上层的意义一句话：它是「程序计数器」的持久化形式。**
 > 恢复不需要重放整个日志，只需读最后几条 record，逐个问「你预约的 entry 到位了吗」，
@@ -518,19 +700,153 @@ seq  lane        record                                     → 指向的 entry
 ⑥ peekAction() / executeAction()   照着 LaneState 决定下一个动作，接着跑
 ```
 
-崩溃走位示例——日志停在 `seq 4`，树里查不到 `e3`：
+### 完整走一遍
+
+用户说「把 auth.ts 里的重复逻辑抽出来」，模型决定并行读两个文件。
+读完第一个之后，进程被 kill。
+
+#### 崩溃那一刻，磁盘上是这样
+
+两边是**同一个文件**，`seq` 共用一个计数器，交替出现：
 
 ```
-findOpenOperations("main") → [r1]  还开着
-validateRecordLog(slice)          → 过（有 started 没 finished 是正常前缀）
-reduceLaneState(...)              → LaneState.operation.toolBatch = {
-                                        assistantEntryId: "e2",
-                                        calls: [{ started: ✓, resultExists: false }],
-                                        unresolved: true }
-peekAction()                      → { kind: "execute_tool", toolCallId, toolName }
+   树（entry，靠 parentId）              带子（record，靠 seq）
+                                  │
+        null                      │  seq1  operation_started {r1, initialMessages:[e1]}
+         ↑                        │
+   ┌──────────┐  seq2             │  seq3  step_attempt  {r1, resultEntryId:"e2"} ──┐
+   │ e1  user │  "抽出重复逻辑"     │                                                 │
+   └──────────┘                   │                                                 │
+         ↑                        │                                                 │
+   ┌────────────────────┐  seq4 ◄─┼─────────────────────────────────────────────────┘
+   │ e2  assistant      │         │  seq5  usage         {r1, entryId:"e2"}
+   │   toolCall A: read │         │
+   │   toolCall B: read │         │  seq6  tool_started  {r1, toolIndex:0, toolCallId:"A",
+   └────────────────────┘         │                       assistantEntryId:"e2",
+         ↑                        │                       resultEntryId:"e3", replay:"safe"} ─┐
+   ┌──────────────────┐  seq7 ◄───┼───────────────────────────────────────────────────────────┘
+   │ e3  toolResult A │           │
+   └──────────────────┘           │  seq8  tool_started  {r1, toolIndex:1, toolCallId:"B",
+         ▲                        │                       resultEntryId:"e4", replay:"safe"} ──→ e4 ✗
+   main.leafId = e3               │
+                                  │        ✂ 进程死在这
 ```
 
-**一个 register 就定位到断点，没有重放。**
+`seq8` 那根箭头**指向一个不存在的节点**。这就是全部线索。
+
+全程没有一行 `kind:"lane"`——因为一直是直线追加，指针隐式跟着走到 `e3`。
+
+#### 第一步 · 把这条 lane 的东西捞出来
+
+```
+findOpenOperations("main")     →  [r1]        有 started，没 finished
+findRecords({lane:"main"})     →  seq1,3,5,6,8
+从 leafId=e3 沿 parentId 回溯   →  [e1, e2, e3]
+```
+
+打包成 `RecordLogSlice` 丢给 reducer。**到这儿为止一行业务逻辑都没有，纯查询。**
+
+#### 第二步 · 建索引，然后对账
+
+```ts
+entriesById = { e1, e2, e3 }        // reducer.ts:511
+```
+
+| record | 预约 | 在吗 | 结论 |
+|---|---|---|---|
+| `operation_started.initialMessages` | `e1` | ✅ | 用户消息落盘了 → `missingInitialMessages: []` |
+| `step_attempt` (seq3) | `e2` | ✅ | **模型回复完整落盘 → `step: null`，不重调 LLM** |
+| `tool_started` (seq6) | `e3` | ✅ | 工具 A 干完了 |
+| `tool_started` (seq8) | `e4` | ❌ | **断点。工具 B 没干完** |
+
+#### 第三步 · 算出状态
+
+```ts
+LaneState.operation = {
+	id: "r1", kind: "run", aborting: false,
+	step: null,                        // ← LLM 那步是完成态
+	toolBatch: {
+		assistantEntryId: "e2",
+		calls: [
+			{ toolIndex: 0, toolCall: A, started: ✓, resultExists: true  },
+			{ toolIndex: 1, toolCall: B, started: ✓, resultExists: false },  // ★
+		],
+		unresolved: true,
+	},
+	pendingSteer: [], pendingWrites: [], deferred: null,
+}
+```
+
+上层照着 switch：`unresolved === true` → 下一个动作 `{ kind: "execute_tool", toolCallId: "B" }`。
+
+`replay: "safe"` 说明 `read` 可以重跑。**如果这是 `git push`，标记会是 `"never"`，
+恢复就直接报失败而不是重来。**
+
+#### 恢复之后
+
+```
+   树                                     带子
+        e2                          │  ... seq8 tool_started {B → e4}
+        ↑                           │
+       e3  toolResult A             │  seq9  entry e4                    ← 补上
+        ↑                           │  seq10 step_attempt {r1, resultEntryId:"e5"}
+   ┌──────────────────┐  seq9       │  seq11 entry e5
+   │ e4  toolResult B │  ← 补上      │  seq12 operation_finished {r1, completed}
+   └──────────────────┘             │
+        ↑                           │
+   ┌───────────────┐  seq11         │
+   │ e5  assistant │  "抽好了"       │
+   └───────────────┘                │
+        ▲                           │
+   main.leafId = e5                 │
+```
+
+**树上完全看不出这里崩过。带子上也只是正常往下写。**
+没有回滚，没有补偿，没有重放——缺的那个节点补上去，接着往下长。
+
+### 关键：谁说了算
+
+| 问题 | 答案来自 |
+|---|---|
+| **这一轮该做几件事？** | **树** —— `e2` 的 content 里有几个 `toolCall` |
+| **每件事做到哪一步了？** | **带子 + 树对账** —— record 的预约 id 在不在树里 |
+
+```ts
+const toolCalls = assistantEntry.message.content.filter(c => c.type === "toolCall");  // ← 树
+const started = starts.get(toolIndex);                                               // ← 带子
+const result = entriesById.get(started.resultEntryId);                               // ← 对账
+resultExists: result !== undefined                                                    // reducer.ts:476
+```
+
+**所以哪怕 `seq8` 那条 record 也没写成**（崩得更早），结果一样：
+`e2` 里明摆着有两个 toolCall，而 B 的结果 entry 找不到 → 照样是 `execute_tool B`。
+
+> **真正的判据永远是「树上该有的节点在不在」。
+> record 只是告诉你「这件事已经开工了、结果会叫什么名字」。**
+
+### 那为什么还需要 record
+
+只看树也能发现「e2 有两个 toolCall，只有一个 toolResult」。但有些事**树上留不下痕迹**：
+
+| 情况 | 树上看得出来吗 |
+|---|---|
+| 工具 B 到底开工了没（有没有产生副作用） | ❌ 只有 `tool_started` 知道 |
+| B 能不能重跑 | ❌ `replay` 标记只在 record 上 |
+| 这次操作是 run / compaction / navigation | ❌ 只有 `operation_started.intent` |
+| 用户 abort 过没有 | ❌ 只有 `abort_requested` |
+| 有条 steer 消息排队等着，还没挂上树 | ❌ 内容整个在 `queue_enqueued.target` 里 |
+
+> **树记「做成了什么」，带子记「打算做什么、以及做的过程中发生过什么」。
+> 崩溃恢复要的是后者，但验证靠前者。**
+
+### 和「重放日志」的区别
+
+```
+重放式（如 Redis AOF）：  从头把 N 条日志重新执行一遍  → O(N)，且要求操作幂等
+pi 这套：                读最后几条 record 查一下 id   → O(1)，不重新执行任何东西
+```
+
+上游管这叫 **durable program counter**——恢复不是回放历史，是**读一个寄存器然后 switch**。
 
 ---
 
@@ -598,7 +914,81 @@ export class RecordLogCorruption extends Error {
 
 ---
 
-## 十、速查
+## 十、对照 LangGraph
+
+方向上是同一类东西——都是「把执行状态持久化，好在崩溃后接着跑」。但有一处关键差异，
+而且 **"reducer" 这个词两边意思正好相反**。
+
+### 先纠一个直觉
+
+LangGraph 里 **state 不是每个节点一份**——是全图共享**一个** state 对象，节点只返回增量，
+checkpoint 落在 **super-step 之间**。pi 这边也一样：`LaneState` 是**每条 lane 一份**，
+不是每个 entry 一份。Entry 是数据，不带执行状态。
+
+```
+LangGraph:  thread_id  →  一个 state     →  节点之间存 checkpoint
+pi:         lane       →  一个 LaneState →  从日志算出来
+```
+
+`thread_id` ≈ `lane`。
+
+### 两个 reducer 是反的
+
+| | LangGraph 的 reducer | pi 的 `reduceLaneState` |
+|---|---|---|
+| 是什么 | channel 合并函数，`Annotated[list, add_messages]` | 从日志重建状态的函数 |
+| 什么时候跑 | **写入时**——把节点返回的增量合进 state | **读取时**——重启时才跑 |
+| 持久化的是 | **累加器**（fold 的结果） | **事件**（fold 的输入） |
+
+```
+LangGraph:  state_new = reducer(state_old, update)  → 存 state_new
+pi:         存 record/entry，重启时才 reduce 出 LaneState
+```
+
+经典的 **snapshot vs event sourcing**。pi 那 667 行 reducer 在 LangGraph 里根本不存在——
+因为 LangGraph 直接把 state 序列化存了。
+
+### 真正重要的差异：恢复粒度
+
+**LangGraph 的恢复点在节点之间，pi 的恢复点在节点内部。**
+
+一个节点先调 LLM 再跑工具，崩在工具执行中：
+
+```
+LangGraph:  回到节点入口 checkpoint → 整个节点重跑 → LLM 被重新调一次（重新计费）
+pi:         assistant entry 已落盘 → 不重调；只重跑没完成的那个工具
+```
+
+这就是为什么 LangGraph 的最佳实践是**把节点切小、做幂等**——粗粒度恢复的代价靠拆节点来摊。
+pi 换了思路：不要求你拆细，而是在**每个不确定动作前后各写一笔**，断点天然细到单个工具调用。
+还多了 LangGraph 没有的 `replay: "never" | "safe"`。
+
+### 对照表
+
+| | LangGraph | pi harness |
+|---|---|---|
+| 执行单元 | node（图） | operation → step → tool（线性） |
+| 状态归属 | thread | lane |
+| 持久化 | state 快照（checkpointer） | 意图 record + 结果 entry |
+| 恢复粒度 | super-step 边界 | **动作内部** |
+| 重跑安全性 | 你自己保证幂等 | `replay: never/safe` 标记 |
+| 分支 | checkpoint 树 + `update_state` | entry 树 + lane 指针 |
+| 时间旅行 | ✅ 指定 checkpoint_id | ✅ `navigateTree(entryId)` |
+| 并发 | 图内并行分支 | 多 lane |
+| 复杂度 | 存个 dict，简单 | 667 行 reducer + 12 种损坏类型 |
+
+分支那行两边很像：都是「指针回退 + 继续追加」。
+
+> **LangGraph 存的是「现在是什么状态」，pi 存的是「我打算做什么 / 做完了没」。**
+> 前者简单、恢复粗；后者复杂、恢复能精确到一次工具调用中间。
+
+📌 **改造自己的项目时的取舍**：每步都很贵（长 LLM 调用、有外部副作用的工具）→ pi 的细粒度值钱。
+每步都便宜可重跑 → LangGraph 的快照法省事得多，**你不用写那 667 行**。
+折中方案：**抄 pi 的「entry 树 + lane 指针」分支模型，恢复先做快照版。**
+
+---
+
+## 十一、速查
 
 ```
 Session  ── 一个 JSONL 文件
@@ -612,6 +1002,10 @@ Lane      = LanePointer{ lane, leafId }        ≈ git branch
 Record    = 对未来某个 Entry 的预约
 恢复      = 读 record → 查 entry 在不在 → 第一个不在的就是断点
 corruption= 单写者协议写不出来的矛盾 → throw，绝不修复
+
+判据口诀 = 「该做几件事」问树，「做到哪一步」拿 record 的预约 id 去树里查
+预约时机 = 写 record 之前用 session.idGenerator.next() 分配，uuidv7 时间有序
+lane 落盘 = 只有 leafId；配置/队列/operation 全是算出来的（上游改成了寄存器）
 ```
 
 关键文件与行号：
@@ -628,4 +1022,7 @@ corruption= 单写者协议写不出来的矛盾 → throw，绝不修复
 | `reducer.ts` | 400 | `deriveEffectiveConfiguration` |
 | `jsonl/storage.ts` | 123 / 133 / 143 | `createLane` / `moveLane` / `appendEntry` |
 | `jsonl/codec.ts` | 6 / 182 | `ENTRY_TYPES` 白名单 / `encodeMutation` |
+| `session/state.ts` | 112 / 121 | 「必须接在 leaf 上」硬校验 / 追加后隐式挪指针 |
+| `session/session.ts` | 104 / 108 | `idGenerator` —— 预约 id 从这来 |
+| `reducer.ts` | 445 / 476 | `deriveToolBatch` / `resultExists` 对账 |
 | `agent-harness.ts` | 271 | `AgentLane` 接口 |
