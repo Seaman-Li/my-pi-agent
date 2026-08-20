@@ -7,6 +7,50 @@
 > 这条老路。但除 `agent-harness.ts` 外全部模块零未实现标记、全部有测试——**积木都做好了，缺的是指挥**。
 > 详见 [architecture-map.md](./architecture-map.md)。
 
+## 速记（30 秒版）
+
+> **Entry** 是这次 session 的节点，装**内容**（消息、压缩、配置变更），
+> 靠 `parentId` 构成一棵树。
+>
+> **Record** 是旁边一条**不进树**的流水账，记「打算做什么、开过工没」，
+> 靠**预分配的 entry id** 跟树对账。
+>
+> **成败在树上**（LLM 要看到），**过程在带子上**（只有恢复要看）。
+> 要 trace agent 干过什么，两边合起来看。
+>
+> **Lane ≈ git 的 branch ref**（不是 HEAD），指向树上某个 entry，可以有多条同时存在。
+
+```
+树   = 做成了什么          带子 = 打算做什么、开过工没
+lane = 下一笔挂哪儿        恢复 = 拿带子上的号去树上找货，找不到就是断点
+```
+
+### 三个容易记反的点
+
+**① 工具调用失败**记在**树上**，不在 record 里。
+
+失败的 toolResult 要喂给 LLM 看，所以它是一条 entry。`tool_started` 的字段里
+**没有 `outcome`、没有 `error`**——它只记「开工了、结果会叫 e7」。
+带 `error` 的只有 `operation_finished`，那是整次 operation 级别的，不是单个工具。
+
+**② lane 不是 HEAD，是 branch ref。**
+
+HEAD 全局只有一个；lane 可以同时存在多条，各指各的。
+而且 pi 里**没有「当前 lane」这个概念**——每次调用都显式带 lane 名。
+
+**③ entry 不是完全不含工作状态**，漏了两个字段进来：
+
+```ts
+interface MessageEntry { message: AgentMessage; terminate?: true }
+```
+
+- `terminate?: true` —— 上游文档原话：*"It is **orchestration state** that `ToolResultMessage` has no field for."*
+- `message.stopReason` —— reducer 靠 `"deferred"` / `"error"` 算出 `deferred` 和 `terminalFailure`
+
+因为它们没别的地方放。
+
+---
+
 ## 零、三层结构
 
 ```
