@@ -51,6 +51,173 @@ interface MessageEntry { message: AgentMessage; terminate?: true }
 
 ---
 
+## 文件框架（导航）
+
+**9824 行，41 个文件，6 组。**
+
+```
+harness/
+│
+├─ 顶层 *.ts        3007  编排 + 契约 + 横切
+├─ session/         3127  持久化              ← 最大的一块（32%）
+├─ compaction/      1260  上下文压缩
+├─ tools/           1190  四个内置工具
+├─ env/              695  执行环境（Node 实现）
+└─ utils/            545  截断 / shell 捕获
+```
+
+### ① 顶层编排（1175 行）
+
+| 文件 | 行 | 职责 | 状态 |
+|---|---|---|---|
+| `agent-harness.ts` | 508 | `AgentLane` 接口（25 个方法 + 2 个只读属性）+ `AgentHarness` 类 + 全部错误类型 + `Hooks`/`Events` | ⚠️ **22 处 `unavailable`**，只有 getter/setter 是真的 |
+| `reducer.ts` | 667 | **崩溃恢复的全部大脑**。校验 39% + 归约 41%，纯函数零 I/O | ✅ 完整，1127 行测试 |
+
+这两个是核心，也是**唯一互相知道对方存在的一对**：`agent-harness.ts` 定义「有哪些动作」，
+`reducer.ts` 决定「现在该做哪个」。
+
+### ② 契约层（546 行）
+
+| 文件 | 行 | 职责 |
+|---|---|---|
+| `types.ts` | 315 | **接口总集**：`Result` / `Skill` / `PromptTemplate` / `AgentHarnessTool` / `FileSystem` / `Shell` / `ExecutionEnv` + 4 个错误类 |
+| `messages.ts` | 168 | `AgentMessage` 的四种扩展（bash / custom / branchSummary / compactionSummary）+ **`convertToLlm`** |
+| `result.ts` | 63 | `Result` + `TaggedError` |
+
+`ExecutionEnv` 的定义就一行（`types.ts:315`）：
+
+```ts
+export interface ExecutionEnv extends FileSystem, Shell {}
+```
+
+**整个 harness 对外部世界的依赖，全部收敛到这一个接口。**
+想换执行环境（浏览器、远程沙箱），实现它就够了。
+
+#### 📌 发现：`Result` 定义了两遍
+
+```ts
+types.ts:6   export type Result<TValue, TError> = { ok: true; value: TValue } | { ok: false; error: TError };
+result.ts:1  export type Result<TValue, TError> = { ok: true; value: TValue } | { ok: false; error: TError };
+```
+
+一模一样，但用的人完全不同：
+
+| | 用户 |
+|---|---|
+| `types.ts` 的 | `skills` / `prompt-templates` / `compaction` × 2 / `session/search` / `utils/shell-output` —— **6 个成熟模块** |
+| `result.ts` 的 | **只有 `agent-harness.ts`**，还起了别名 `import { type Result as ResultValue }` |
+
+`result.ts` 是跟着 scaffold 一起进来的新文件（多了个 `TaggedError` 错误风格）。
+**又一个「半路改造还没收尾」的痕迹**，和 22 处未实现是同一件事的两面。
+
+### ③ `session/` 持久化（3127 行，32%）
+
+分四层，上层只认下层的接口：
+
+```
+接口定义     types.ts        372   Entry / Record / Session / Storage / Repo 全部接口
+   ↓
+门面 + 校验   session.ts      294   Session 类，实现 SessionTree；转发给 storage，写前校验 JSON 可序列化
+   ↓
+内存状态     state.ts        344   SessionState：树 + lane Map + applyMutation 重放  ← 分支规则在这
+   ↓
+后端实现     jsonl/ + memory.ts
+```
+
+| 文件 | 行 | 职责 |
+|---|---|---|
+| `types.ts` | 372 | **7 种 Entry + 9 种 Record + 查询类型 + Storage/Repo 接口**。整个数据模型的定义处 |
+| `state.ts` | 344 | `SessionState`。`applyMutation:97` 是重放核心——`:112` 硬校验「必须接在 leaf 上」，`:121` 隐式挪指针 |
+| `session.ts` | 294 | `Session` 类。`assertJsonSerializable` 在这（拒绝循环引用、稀疏数组、非有限数） |
+| `context.ts` | 100 | ★ **Entry → `AgentMessage[]` 的唯一投影点**。`defaultContextEntryTransform:45` 实现「不读过压缩点」 |
+| `memory.ts` | 192 | `InMemorySessionStorage` / `InMemorySessionRepo`——测试后端 |
+| `search.ts` | 71 | 扫描式会话搜索 |
+| `jsonl/storage.ts` | 272 | JSONL 后端主体。`createLane` / `moveLane` / `appendEntry` / `appendRecord` 都在这，**全过同一个 `enqueue` 串行队列** |
+| `jsonl/codec.ts` | 193 | 一行 JSON ↔ mutation。`ENTRY_TYPES` / `RECORD_TYPES` 白名单，读时校验 |
+| `jsonl/repo.ts` | 179 | 会话文件的增删查、fork、原子发布 |
+| `jsonl/types.ts` `errors.ts` `jsonl.ts` `index.ts` | 95 | v4 header 类型、错误、re-export |
+| **`testing/conformance.ts`** | **993** | **后端一致性测试套件** |
+
+`testing/conformance.ts` 单文件占整个 harness 的 10%，而且是**发布出去的产物**
+（`session/testing/index.ts` 导出 `createSessionBackendConformance`）——你自己实现 Postgres 后端，直接跑它。
+
+### ④ 能力模块（1921 行）
+
+| 文件 | 行 | 职责 |
+|---|---|---|
+| `compaction/compaction.ts` | 848 | token 估算、`shouldCompact` 阈值判定、生成摘要、带重试 |
+| `compaction/branch-summarization.ts` | 280 | 跨分支跳转时生成 `branch_summary` |
+| `compaction/utils.ts` | 132 | 从消息里提取读过/改过的文件列表，塞进摘要 |
+| `skills.ts` | 375 | 从磁盘扫 skill 目录、解析 frontmatter、诊断错误 |
+| `prompt-templates.ts` | 262 | 同上，外加 `parseCommandArgs` / `substituteArgs`（`$1 $2 $ARGUMENTS` 替换） |
+| `system-prompt.ts` | 34 | 把 skill 列表格式化进 system prompt。**全文件一个函数** |
+
+### ⑤ `tools/` 四个内置工具（1190 行）
+
+| 文件 | 行 | 职责 |
+|---|---|---|
+| `edit-diff.ts` | 500 | **模糊匹配替换**——行尾归一化、空白容错、保留未改动行的原始格式 |
+| `bash.ts` | 161 | `createBashTool`，带 `BashPrepare` 钩子（权限检查挂这） |
+| `read.ts` | 144 | `createReadTool`，可插 `ReadImageProcessor` |
+| `edit.ts` | 127 | `createEditTool` |
+| `image.ts` | 104 | 嗅探图片 MIME + base64 |
+| `file-mutation-queue.ts` | 56 | 同文件写入串行化 |
+| `write.ts` `path-utils.ts` `index.ts` `tool-context.ts` | 98 | |
+
+全是 `createXxxTool()` 工厂，都泛型于 `ExecutionToolContext`——**工具不知道自己跑在什么环境里**。
+
+> **只有 4 个工具，没有 grep / find / ls / web**——那些在 `coding-agent` 里。
+> 这是「库」和「产品」的分界线。
+
+### ⑥ 执行环境 + 横切（1240 行）
+
+| 文件 | 行 | 职责 |
+|---|---|---|
+| `env/nodejs.ts` | 695 | `NodeExecutionEnv implements ExecutionEnv`。**整个 harness 里唯一 import `node:*` 的文件** |
+| `telemetry.ts` | 615 | 两套 span schema：`AI_TELEMETRY_SCHEMA`（:42）+ `HARNESS_TELEMETRY_SCHEMA`（:232） |
+| `utils/truncate.ts` | 350 | `truncateHead` / `truncateTail` / `truncateLine`，默认 2000 行 / 50KB |
+| `utils/shell-output.ts` | 195 | shell 输出捕获 + 二进制字符清洗 |
+
+### 依赖方向
+
+```
+              agent-harness.ts  ⚠️
+                     │  编排
+      ┌──────────────┼──────────────┬──────────────┐
+      ▼              ▼              ▼              ▼
+  reducer.ts     session/      compaction/      tools/
+      │              │              │              │
+      └──────────────┴──────┬───────┴──────────────┘
+                            ▼
+                        types.ts          ← ExecutionEnv / Result / 错误类
+                            ▲
+                            │ implements
+                        env/nodejs.ts     ← 唯一碰 node:* 的地方
+```
+
+**严格单向。** 底下四个模块互不认识（`reducer` 不 import `compaction`，`tools` 不 import `session`），
+全靠 `agent-harness.ts` 组装。
+
+> **所以那 22 处 `unavailable` 卡住的正是「组装」这一步**——积木和接口都齐了，
+> 缺的是把它们串起来的那 500 行。
+
+### 读的顺序
+
+```
+1. types.ts (315)           先看契约，尤其 ExecutionEnv 那一行
+2. session/types.ts (372)   数据模型 —— 本文前面几节已经拆过
+3. session/context.ts (100) Entry → 消息的唯一投影点，最小最关键
+4. reducer.ts (667)         恢复大脑
+5. session/state.ts (344)   分支规则的实现
+6. agent-harness.ts (508)   最后看，因为它是半成品，看接口不看实现
+```
+
+**跳过**：`testing/conformance.ts`（993，测试套件）、`edit-diff.ts`（500，纯算法）、
+`env/nodejs.ts`（695，胶水）、`telemetry.ts`（615，schema 声明）——
+**加起来 2803 行，占 29%，跟架构无关**。真正要读的架构代码只有约 2300 行。
+
+---
+
 ## 零、三层结构
 
 ```
@@ -856,10 +1023,10 @@ LaneState.operation = {
 | **每件事做到哪一步了？** | **带子 + 树对账** —— record 的预约 id 在不在树里 |
 
 ```ts
-const toolCalls = assistantEntry.message.content.filter(c => c.type === "toolCall");  // ← 树
-const started = starts.get(toolIndex);                                               // ← 带子
-const result = entriesById.get(started.resultEntryId);                               // ← 对账
-resultExists: result !== undefined                                                    // reducer.ts:476
+const toolCalls = assistantEntry.message.content.filter(c => c.type === "toolCall"); // :462  ← 树
+const started = starts.get(toolIndex);                                               // :477  ← 带子
+const result = startedResult ?? blockedResult;                                       // :487  ← 对账
+resultExists: result !== undefined,                                                  // :492
 ```
 
 **所以哪怕 `seq8` 那条 record 也没写成**（崩得更早），结果一样：
@@ -1032,7 +1199,251 @@ pi 换了思路：不要求你拆细，而是在**每个不确定动作前后各
 
 ---
 
-## 十一、速查
+## 十一、Day 6 五问
+
+schedule 里 harness 的定义是「会话存哪、上下文超了怎么办、工具从哪来、崩了怎么恢复、状态怎么给 UI 看」。
+逐条答，**每条分两代看**——`harness/`（第二代，写完没接）和 `coding-agent/core/`（第一代，实际在跑）。
+
+### ① 会话存哪
+
+**一个 append-only 的 JSONL 文件，一行一条，永不修改已有行。**
+
+```
+~/.pi/agent/sessions/<cwd 编码>/<时间戳>_<uuid>.jsonl
+```
+
+- 目录：`join(resolvedAgentDir, "sessions", safePath)`（`session-manager.ts:480`）
+- 文件名：`${fileTimestamp}_${this.sessionId}.jsonl`（`:953`）
+
+`session-manager.ts:845` 的类注释直接点题：
+*"Manages conversation sessions as **append-only trees** stored in JSONL files."*
+
+| | 第一代 v3 | 第二代 v4 |
+|---|---|---|
+| 一行是什么 | 只有 **entry** | `kind` 四选一：`entry` / `record` / `lane` / `fact` |
+| 树 | ✅ `parentId` | ✅ 同样 |
+| 执行日志 | ❌ 没有 | ✅ record 带子 |
+| 多游标 | ❌ | ✅ lane |
+| 后端可换 | ❌ 写死 JSONL | ✅ `SessionStorage` 接口 + JSONL / InMemory 两实现 + 993 行 conformance |
+
+#### v3 和 v4 是同一条版本线
+
+```
+v1  ─→  v2  ─→  v3          coding-agent/core/session-manager.ts
+                  └──→  v4  agent/src/harness/session/jsonl/
+```
+
+```ts
+export const CURRENT_SESSION_VERSION = 3;              // session-manager.ts:30
+version?: number;  // v1 sessions don't have this      // :34
+const version = header?.version ?? 1;                  // :283
+if (version < 2) migrateV1ToV2(entries);               // :287
+if (version < 3) migrateV2ToV3(entries);               // :288
+```
+
+harness 明确知道 v3 的存在——**不是两套并行格式，v4 要读 v3**：
+
+```ts
+sourceFormat: 3 | 4;                                                  // jsonl/types.ts:30
+/** Present only when a v3 parent path could not be resolved to a session id. */
+legacyParentSessionPath?: string;                                     // jsonl/types.ts:31
+```
+
+上游文档也提到 *"Fresh or **normalized-v3** `main` may temporarily lack `lane.config`"*（§2.3）。
+
+头一行的三处变化，都能对上前面讲过的东西：
+
+```jsonl
+v3  {"type":"session","version":3,"id":"019ff716-...","timestamp":"2026-08-12T17:47:49.253Z","cwd":"..."}
+v4  {"kind":"header","version":4,"id":"...","createdAt":...,"cwd":"...","parentSessionId"?:...}
+```
+
+| | v3 | v4 | 为什么 |
+|---|---|---|---|
+| 判别键 | `type` | **`kind`** | v4 要区分四种行，`type` 得让给「哪种 entry」 |
+| 时间 | `timestamp` ISO 字符串 | `createdAt` 数字 | 统一成 epoch ms |
+| 父会话 | 路径 | **`parentSessionId`** | fork 要能可靠指回去，路径会变 |
+
+第一条最说明问题：**v3 只有一种行，`type` 够用；v4 有四种行，只好在外面套一层 `kind`。**
+这就是前面「两级判别式」的由来。
+
+### ② 上下文超了怎么办
+
+**压缩：把前面全部历史换成一条摘要 entry。**
+
+三个触发原因 `"manual" | "threshold" | "overflow"`：
+
+| 原因 | 什么时候 | 出处 |
+|---|---|---|
+| `threshold` | **主动**——算出来快满了 | `shouldCompact()` |
+| `overflow` | **被动**——LLM 真报了超限错，事后补救 | `agent-session.ts:1998` |
+| `manual` | 用户敲 `/compact` | — |
+
+阈值判定只有一行：
+
+```ts
+export function shouldCompact(contextTokens, contextWindow, settings): boolean {
+	if (!settings.enabled) return false;
+	return contextTokens > contextWindow - settings.reserveTokens;
+}                                                    // compaction/compaction.ts:247
+
+export const DEFAULT_COMPACTION_SETTINGS = {
+	enabled: true,
+	reserveTokens: 16384,      // 给摘要 prompt 和输出留的
+	keepRecentTokens: 20000,   // 压缩后保留的近期上下文
+};                                                   // compaction/compaction.ts:158
+```
+
+产物是一条 entry：
+
+```ts
+interface CompactionEntry { summary: string; retainedTail: AgentMessage[]; tokensBefore: number }
+```
+
+然后读上下文时**不读过压缩点**：
+
+```ts
+return compaction === undefined ? [...pathEntries] : [compaction, ...pathEntries.slice(compactionIndex + 1)];
+                                                     // session/context.ts:45
+```
+
+> 上游原话：*"Every compaction stores a complete `retainedTail`. **Context never reads past a compaction.**
+> This is what makes a compaction a **self-contained checkpoint** rather than a pointer into history."*
+
+**防死循环**（压完还是超 → 再压 → 无限）两代都做了：
+
+```ts
+private _overflowRecoveryAttempted = false;   // gen1  agent-session.ts:329   裸布尔
+const overflowRecoveryUsed = ...              // gen2  reducer.ts:587         用「上次消费新输入」当水位线
+```
+
+### ③ 工具从哪来
+
+**构造时注入的一个数组。框架本身不持有任何工具。**
+
+```ts
+export interface AgentHarnessOptions {
+	tools?: HarnessTool[];
+	toolContext?: object | (() => object | Promise<object>);
+	activeToolNames?: string[];
+	...
+}                                                    // agent-harness.ts:243
+```
+
+三层来源：
+
+```
+① 内置        harness/tools/           4 个：bash / read / edit / write        1190 行
+              coding-agent/core/tools/ 再加 grep / find / ls 等                4142 行
+② 扩展        beforeToolCall / afterToolCall 拦截、包装、拦下
+③ 开关        activeToolNames 决定这一轮哪些启用
+```
+
+三个要点：
+
+- **工具是工厂，不是单例。** 全是 `createBashTool()` / `createReadTool()`，泛型于 `ExecutionToolContext`
+  ——工具不知道自己跑在什么环境里
+- **只有 4 个内置的，没有 grep/find/ls。** 那些在 coding-agent 里，这是「库」和「产品」的分界线
+- **`activeToolNames` 是分支状态**（v0.84.1 是 `active_tools_change` entry，上游改成 lane 寄存器），
+  所以「这条分支上开了哪些工具」可回溯
+
+### ④ 崩了怎么恢复
+
+**详见[第八节](#八恢复流程完整走位)。** 这里只记两代的差别：
+
+| | 重启后能拿回来吗 |
+|---|---|
+| 对话历史 | 两代都 ✅ 从 JSONL 读回整棵树 |
+| 正在跑的工具 | gen1 ❌ / gen2 ✅ |
+| steer / followUp 队列 | gen1 ❌ / gen2 ✅ |
+| 当前 operation | gen1 ❌（没这个概念）/ gen2 ✅ |
+
+**第一代不是没写恢复，是数据格式里就没有这个东西**——v3 只有 entry，
+没有任何 `tool_started` 的对应物，**结构上就无法知道有个工具跑到一半**。
+
+`session-manager.ts:890` 那个 `resume` 的注释是
+*"Switch to a different session file (used for resume and branching)"*
+——**它的 resume 是「换个文件重新加载」，不是「接着上次跑」。**
+
+> **第一代能恢复「说过什么」，恢复不了「干到哪了」。这就是第二代整个 record 带子存在的全部理由。**
+
+### ⑤ 状态怎么给 UI 看
+
+**第一代推事件，第二代快照 + 订阅。这是两代差别最大的一处。**
+
+#### 第一代：纯事件流
+
+```ts
+export type AgentSessionEvent =
+	| Exclude<AgentEvent, { type: "agent_end" }>              // agent 层原有的
+	| { type: "agent_end"; messages; willRetry }
+	| { type: "queue_update"; steering; followUp }
+	| { type: "compaction_start" | "compaction_end"; reason; ... }
+	| { type: "entry_appended"; entry }
+	| { type: "auto_retry_start" | "auto_retry_end"; attempt; ... }
+	| { type: "bash_execution_update"; id?; delta }
+	| ... 共 20 来种                                          // agent-session.ts:141
+
+private _emit(event: AgentSessionEvent): void { ... }        // :563  广播给 _eventListeners
+```
+
+**UI 必须自己跟着事件流从零攒状态。** 中途接进来、或者刷新一下，就什么都没有了。
+
+#### 第二代：先给全量，再给增量
+
+```ts
+watch(): Promise<WatchHandle<LaneSnapshot>>;                  // agent-harness.ts:302
+
+export interface WatchHandle<TSnapshot> {
+	snapshot: TSnapshot;                                      // ← 立刻给一份完整的
+	start(listener: (event: unknown) => void): void;          // ← 然后订阅增量
+	unsubscribe(): void;
+}
+
+export interface LaneSnapshot {
+	lane: string;
+	transcript: Entry[];                                      // 完整对话
+	leafId: string | null;
+	operation: { id; kind; status } | null;                   // 在跑什么
+	queues: { steer: QueuedItem[]; followUp: QueuedItem[]; nextRun: QueuedItem[] };
+	pendingWrites: { id; entry }[];
+	faulted: boolean;
+}                                                             // agent-harness.ts:167
+```
+
+> **任何时候接进来都能先拿一份全量，不用重放历史事件。**
+
+这对多端（CLI + Web + Slack 同时看一个 session）几乎是必需的。
+第一代做不到，因为它没有一个「当前状态」的完整表示——状态散在 `AgentSession` 的实例字段里。
+
+**第二代能做到，正是因为有 `reduceLaneState`**：状态是算出来的，随时能算一份完整的给你。
+
+### 汇总
+
+| 问题 | 第一代（在跑） | 第二代（写完没接） |
+|---|---|---|
+| **会话存哪** | JSONL v3，只有 entry | JSONL v4，四种行；后端可换 + 一致性套件 |
+| **超了怎么办** | 压缩，三种触发 | **一样**（`compaction/` 两边几乎平行） |
+| **工具从哪来** | 构造注入，8+ 个 | 构造注入，4 个 |
+| **崩了怎么恢复** | ❌ 只恢复对话 | ✅ 精确到单个工具调用中间 |
+| **状态给 UI** | 推事件，UI 自己攒 | 快照 + 订阅 |
+
+> **两代真正的差异只有两处：崩溃恢复、UI 状态获取。而这两处是同一个根因**
+> ——第二代把状态从「实例字段」改成了「从日志算出来」。
+>
+> 会话格式、压缩策略、工具注入方式，两代基本一样。
+
+### 📌 对改造项目的直接结论
+
+- **压缩逻辑照抄第一代**（`shouldCompact` 三行 + 一条 compaction entry + 不读过压缩点），够用，别自己发明
+- **存储照抄第二代的接口**（`SessionStorage` + conformance），因为你迟早要换后端
+- **UI 用 `watch()` 那个形状**（快照 + 订阅），比纯事件流省很多事
+- **崩溃恢复先做简单版**：只恢复对话，工具跑一半就当没跑（第一代就是这么活的）。
+  等你的工具真有外部副作用了，再上 record 那套
+
+---
+
+## 十二、速查
 
 ```
 Session  ── 一个 JSONL 文件
@@ -1069,4 +1480,8 @@ lane 落盘 = 只有 leafId；配置/队列/operation 全是算出来的（上�
 | `session/state.ts` | 112 / 121 | 「必须接在 leaf 上」硬校验 / 追加后隐式挪指针 |
 | `session/session.ts` | 104 / 108 | `idGenerator` —— 预约 id 从这来 |
 | `reducer.ts` | 445 / 476 | `deriveToolBatch` / `resultExists` 对账 |
-| `agent-harness.ts` | 271 | `AgentLane` 接口 |
+| `agent-harness.ts` | 167 / 211 / 243 / 271 | `LaneSnapshot` / `Hooks` / `AgentHarnessOptions` / `AgentLane` |
+| `harness/types.ts` | 315 | `ExecutionEnv extends FileSystem, Shell` —— 对外部世界的唯一依赖 |
+| `compaction/compaction.ts` | 158 / 247 | 默认设置 / `shouldCompact` |
+| `coding-agent/core/session-manager.ts` | 30 / 480 / 890 | `CURRENT_SESSION_VERSION=3` / 存储路径 / resume 注释 |
+| `coding-agent/core/agent-session.ts` | 141 / 563 | `AgentSessionEvent` 联合 / `_emit` |
