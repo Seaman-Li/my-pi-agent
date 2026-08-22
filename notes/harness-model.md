@@ -1578,22 +1578,74 @@ harness-global; every payload carries `lane`."*
 
 > **Hook = 可以「拦下来改数据」的挂载点。**
 
-### 和 Event 的区别：返回类型就是全部
+### Hook 与 Event 的分工
 
-`agent-harness.ts:211` 和 `:215` 是并排的一对：
+`agent-harness.ts:211` 和 `:215` 是并排的一对，几乎一模一样：
 
 ```ts
-export interface Hooks  { on(name, handler: (e) => unknown | Promise<unknown>, ...): () => void }
-export interface Events { on(type, listener: (e) => void | Promise<void>): () => void }
-                                                    ↑ 返回 void
+export interface Hooks  { on(name: HookName, handler:  (e) => unknown | Promise<unknown>, ...): () => void }
+export interface Events { on(type: string,   listener: (e) => void    | Promise<void>): () => void }
+                            ↑ 封闭联合 11 个                    ↑ 返回 void
+                                         ↑ 开放 string
 ```
 
 > Events expose **post-hook** values. Passive listeners **cannot transform** them.
 
 **hook 先跑、能改；event 看到的是改完的结果。**
 
+| | Hooks | Events |
+|---|---|---|
+| 干什么 | **阀门**——拦下来改数据 | **喇叭**——广播已经定下来的事实 |
+| 返回值 | `unknown`，**就是新数据** | `void`，被丢弃 |
+| 名字空间 | `HookName`，**封闭联合 11 个** | `string`，**开放** |
+| 谁定义有哪些 | 框架（是流程上的固定工位） | 谁都能加新类型 |
+| 顺序 | 先 | 后（看到 hook 改完的值） |
+| 失败了 | `before_tool` 阻断，其余跳过继续 | 不影响主流程 |
+| 能不能拖慢主流程 | ✅ awaited | ⚠️ 声明了 `Promise` 就也 awaited |
+
+**名字空间那行是个设计信号**：hook 是流程上的固定工位，**框架说了算有哪几个**；
+event 是广播，**任何人都能加新类型**。
+
 这跟 [agent-loop.md](./agent-loop.md) 第七节记的 `emit` 是同一组对立——
-`AgentEventSink` 返回 `Promise<void> | void`，所以它是**喇叭**；hook 返回值有意义，所以它是**阀门**。
+`AgentEventSink = (event: AgentEvent) => Promise<void> | void`，是喇叭那一支。
+
+#### 「只能看不能改」是编译器兜住的，不是约定
+
+实测过（见 [ts-notes.md](./ts-notes.md) 第 23 条）：TS 那条「返回类型是 `void` 就什么都放行」的
+宽松规则**只对裸 `void` 生效**，写成 `void | Promise<void>` 这种真联合就失效，
+回落到严格检查。
+
+```ts
+type A = (e: unknown) => void;                 const a: A = (e) => 42;   // ✅ 宽松规则
+type B = (e: unknown) => void | Promise<void>; const b: B = (e) => 42;   // ❌ TS2322
+```
+
+pi 写联合的动机其实是**让调用方能 `await`**（`await emit(...)`）；
+**「别返回值」变成编译期硬约束是顺带来的副作用**。
+
+#### ⚠️ 和 `onclick` 也不是一回事
+
+`on` 是**注册器**不是触发器（触发在 `emit` / 用户点击那一侧）。pi 有两个 `on`：
+
+| | 对应前端的什么 |
+|---|---|
+| **`Events.on`** | ✅ 就是 `addEventListener`——返回 `void`，只能看 |
+| **`Hooks.on`** | ❌ 不是。更像 **Axios interceptor** |
+
+三处差别：
+
+1. **返回值有没有意义** —— DOM 那边唯一能影响流程的是 `preventDefault()`，**只能取消不能替换**
+2. **框架等不等你** —— 上游用词是 *"**awaited** interception points"*
+3. **什么时候跑** —— `onclick` 可能永远不跑；hook 是流水线上的工位，**走到那儿必然跑**
+
+注册形式上倒是同族，但解绑方式更现代：
+
+```ts
+const off = hooks.on("before_tool", handler);   // on() 直接返回解绑函数
+off();
+```
+
+比 `removeEventListener` 好用——不用自己保管函数引用。
 
 ### v0.84.1 现状：类型在，实现全 throw
 
@@ -1796,8 +1848,9 @@ corruption= 单写者协议写不出来的矛盾 → throw，绝不修复
 判据口诀 = 「该做几件事」问树，「做到哪一步」拿 record 的预约 id 去树里查
 预约时机 = 写 record 之前用 session.idGenerator.next() 分配，uuidv7 时间有序
 lane 落盘 = 只有 leafId；配置/队列/operation 全是算出来的（上游改成了寄存器）
-hook     = 能改数据的拦截点（11 个，v0.84.1 全未实现，实际能用的 3 个）
-           event 只能看不能改——返回类型 void 就是全部区别
+hook     = 阀门，能改数据（11 个封闭联合，v0.84.1 全未实现，实际能用的 3 个）
+event    = 喇叭，只能看（名字是开放 string；返回 void 是编译器硬约束，见 ts-notes 23）
+on       = 注册器不是触发器；Events.on ≈ addEventListener，Hooks.on ≈ Axios interceptor
 ```
 
 关键文件与行号：

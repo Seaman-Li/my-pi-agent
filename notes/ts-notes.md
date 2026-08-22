@@ -1436,10 +1436,119 @@ npx tsc --noEmit --skipLibCheck --module esnext --target es2022 \
 
 ---
 
+## 23. `void` 作为返回类型：裸的宽松，联合的严格
+
+从 `harness/agent-harness.ts:211/215` 这一对接口来的——它俩长得几乎一样，
+差别只在返回类型：
+
+```ts
+export interface Hooks  { on(name: HookName, handler: (e) => unknown | Promise<unknown>, ...): () => void }
+export interface Events { on(type: string,   listener: (e) => void    | Promise<void>): () => void }
+```
+
+（顺带：`handler` / `listener` 和 `name` / `type` 这些**参数名纯粹是文档**，见第 17 条。
+把它们互换，两个接口的行为一个字都不变。）
+
+### 那条著名的宽松规则
+
+TS 有个特例：**目标函数类型的返回类型是 `void` 时，源函数返回什么都放行。**
+
+```ts
+const arr: number[] = [];
+[1, 2, 3].forEach(x => arr.push(x));   // push 返回 number，forEach 声明的是 void  ✅
+```
+
+没这条规则你得写 `x => { arr.push(x); }`——多一对花括号只为丢掉返回值。
+
+规则的含义不是「你不能返回」，是 **「我不会用你的返回值，你爱返回什么返回什么」**。
+宽松到连 async 都放行：
+
+```ts
+type D = (e: unknown) => void;
+const d1: D = (e) => 42;          // ✅ number → void
+const d2: D = async (e) => 42;    // ✅ Promise<number> → void
+```
+
+### 但一并成联合就失效
+
+5 组隔离实测（`tsc --strict`）：
+
+```ts
+type P1 = (e: unknown) => void;               const p1: P1 = (e) => 42;   // ✅
+type P2 = (e: unknown) => (void);             const p2: P2 = (e) => 42;   // ✅
+type P3 = (e: unknown) => void | void;        const p3: P3 = (e) => 42;   // ✅
+type P4 = (e: unknown) => void | undefined;   const p4: P4 = (e) => 42;   // ❌ TS2322
+type P5 = (e: unknown) => void | never;       const p5: P5 = (e) => 42;   // ✅
+```
+
+分界线是**归约之后还是不是 `void` 本身**：
+
+| 写法 | 归约结果 | 宽松规则 |
+|---|---|---|
+| `void` / `(void)` | `void` | ✅ 触发 |
+| `void \| void` | `void`（重复成员去掉） | ✅ 触发 |
+| `void \| never` | `void`（`never` 被吸收） | ✅ 触发 |
+| `void \| undefined` | **两个成员的真联合** | ❌ 不触发 |
+| `void \| Promise<void>` | **两个成员的真联合** | ❌ 不触发 |
+
+> **触发条件是「目标的返回类型**就是 `void` 这个类型本身**」。
+> 一旦是真联合，它就不是 `void` 了，特例不触发，回落到普通赋值检查。**
+
+普通检查：`number` 能赋给 `void | Promise<void>` 吗？逐个试——
+`number → void`？不行。`number → Promise<void>`？不行。→ 失败。
+
+### 为什么这条规则只能是「特例」
+
+因为 `void` **不是**万能超类型：
+
+```ts
+const v: void = 42;   // ❌ Type 'number' is not assignable to type 'void'
+```
+
+`void` 要真是 top type，这行就该通过。它不通过 → **宽松规则没法做进类型格里**，
+只能写成「比较函数签名时的一个 if」：
+
+```
+比较两个函数类型
+  ├─ 比参数
+  └─ 比返回类型
+       ├─ if (目标返回类型 === void) return true      ← 特例，认的是 void 这个具体类型
+       └─ else 普通赋值检查
+```
+
+**特例认「精确等于」，不会对联合做分配。**
+
+### pi 为什么还写联合
+
+因为**调用方要 `await`**：
+
+```ts
+await emit({ type: "message_start", message });   // agent-loop.ts
+```
+
+如果 `AgentEventSink` 写成 `=> void`：
+
+- 注册这头没问题——宽松规则已经能接受 `async` handler
+- 但**调用这头** `await` 一个声明为 `void` 的东西语义不对，
+  类型上它根本不是 thenable（`await-thenable` 这类 lint 会报）
+
+```
+=> void                  宽松，但调用方 await 站不住脚
+=> void | Promise<void>  严格，调用方 await 名正言顺   ← pi 用的
+```
+
+> **严格性是顺带来的副作用。** 写联合的动机是让调用方能 `await`，
+> 结果连带把「别返回值」也变成编译器真拦得住的事——
+> 于是 `Events` 的「只能看不能改」不是约定，是类型系统兜住的。
+
+Python 里没有对应物：`Callable[..., None]` 返回别的东西 mypy 直接报错，没有这条特例。
+
+---
+
 ## 待补
 
 遇到再加：
 
 - 装饰器（`experimentalDecorators: true` 开着，但 `packages/*/src` 里一处未用——大概率是模板残留。注意装饰器**不可擦除**，真用了会和 `erasableSyntaxOnly` 冲突）
 - `const` 类型参数（`model-catalog.ts:23` 的 `<const TProvider>`，与第 20 条相关）
-- 变型（协变/逆变）在函数类型赋值上的表现（第 17 条"能少不能多"背后的规则）
+- 变型（协变/逆变）在函数类型赋值上的表现（第 17 条"能少不能多"背后的规则，与第 23 条的 `void` 特例相关）
