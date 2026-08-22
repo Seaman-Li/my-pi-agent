@@ -911,6 +911,63 @@ seq  lane        record                                     → 指向的 entry
 ⑥ peekAction() / executeAction()   照着 LaneState 决定下一个动作，接着跑
 ```
 
+### 谁喊开始：`AgentHarness.create()`
+
+即便是半成品，这段也把设计意图写清楚了（`agent-harness.ts:347`）：
+
+```ts
+static async create(options): Promise<{ harness: AgentHarness; suspended: SuspendedOperation[] }> {
+	const [record] = await options.session.findRecords({ limit: 1 });
+	if (record !== undefined) throw new HarnessNotImplemented("create.restore");
+	return { harness: new AgentHarness(options), suspended: [] };
+}
+```
+
+**打开会话时，先摸一条 record。**
+
+```
+findRecords({ limit: 1 })
+   ├─ 一条都没有  → 全新会话，直接 new
+   └─ 有          → 这个 session 之前跑过 operation → 走恢复路径
+```
+
+只需读一行，不用扫全文件。
+
+#### 恢复是三步，而且刻意不自动
+
+| 步骤 | 在哪 | v0.84.1 现状 |
+|---|---|---|
+| **检测** | `create()` 时摸 record | ✅ 骨架在 |
+| **报告** | 返回 `suspended: SuspendedOperation[]` | ✅ 类型在 |
+| **继续** | 调用方显式调 `lane.resume()` | ❌ `unavailable("resume")` (`:380`) |
+
+> **`create()` 不会自己接着跑。** 它把「有这些操作挂在半路」交回给调用方，
+> 由 UI 决定是恢复、丢弃、还是先问用户。
+>
+> 理由很实际——恢复可能重跑一个有副作用的工具，这不是框架能替你决定的。
+
+#### `SuspendedOperation` 里最值得看的字段
+
+```ts
+export interface SuspendedOperation {
+	lane: string;
+	kind: "run" | "compaction" | "navigation";
+	id: string;
+	startedAt: number;
+	reason: "crash" | "deferred";          // ← 区分「崩了」和「主动挂起等结果」
+	prompt?: AgentMessage[];
+	deferred?: DeferredHandle;
+	aborting?: { steer: AgentMessage[]; followUp: AgentMessage[] };
+	missing: { tools: string[]; models: string[] };   // ★
+}                                          // agent-harness.ts:140
+```
+
+- **`missing`** —— 恢复前先查：当时用的工具和模型现在还在不在。
+  重启后改了配置、关掉某个工具、删了 provider → 这个 operation **恢复不了**，
+  对应错误是 `MissingIdentities`（`:108` 的 `ResumeRejected`）
+- **`reason`** —— 恢复不只服务崩溃。**主动挂起等异步结果**（`deferred`，比如 batch API）
+  走的是同一套机制
+
 ### 完整走一遍
 
 用户说「把 auth.ts 里的重复逻辑抽出来」，模型决定并行读两个文件。
@@ -1034,6 +1091,77 @@ resultExists: result !== undefined,                                             
 
 > **真正的判据永远是「树上该有的节点在不在」。
 > record 只是告诉你「这件事已经开工了、结果会叫什么名字」。**
+
+### 上下文从哪来：树上重新取，不从 record
+
+record 里**根本没有消息内容**（除了队列项那种 `ProvisionedEntry`）。恢复后要发给 LLM 的消息，
+是沿树重新构建的：
+
+```
+leafId
+   ↓  findEntriesOnBranch({ start: leafId })      沿 parentId 回溯
+Entry[]
+   ↓  buildSessionContext(pathEntries)            session/context.ts:90
+{ messages, thinkingLevel, model, activeToolNames }
+```
+
+`SessionContext` 的形状正好是**发一次 LLM 请求需要的全部东西**：
+
+```ts
+export interface SessionContext {
+	messages: AgentMessage[];
+	thinkingLevel: string;
+	model: { provider: string; modelId: string } | null;
+	activeToolNames: string[] | null;
+}                                          // session/context.ts:5
+```
+
+内部就是第二节那两条通路合起来：
+
+```ts
+const state = deriveSessionContextState(pathEntries);      // :94  → 三项配置
+const contextEntries = buildContextEntries(pathEntries);   // :95  → 砍到最近的 compaction
+const messages = contextEntries.flatMap(sessionEntryToContextMessages);  // :96  → 消息
+return { ...state, messages };
+```
+
+#### 所以恢复是两半拼起来的
+
+```
+执行位置（程序计数器）  ← record 带子 → reduceLaneState     → LaneState
+上下文内容（发什么）    ← entry 树    → buildSessionContext → messages
+```
+
+> **位置从带子来，内容从树来。**
+
+#### 为什么「重新构建」是安全的
+
+崩溃前那次请求的上下文**并没有被保存**，恢复时是从零重建的。这能成立靠三个条件：
+
+1. **树是 append-only** —— 崩溃前的 entry 一条不少
+2. **`leafId` 持久化了** —— 知道从哪儿开始回溯
+3. **配置也在树上** —— `model_change` 等是 entry，重放路径就得到同样的配置
+
+**同样的输入必然重建出同样的上下文。** 这就是第二节说「配置必须持久化」的实际后果——
+否则重启后模型可能换了，恢复出来的请求和崩溃前那次不是同一个。
+
+#### 配置：重推 vs 快照
+
+上游把配置从树搬到了 lane 寄存器（**可变**），于是「重放得同样结果」这个保证没了。
+所以它改成**快照**：
+
+> The context snapshots configuration, stream options, and retry policy **inline**.（§4）
+>
+> **Reopen never rebuilds it from current settings**, so the provider sees the same
+> summary input the hook approved.（§3.9）
+
+| | v0.84.1 | 上游 |
+|---|---|---|
+| 配置存哪 | 树上的 entry（**不可变**） | lane 寄存器（**可变**） |
+| 恢复时配置怎么来 | **重新推导**（`deriveEffectiveConfiguration`） | **快照在 `op.state` 里** |
+
+> **两者是自洽的，不是谁改进了谁**——配置放在不可变的树上就能重推，
+> 放在可变寄存器上就必须快照。选了后者，就得配套加快照。
 
 ### 那为什么还需要 record
 
