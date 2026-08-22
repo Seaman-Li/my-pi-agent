@@ -1584,6 +1584,8 @@ Lane      = LanePointer{ lane, leafId }        ≈ git branch
 分支产生   = 指针回退 + 继续追加                ≈ git checkout HEAD~n && commit
 Record    = 对未来某个 Entry 的预约
 恢复      = 读 record → 查 entry 在不在 → 第一个不在的就是断点
+           位置从带子来（LaneState），内容从树来（buildSessionContext）
+           触发在 AgentHarness.create()，但不自动跑——交回 suspended[] 给调用方
 corruption= 单写者协议写不出来的矛盾 → throw，绝不修复
 
 判据口诀 = 「该做几件事」问树，「做到哪一步」拿 record 的预约 id 去树里查
@@ -1598,7 +1600,7 @@ lane 落盘 = 只有 leafId；配置/队列/operation 全是算出来的（上�
 | `session/types.ts` | 14 / 80 | `EntryBase` / `RecordBase` |
 | `session/types.ts` | 76 | `ProvisionedEntry` |
 | `session/types.ts` | 262 | `LanePointer` |
-| `session/context.ts` | 65 | `sessionEntryToContextMessages` —— 唯一 Entry→消息 |
+| `session/context.ts` | 5 / 65 / 90 | `SessionContext` / `sessionEntryToContextMessages` / `buildSessionContext` |
 | `reducer.ts` | 15 | `RecordLogCorruptionReason` 注释 |
 | `reducer.ts` | 79 | `LaneState` |
 | `reducer.ts` | 312 / 506 | `validateRecordLog` / `reduceLaneState` |
@@ -1607,8 +1609,9 @@ lane 落盘 = 只有 leafId；配置/队列/operation 全是算出来的（上�
 | `jsonl/codec.ts` | 6 / 182 | `ENTRY_TYPES` 白名单 / `encodeMutation` |
 | `session/state.ts` | 112 / 121 | 「必须接在 leaf 上」硬校验 / 追加后隐式挪指针 |
 | `session/session.ts` | 104 / 108 | `idGenerator` —— 预约 id 从这来 |
-| `reducer.ts` | 445 / 476 | `deriveToolBatch` / `resultExists` 对账 |
+| `reducer.ts` | 445 / 492 | `deriveToolBatch` / `resultExists` 对账 |
 | `agent-harness.ts` | 167 / 211 / 243 / 271 | `LaneSnapshot` / `Hooks` / `AgentHarnessOptions` / `AgentLane` |
+| `agent-harness.ts` | 140 / 347 / 380 | `SuspendedOperation` / `create()` 恢复触发点 / `resume()` |
 | `harness/types.ts` | 315 | `ExecutionEnv extends FileSystem, Shell` —— 对外部世界的唯一依赖 |
 | `compaction/compaction.ts` | 158 / 247 | 默认设置 / `shouldCompact` |
 | `coding-agent/core/session-manager.ts` | 30 / 480 / 890 | `CURRENT_SESSION_VERSION=3` / 存储路径 / resume 注释 |
