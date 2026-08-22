@@ -1571,7 +1571,212 @@ export interface LaneSnapshot {
 
 ---
 
-## 十二、速查
+## 十二、Hook：11 个拦截点
+
+上游文档 §5.6 原话：*"Hooks are **awaited** interception points. Registration is
+harness-global; every payload carries `lane`."*
+
+> **Hook = 可以「拦下来改数据」的挂载点。**
+
+### 和 Event 的区别：返回类型就是全部
+
+`agent-harness.ts:211` 和 `:215` 是并排的一对：
+
+```ts
+export interface Hooks  { on(name, handler: (e) => unknown | Promise<unknown>, ...): () => void }
+export interface Events { on(type, listener: (e) => void | Promise<void>): () => void }
+                                                    ↑ 返回 void
+```
+
+> Events expose **post-hook** values. Passive listeners **cannot transform** them.
+
+**hook 先跑、能改；event 看到的是改完的结果。**
+
+这跟 [agent-loop.md](./agent-loop.md) 第七节记的 `emit` 是同一组对立——
+`AgentEventSink` 返回 `Promise<void> | void`，所以它是**喇叭**；hook 返回值有意义，所以它是**阀门**。
+
+### v0.84.1 现状：类型在，实现全 throw
+
+```ts
+class UnavailableRegistry implements Hooks, Events {
+	on(_name, _handler, _options): () => void {
+		throw this.isClosed() ? new HarnessClosed() : new HarnessNotImplemented(this.operation);
+	}
+}                                                            // agent-harness.ts:219
+
+this.hooks = new UnavailableRegistry("hooks.on", ...);       // :326
+```
+
+**注册就抛。** 而且 handler 签名是 `(event: unknown) => unknown`——**泛型被擦光了**。
+上游有完整的 `HookMap`，本地这版只留了个名字列表。又一处「先把接口占住」的痕迹。
+
+### 11 个 hook：拦在哪，能改什么
+
+| Hook | 拦在哪 | 能改什么 |
+|---|---|---|
+| `before_run` | 接受 prompt **之前** | 追加消息、替换 system prompt、存 `resumeData` |
+| `before_resume` | `resume()` 时，任何副作用之前 | ❌ 只读（必须幂等） |
+| `before_run_end` | 一轮正常结束时 | 返回 `followUp` 让它接着跑 |
+| `transform_context` | 每次请求前，**`AgentMessage` 层** | 整个消息数组 |
+| `before_request` | 每次请求前，**provider 中立** | `streamOptions` |
+| `before_payload` | 每次请求前，**provider 专有线格式** | 整个 wire payload |
+| `after_response` | 流式结束后、`message_end` 和落盘**之前** | 整条 assistant 消息 |
+| `before_tool` | 参数校验后、执行前 | **改参数** 或 **`block` 掉** |
+| `after_tool` | 执行后、结果落盘前 | `content` / `isError` / `usage` / `terminate` |
+| `before_compaction` | 压缩决策点 | `decline` 或**自己给一份摘要** |
+| `before_navigation` | 分支跳转决策点 | 同上 |
+
+#### 三个请求钩子是同一次请求上的三层，粒度递减
+
+```
+transform_context   消息数组      ← 还是 AgentMessage
+        ↓ toProviderMessages
+before_request      流式选项      ← provider 中立
+        ↓ 组装
+before_payload      wire payload  ← 已经是 Anthropic / OpenAI 的 JSON 了
+        ↓ 发出去
+```
+
+想加「自动把超长文件摘要掉」→ `transform_context`。
+想给某家 provider 塞个自定义字段 → `before_payload`。
+
+### 两条容易踩的语义
+
+#### ① `before_tool` 是失败闭合，其他都是失败开放
+
+> A throw emits `handler_error`, skips that handler, and lets the rest continue.
+> **`before_tool` instead fails closed and blocks the tool.**
+
+你的权限检查 hook 挂了 → **工具不执行**，而不是「检查失败所以放行」。安全默认值。
+
+跑得通的那条路上就是这么写的：
+
+```ts
+} catch (err) {
+	if (err instanceof Error) throw err;
+	throw new Error(`Extension failed, blocking execution: ${String(err)}`);
+}                                          // coding-agent/core/agent-session.ts:485
+```
+
+#### ② hook 可能被重跑一次
+
+> Durable hook outputs commit before execution continues. A return alone is **not durable**;
+> a pre-commit crash **may rerun** the hook.
+
+回到第八节的恢复模型——**hook 的返回值只有落进那笔事务才算数**。
+崩在返回之后、事务之前，重启就再跑一遍。
+
+| Hook | fresh | retry | resume |
+|---|---|---|---|
+| `before_run` | 一次 | ❌ | ❌（结果已持久化在 operation 里） |
+| `transform_context` / `before_request` / `before_payload` | 每次请求 | ✅ | ✅ |
+| `before_tool` | 每次调用 | — | ❌ 已经 `effect_pending` 的不再跑 |
+| `after_tool` | 每个结果 | — | 只在 `replay: "safe"` 时 |
+| `before_run_end` | 每个结束边界 | — | **可能重复** |
+
+> `before_run_end` may fire again after a crash at the same boundary.
+> Handlers that must not double-fire keep their own durable marker.
+> **This is the exactly-once non-goal surfacing in the hook layer.**
+
+**所以：hook 里有外部副作用（发 Slack、写数据库）的，自己按 operation id 做幂等。**
+上游明说了做不到 exactly-once，这是设计上的**非目标**，不是缺陷。
+
+### hook 本身是一个可调度的动作
+
+```ts
+export type ActionInfo =
+	| ...
+	| { kind: "hook"; name: HookName }          // agent-harness.ts:195
+	| { kind: "sleep"; delayMs: number };
+```
+
+hook 调用跟「调 LLM」「执行工具」平级，都是 `peekAction()` / `executeAction()` 能单步驱动的东西。
+**`drive: "manual"` 模式下测试时可以停在 hook 前面。**
+
+一整条 hook 流水线（同名的 N 个 handler）算**一个** action，不是 N 个。
+
+### 对照：跑得通的代码里只有 3 个
+
+harness 的 11 个是规划。`packages/agent/src/agent.ts` 里实际能用的是：
+
+```ts
+public transformContext?: (messages, signal?) => Promise<AgentMessage[]>;                  // :180
+public beforeToolCall?:   (context, signal?) => Promise<BeforeToolCallResult | undefined>; // :185
+public afterToolCall?:    (context, signal?) => Promise<AfterToolCallResult | undefined>;  // :189
+```
+
+| harness 规划 | 现在有对应的吗 |
+|---|---|
+| `transform_context` | ✅ `transformContext` |
+| `before_tool` | ✅ `beforeToolCall` |
+| `after_tool` | ✅ `afterToolCall` |
+| 其余 8 个 | ❌ |
+
+**形态也不同**：现在是「一个字段一个函数」，harness 是「注册表 + 多 handler 按序链式」。
+
+coding-agent 靠这三个字段把整个扩展系统接上去（`agent-session.ts:479` 的 `_installAgentToolHooks`）：
+
+```ts
+this.agent.beforeToolCall = async ({ toolCall, args }) => {
+	if (!runner.hasHandlers("tool_call")) return undefined;
+	return await runner.emitToolCall({ ... });      // 转给扩展运行器
+};
+```
+
+> **单字段回调 → 扩展系统的多播，是 coding-agent 自己补的一层。harness 想把这层收进框架里。**
+
+### ⚠️ 和 React 的 hook 不是一回事
+
+名字撞车，**方向是反的**：
+
+```
+React hook：   你的组件  ──调用──►  React        「让我钩住 React 的内部能力」
+pi hook：      框架      ──调用──►  你的函数      「让你钩在我的流程上」
+```
+
+React 官方定义是 *"hook **into** React state and lifecycle features"*——**钩进去拿能力**。
+pi 的是这个词的**本义**：在别人的流程上挂钩子。同族是 git hook / webhook / WordPress `do_action`。
+
+| | React hook | pi hook |
+|---|---|---|
+| 调用方向 | 你 → React | **框架 → 你** |
+| 能改数据流吗 | ❌ | ✅ **这就是它存在的理由** |
+| 触发方式 | `useEffect` 依赖变了跑 | 流程走到那个位置**必然**调用 |
+| 多个同类 | 各管各的 | **按注册顺序链式**，后一个看到前一个改完的值 |
+
+**前端里真正对应的是 Axios interceptors**：
+
+```js
+axios.interceptors.request.use(config => { config.headers.X = 1; return config })
+axios.interceptors.response.use(res => { res.data = clean(res.data); return res })
+```
+
+| Axios | pi |
+|---|---|
+| `interceptors.request` | `before_request` / `before_payload` |
+| `interceptors.response` | `after_response` |
+| 多个拦截器按注册顺序链式 | ✅ |
+| 抛错中断请求 | ✅ `before_tool` 抛错 = block |
+| 返回值就是新的 config / response | ✅ |
+
+> **React hook 是「我钩住你」，pi hook 是「你钩住我」。找类比看 Axios interceptors，不是 `useState`。**
+
+### 📌 对改造项目的实际结论
+
+| 你想做 | 用哪个 | 现在能做吗 |
+|---|---|---|
+| 权限确认 / 命令拦截 | `beforeToolCall` | ✅ |
+| 工具结果后处理（截断、脱敏、注入图片） | `afterToolCall` | ✅ |
+| 上下文压缩、注入记忆 | `transformContext` | ✅ |
+| 请求前改模型参数 | `before_request` | ❌ 得自己在 `StreamFn` 那层包 |
+| 自己接管压缩逻辑 | `before_compaction` | ❌ |
+| 一轮结束后自动追问 | `before_run_end` | ❌ 得在外层循环里自己写 |
+
+**前三个覆盖了 80% 的场景**——这也是为什么 coding-agent 只用这三个就把整个产品做出来了。
+
+---
+
+## 十三、速查
 
 ```
 Session  ── 一个 JSONL 文件
@@ -1591,6 +1796,8 @@ corruption= 单写者协议写不出来的矛盾 → throw，绝不修复
 判据口诀 = 「该做几件事」问树，「做到哪一步」拿 record 的预约 id 去树里查
 预约时机 = 写 record 之前用 session.idGenerator.next() 分配，uuidv7 时间有序
 lane 落盘 = 只有 leafId；配置/队列/operation 全是算出来的（上游改成了寄存器）
+hook     = 能改数据的拦截点（11 个，v0.84.1 全未实现，实际能用的 3 个）
+           event 只能看不能改——返回类型 void 就是全部区别
 ```
 
 关键文件与行号：
@@ -1612,6 +1819,9 @@ lane 落盘 = 只有 leafId；配置/队列/operation 全是算出来的（上�
 | `reducer.ts` | 445 / 492 | `deriveToolBatch` / `resultExists` 对账 |
 | `agent-harness.ts` | 167 / 211 / 243 / 271 | `LaneSnapshot` / `Hooks` / `AgentHarnessOptions` / `AgentLane` |
 | `agent-harness.ts` | 140 / 347 / 380 | `SuspendedOperation` / `create()` 恢复触发点 / `resume()` |
+| `agent-harness.ts` | 195 / 198 / 211 / 219 | `ActionInfo.hook` / `HookName` 11 个 / `Hooks` / `UnavailableRegistry` |
+| `agent/src/agent.ts` | 180 / 185 / 189 | 实际能用的 3 个 hook 字段 |
+| `agent/src/types.ts` | 428 | `AgentEvent` 11 种（只读，改不了） |
 | `harness/types.ts` | 315 | `ExecutionEnv extends FileSystem, Shell` —— 对外部世界的唯一依赖 |
 | `compaction/compaction.ts` | 158 / 247 | 默认设置 / `shouldCompact` |
 | `coding-agent/core/session-manager.ts` | 30 / 480 / 890 | `CURRENT_SESSION_VERSION=3` / 存储路径 / resume 注释 |
