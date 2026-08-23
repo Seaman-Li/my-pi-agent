@@ -68,10 +68,9 @@ loop、tool、session、feature 一律不许直接调 `streamSimple`——它们
 ## 二、文件结构
 
 ```
-agent1-travel/
+packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同级
 ├── package.json              deps 只有 pi-ai
 ├── tsconfig.json             只为编辑器,不参与运行
-├── DEVELOPMENT.md            ← 本文件,进项目根
 ├── BACKLOG.md                冒出来的新想法丢这,当次不做
 ├── README.md                 每个 Step 的验收命令表
 ├── docs/
@@ -207,7 +206,8 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
 **开场**(直接复制,只改 Step 号):
 
 ```
-读 /Users/simonli/Downloads/MyProjects/agent1-travel/DEVELOPMENT.md,执行 Step N。
+读 notes/travel-agent-notes/agent1-dev-workflow.md,执行 Step N。
+代码在 packages/pi-travel-agent/。
 只改 Step N 列的文件。写完跑验收命令并贴输出。
 新想法记进 BACKLOG.md,不当场做。
 ```

@@ -1,0 +1,13 @@
+{
+	"name": "@earendil-works/pi-travel-agent",
+	"version": "0.84.1",
+	"description": "Travel assistant agent — handwritten on pi's architecture",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"clean": "shx rm -rf dist"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}
