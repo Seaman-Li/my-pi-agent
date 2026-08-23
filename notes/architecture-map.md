@@ -151,6 +151,209 @@ grep -rn "createCodingAgentHarness" packages | grep -v node_modules | grep -v di
 
 **结论：agent 层的 tools 是"给别人用的参考实现"，coding-agent 层的是"pi 自己用的完整版"。行数差 2–7 倍，差的全是产品化的部分（权限、渲染、截断）。**
 
+> 两个文件夹各自的内部结构、依赖注入手法的差别，见下一节。
+
+---
+
+## `tools/` 两个文件夹的结构
+
+上一节说清了「为什么有两份」，这节说**各自长什么样、依赖注入的手法差在哪**。
+
+### 一个 tool 就是一个对象
+
+没有基类、没有装饰器、没有注册表：
+
+```ts
+interface AgentTool extends Tool {
+	name: string;
+	description: string;      // ← 这两个直接发给 LLM
+	parameters: TSchema;      // ← typebox schema，转 JSON Schema 发给 LLM
+	label: string;            // UI 显示用
+	execute(...): Promise<AgentToolResult>;
+	prepareArguments?(args: unknown): Static<TParameters>;   // 可选：兼容垫片
+	executionMode?: "sequential" | "parallel";
+}                                              // agent/src/types.ts:386
+```
+
+**schema 定义一次，用在三处**：
+
+```
+xxxSchema ─┬─→ 转 JSON Schema 发给 LLM（工具描述，含 description 文案）
+           ├─→ 运行时校验模型传回来的参数
+           └─→ Static<typeof xxxSchema> 推出 TS 类型
+```
+
+返回值的二分很关键：
+
+```ts
+interface AgentToolResult<T> {
+	content: (TextContent | ImageContent)[];   // ← 给 LLM 看，进上下文，花 token
+	details: T;                                // ← 给 UI / 日志看，LLM 看不到
+	usage?: Usage;
+	addedToolNames?: string[];                 // ← 工具的执行结果可以引入新工具
+	terminate?: boolean;                       // ← 提示循环停下（agent-loop 出口②）
+}                                              // agent/src/types.ts:361
+```
+
+`execute` 里**不写 try/catch**——注释明说 *"Throw on failure instead of encoding errors in `content`"*，
+抛出去由循环包成 error 的 `ToolResultMessage`。
+
+---
+
+### A. `agent/src/harness/tools/`（1190 行，10 文件）
+
+| 文件 | 行 | 职责 |
+|---|---|---|
+| `edit-diff.ts` | 500 | **模糊匹配替换**——行尾归一化、空白容错、保留未改动行的原始格式 |
+| `bash.ts` | 161 | `createBashTool`，带 `BashPrepare` 钩子（权限检查挂这） |
+| `read.ts` | 144 | `createReadTool`，可插 `ReadImageProcessor` |
+| `edit.ts` | 127 | `createEditTool` |
+| `image.ts` | 104 | 嗅探图片 MIME + base64 |
+| `file-mutation-queue.ts` | 56 | 同文件写入串行化 |
+| `write.ts` | 39 | 最小完整样本 |
+| `path-utils.ts` | 30 | 路径解析 |
+| `index.ts` | 23 | re-export |
+| `tool-context.ts` | 6 | `ExecutionToolContext { env }` |
+
+**依赖注入：一个 `ExecutionEnv`，走 `execute` 的第五个参数。**
+
+```ts
+async execute(_toolCallId, { path, content }, signal, _onUpdate, { env }) {
+	const absolutePath = await resolveToolPath(env, path, signal);
+	return withFileMutationQueue(env, absolutePath, async () => {
+		getOrThrow(await env.writeFile(absolutePath, content, signal));
+		...
+	});
+}                                              // tools/write.ts
+```
+
+第五个参数是**泛型 context**，不是写死的 env：
+
+```ts
+export type AgentHarnessTool<TContext, TParameters extends TSchema = TSchema, TDetails = unknown> =
+	Omit<AgentTool<TParameters, TDetails>, "execute"> & {
+		execute(toolCallId, params, signal, onUpdate, context: TContext): Promise<AgentToolResult<TDetails>>;
+	};                                         // harness/types.ts:81
+```
+
+```ts
+export interface ExecutionToolContext { env: ExecutionEnv }   // tools/tool-context.ts
+```
+
+`createWriteTool<TContext extends ExecutionToolContext = ExecutionToolContext>()`
+——**约束是「至少得有 env」，你自己的工具可以要求 `{ env, db, currentUser }`。**
+调用方那头完全开放：`toolContext?: object | (() => object | Promise<object>)`（`agent-harness.ts:250`）。
+
+> 为什么是 `Omit &` 不是 `extends`：多一个必需参数违反里氏替换，`extends` 编译不过。
+> 详见 [ts-notes.md](./ts-notes.md) 第 24 条。
+
+**`file-mutation-queue.ts`（56 行）小而精**，三个设计点：
+
+1. **队列挂在 `env` 上**（`WeakMap<ExecutionEnv, State>`），不是全局。多 env 互不干扰，env 被回收队列跟着回收
+2. **key 是 canonicalPath**（解析 symlink 后的真实路径）——三个不同字符串指向同一文件也能正确串行；
+   文件不存在时降级用绝对路径
+3. **「入队」这个动作本身也串行化**——因为算 canonicalPath 是异步的，
+   两个请求各自 `await` 完再抢队列的话，**后来的可能先抢到**。
+   所以先用 `state.registration` 链把入队动作串起来
+
+> 不只是「排队执行」，还得保证「排队」的顺序本身不乱。这个 bug 很难想到，也很难测。
+
+---
+
+### B. `coding-agent/src/core/tools/`（4142 行，15 文件）
+
+| 文件 | 行 | 职责 |
+|---|---|---|
+| `edit-diff.ts` | 560 | 同名但独立实现，多了产品化处理 |
+| `bash.ts` | 508 | + 权限、spawn 钩子、实时输出 |
+| `edit.ts` | 441 | |
+| `grep.ts` | 390 | **harness 没有** |
+| `find.ts` | 380 | **harness 没有** |
+| `read.ts` | 356 | |
+| `truncate.ts` | 276 | 输出截断（harness 的在 `utils/`） |
+| `write.ts` | 272 | |
+| `ls.ts` | 230 | **harness 没有** |
+| `output-accumulator.ts` | 222 | 流式输出攒批 |
+| `index.ts` | 196 | 工厂总表 |
+| `path-utils.ts` | 118 | |
+| `render-utils.ts` | 85 | **TUI 渲染**——harness 完全没有 |
+| `file-mutation-queue.ts` | 61 | 同名独立实现 |
+| `tool-definition-wrapper.ts` | 47 | ★ 见下 |
+
+**依赖注入：每个工具一个 `XxxOperations` 接口，构造时传，且有默认实现。**
+
+```ts
+export interface EditOperations {
+	readFile: (absolutePath: string) => Promise<Buffer>;
+	writeFile: (absolutePath: string, content: string) => Promise<void>;
+	access: (absolutePath: string) => Promise<void>;
+}
+const defaultEditOperations: EditOperations = {
+	readFile: (path) => fsReadFile(path),                    // ← 直接 node:fs
+	writeFile: (path, content) => fsWriteFile(path, content, "utf-8"),
+	access: (path) => fsAccess(path, constants.R_OK | constants.W_OK),
+};                                             // core/tools/edit.ts:84
+```
+
+```ts
+createEditTool(cwd, options?)     // cwd 构造时就烤进去，不是每次调用传
+```
+
+#### ★ 三层形状与 `tool-definition-wrapper.ts`
+
+coding-agent 的内置工具走的是**扩展面向的接口**，再统一 wrap：
+
+```
+createReadToolDefinition(cwd, options)  →  ToolDefinition   扩展面向（extensions/types.ts）
+        ↓  wrapToolDefinition
+createReadTool(cwd, options)            →  AgentTool        运行时面向
+```
+
+```ts
+export function createReadTool(cwd: string, options?: ReadToolOptions): AgentTool<typeof readSchema> {
+	return wrapToolDefinition(createReadToolDefinition(cwd, options));
+}                                              // core/tools/read.ts:354
+```
+
+> **内置工具没有特权，和第三方扩展工具走同一个形状（`ToolDefinition`），
+> 只是内置的那批顺手也导出了 wrap 好的版本。**
+
+工厂总表在 `index.ts`：
+
+```ts
+export type ToolName = "read" | "bash" | "edit" | "write" | "grep" | "find" | "ls";   // :83
+export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef  // :96
+export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptions): Tool               // :117
+export function createCodingToolDefinitions(cwd, options): ToolDef[]      // 全套
+export function createReadOnlyToolDefinitions(cwd, options): ToolDef[]    // 只读子集 ← 审计/沙箱场景
+```
+
+---
+
+### 两边的结构差异
+
+| | `harness/tools/` | `coding-agent/core/tools/` |
+|---|---|---|
+| 行数 | 1190 | 4142（3.5×） |
+| 工具数 | 4 | 7 |
+| **依赖注入** | **一个 `ExecutionEnv`**，`execute` 第 5 参 | **每工具一个 `XxxOperations`**，构造时传 |
+| **默认实现** | ❌ 必须自己给 env | ✅ `defaultXxxOperations` 直接用 `node:fs` |
+| **cwd** | 每次调用从 env 解析 | **构造时烤进去** |
+| 工具形状 | `AgentHarnessTool`（5 参 execute） | `ToolDefinition` → wrap → `AgentTool`（4 参） |
+| 和扩展的关系 | 无 | **内置与扩展同一形状** |
+| TUI 渲染 | ❌ | ✅ `render-utils.ts` |
+| 输出截断 | 在 `harness/utils/truncate.ts` | 在 `tools/truncate.ts` |
+
+**两种注入手法的取舍：**
+
+```
+一个 ExecutionEnv    换环境只实现一个接口；但每次调用都得把 env 传进来
+每工具 Operations    颗粒更细、能只 mock 一个工具的 IO；但接口数量 = 工具数量
+```
+
+harness 那套更适合「整体换执行环境」（浏览器、远程沙箱）；
+coding-agent 那套更适合「单个工具打桩测试」。**两边都是本地跑，只是抽象的切法不同。**
+
 ---
 
 ## 四个边缘包（合计不到 6000 行，可以先不看）
@@ -176,7 +379,8 @@ grep -rn "createCodingAgentHarness" packages | grep -v node_modules | grep -v di
 | 改 agent 循环的终止/重试逻辑 | `agent/src/agent-loop.ts` |
 | 改上下文压缩策略 | `agent/src/harness/compaction/` |
 | 改会话怎么存 | `agent/src/harness/session/` |
-| 加一个 pi 的内置工具 | `coding-agent/src/core/tools/` |
+| 加一个 pi 的内置工具 | `coding-agent/src/core/tools/`（写成 `ToolDefinition`，见 [tools 结构](#tools-两个文件夹的结构)） |
+| 给 SDK 用户加一个工具 | `agent/src/harness/tools/`（写成 `AgentHarnessTool`，5 参 execute） |
 | 改终端界面 | `tui/` + `coding-agent/src/modes/interactive/` |
 | 改命令行参数 | `coding-agent/src/main.ts` |
 | 加扩展/插件 | `coding-agent/src/core/extensions/` |
