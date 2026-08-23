@@ -170,55 +170,87 @@ node src/cli.ts "你好"          # 22.18+ 默认开启;报错就加 --experimen
 
 ### 三级单位
 
-| 单位 | 是什么 | 边界 |
+| 单位 | 是什么 | 谁决定它的大小 |
 |---|---|---|
-| **Step** | 一次对话 = 一个 Step = 一个 commit | **≤500 行,目标 300** |
-| **分支** | 若干 Step,跑得起来的一个版本 | 验收通过 → merge 进 main + 打 tag |
+| **Step** | 一个完整功能,验收标准是「这个功能能用」 | **功能本身**,不是行数 |
+| **批** | 一次对话 = 一个 commit = Step 的一个切片 | 行数。300 行舒服,400 以上该想收尾了 |
+| **分支** | 一个或多个 Step | 验收通过 → merge 进 main |
 | **main** | 只有验收通过的版本 | 永远能跑 |
+
+**行数不是切功能的刀,是分批的信号。**
+写到 400 行发现功能还差一半,正确反应是「这个 Step 有两批」,
+不是「砍掉一半算它做完了」。半个功能没法验收,也没法在三个月后解释它为什么长这样。
 
 ```
 main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
        ├── v2-tools       (Step 3-4)  6 个工具 + HTML 报告
-       ├── v3-session     (Step 5)    Entry 树 + --resume
+       ├── v3-session     (Step 5)    多轮 + Entry 树 + --resume
        ├── v4-memory      (Step 6)    跨会话偏好
-       └── v5-compaction  (Step 7)    上下文压缩
+       ├── v5-compaction  (Step 7)    上下文压缩
+       ├── v6-guard       (Step 8)    安全边界
+       ├── v7-debug       (Step 9)    trace / replay
+       └── v8-mcp         (Step 10)   MCP 对照实验(选做)
 ```
 
-叠加式:`v2` 从 `v1` merge 后的 main 开出来。每个分支自带 README 里的一行验收命令。
+叠加式:`v2` 从 `v1` merge 后的 main 开出来。
+
+### 怎么分批
+
+按优先级三条:
+
+1. **按闭环分,不按文件分。** 每一批尽量让 `node src/cli.ts` 还能跑,哪怕功能不全。
+   「先把五个文件的类型都定了,下一批再实现」是最差的分法 —— 中间态谁都验不了。
+2. **先接口后实现。** 第一批:形状 + 一个最小但能端到端跑通的实现;
+   第二批:填齐分支和边界情况。这样第二批的 diff 是纯增量,好读。
+3. **中间批允许跑不起来,但不许 merge。** 分支上的半成品 commit 无所谓,
+   「main 永远能跑」这条不动。真出现不可运行的中间批,commit message 里写明「中间态」。
 
 ### Step 清单
 
-| # | 分支 | 做什么 | 行数 | 验收命令 |
+| # | 分支 | Step(一个完整功能) | 批 | 验收 |
 |---|---|---|---|---|
-| 1 | v1-chat | `core/types.ts` + `core/model.ts` + 最小 `cli.ts`,直出 pi-ai 事件流 | ~250 | `node src/cli.ts "你好"` 逐字输出 |
-| 2 | v1-chat | `hooks.ts` + `registry.ts` + **`loop.ts`** + `tools/weather.ts` + `compose.ts` + 最小 `--trace` | ~380 | `--trace` 打出 step/tool/hook 序列,turn 正常结束 |
-| 3 | v2-tools | `tools/amap.ts` + `truncate.ts` + 4 个 tool + **并行/串行 + abort + 参数校验** | ~380 | Ctrl-C 立刻停;两个独立工具并行 |
-| 4 | v2-tools | `TripPlan` schema + `save_plan` + `report.ts`(**HTML 转义**) | ~320 | `out/*.html` 双击可读,注入不执行 |
-| 5 | v3-session | `session/types.ts` + `store.ts` + `--resume` | ~300 | 退出重进,历史还在 |
-| 6 | v4-memory | `features/memory.ts` + `remember` tool | ~250 | 新会话不推荐爬山 |
-| 7 | v5-compaction | `features/compaction.ts`(阈值调到 20k) | ~250 | JSONL 里出现 compaction entry |
-| 8 | v6-guard | `features/guard.ts` —— 出口白名单 + 路径限制 + 调用预算 + 外部数据标注 | ~250 | 注入用例被挡;超预算停 |
-| 9 | v7-debug | `--trace` 完整版 + `--replay` + `docs/debugging.md` | ~280 | 同一 session 能重放,结论可复现 |
-| 10 | v8-mcp(选做) | 高德 MCP server 版 `weather`,与 REST 版并存,compose 开关切 | ~200 | 两条路径同一问题输出一致 |
+| 1 | v1-chat | 跑通一次流式调用 | 1 ✅ | `node src/cli.ts "你好"` 逐字输出 |
+| 2 | v1-chat | 能调工具的对话循环 | 2 | `--trace` 打出 step/tool/hook 序列,turn 正常结束 |
+| 3 | v2-tools | 六个真工具,能出行程 | 2 | 一句话规划三天行程;Ctrl-C 立刻停 |
+| 4 | v2-tools | 结构化产出 + HTML 报告 | 1 | `out/*.html` 双击可读,注入不执行 |
+| 5 | v3-session | 多轮对话 + 会话持久化 | 2 | 退出重进,历史还在 |
+| 6 | v4-memory | 跨会话记忆 | 1 | 新会话不推荐爬山 |
+| 7 | v5-compaction | 上下文压缩 | 1 | JSONL 里出现 compaction entry |
+| 8 | v6-guard | 安全边界 | 1 | 注入用例被挡;超预算停 |
+| 9 | v7-debug | 可定位:trace + replay | 1 | 同一 session 能重放,结论可复现 |
+| 10 | v8-mcp | MCP 对照实验(选做) | 1 | 两条路径同一问题输出一致 |
 
-合计约 2600 行 / 10 次对话。超预算的 Step 当场拆成 a/b 两次,不要硬塞。
+多批的三个 Step,切法先定好:
+
+| Step | 批 | 交付 | 这批跑得起来吗 |
+|---|---|---|---|
+| 2 | 2a | `core/types.ts` 补 Tool/ToolResult + `registry.ts` + **`loop.ts`** + 假数据 `weather` | ✅ 端到端跑通一次工具调用 |
+| 2 | 2b | `hooks.ts` 接进 loop + `compose.ts` + 最小 `--trace` | ✅ 行为不变,挂载点就位 |
+| 3 | 3a | `tools/amap.ts` + `truncate.ts` + `weather`/`search_poi` 换真 API | ✅ 能查真天气真景点 |
+| 3 | 3b | `search_hotel` + `estimate_budget` + 并行执行 + abort 贯穿 + 参数 Convert→Check | ✅ 能出完整行程 |
+| 5 | 5a | REPL 多轮,`messages` 跨轮累积(仍在内存) | ✅ 能连着聊 |
+| 5 | 5b | `session/types.ts` + `store.ts` JSONL + `--resume` | ✅ 退出重进历史还在 |
+
+> Step 5 的 REPL 是补进来的 —— 原计划漏了。没有多轮就没有「历史」,`--resume` 也就无从谈起。
+
+预计 13 批、约 2900 行。**这是预估不是预算**:某一批写着写着发现是两批,就拆成两批。
 
 ### 每次对话的固定协议
 
-**开场**(直接复制,只改 Step 号):
+**开场**(直接复制,只改编号):
 
 ```
-读 notes/travel-agent-notes/agent1-dev-workflow.md,执行 Step N。
+读 notes/travel-agent-notes/agent1-dev-workflow.md,执行 Step N 第 x 批。
 代码在 packages/pi-travel-agent/。
-只改 Step N 列的文件。写完跑验收命令并贴输出。
+功能优先:这一批要交付一个能验收的切片,写不完就明说还差什么,别砍功能凑行数。
 新想法记进 BACKLOG.md,不当场做。
 ```
 
 **收尾三件事**:
 
-1. `git diff --stat` —— 超 500 行说明拆错了,停下来拆
-2. 跑**本 Step 的验收命令 + 之前所有 Step 的验收命令**(它们都只要几秒)—— 防回归,这就是测试
-3. `git commit -m "stepN(scope): ..."` —— 不 push
+1. `git diff --stat` —— 400 行以上先想一下:是这批该收尾了,还是这个 Step 本来就该多一批
+2. 跑**本批验收 + 之前所有 Step 的验收命令**(都只要几秒)—— 防回归,这就是测试
+3. `git commit -m "stepNx(scope): ..."` —— 不 push
 
 ### 文件头:每个文件第一行写职责
 
@@ -291,12 +323,13 @@ find src -name '*.ts' -exec awk '/^(export )?(async )?function /{ if (prev !~ /\
 
 ### 红线
 
-- **一次对话只做一个 Step。** 顺手改别的 = 下次 diff 读不懂 = 分支不再是干净的积木
+- **一次对话只做一个批,不跨 Step。** 顺手改别的 = 下次 diff 读不懂 = 分支不再是干净的积木
+- **不为凑行数砍功能。** 宁可多一批,也不把半个功能 merge 进 main
 - **Step 2 之后 `core/loop.ts` 只读。** 想改它说明缺 hook —— 先加 hook 再挂功能。合并前 `git diff main -- src/core/loop.ts` 应为空(Step 2 除外)
 - **不提前抽象。** 第二次出现同一个形状才抽
 - **不装计划外的依赖、不动 tsconfig、不 push。** 需要时先说
 - 卡住超 40 分钟 → 记进 BACKLOG.md,跳过,往下走
-- **绑定问题的 Step 没写完 `docs/answers/qN-*.md`,不算完成**,不 merge
+- **绑定问题的 Step 没写完 `docs/answers/qN-*.md`,不算完成**,不 merge(写在这个 Step 的最后一批)
 
 ### README.md 长这样
 
@@ -321,9 +354,9 @@ find src -name '*.ts' -exec awk '/^(export )?(async )?function /{ if (prev !~ /\
 |---|---|---|---|---|
 | 1 | 一次 prompt 如何进入 loop,turn 怎么结束 | Step 2 | `core/loop.ts` | 把 **turn 的四个结束条件**在代码里写成一个显式函数,不要散在 while 条件里:无 toolCall / stopReason≠toolUse / abort / 触顶 maxSteps |
 | 2 | context、event、hook 怎么配合 | Step 2 建骨架,Step 6-8 才验证 | `core/hooks.ts` + 三个 feature | Step 8 之后 `beforeToolCall` 上会挂着 2 个 handler(guard + memory),那时才有「多 handler 串起来」可讲 |
-| 3 | 工具调用怎么执行 | Step 3 | `core/loop.ts` 的 execute 段 | 原计划把并行和 abort 放进「选做」,现在提到 Step 3——否则这题只能答一半 |
+| 3 | 工具调用怎么执行 | Step 3(3b) | `core/loop.ts` 的 execute 段 | 原计划把并行和 abort 放进「选做」,现在提到 Step 3b——否则这题只能答一半 |
 | 4 | 长上下文怎么压缩 | Step 7 | `features/compaction.ts` | 阈值调到 20k 真触发一次,并回答「压缩后追问细节还答得上吗」 |
-| 5 | session 怎么持久化和恢复 | Step 5 | `session/store.ts` | 手改 JSONL 制造一次断链,确认报错而不是静默跳过 |
+| 5 | session 怎么持久化和恢复 | Step 5(5b) | `session/store.ts` | 手改 JSONL 制造一次断链,确认报错而不是静默跳过。5a 的 REPL 是它的前提 |
 | 6 | 安全边界怎么设计,和沙箱是不是一回事 | Step 8 | `features/guard.ts` | 见下 |
 | 7 | 出错了怎么定位,幻觉还是 agent bug | Step 9 | `--trace` / `--replay` | 见下 |
 | 8 | 用不用 MCP,无状态和有状态什么区别 | Step 10 | MCP 版 weather | 见下 |
