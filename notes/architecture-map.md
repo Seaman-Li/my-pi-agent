@@ -204,16 +204,16 @@ interface AgentToolResult<T> {
 
 | 文件 | 行 | 职责 |
 |---|---|---|
-| `edit-diff.ts` | 500 | **模糊匹配替换**——行尾归一化、空白容错、保留未改动行的原始格式 |
-| `bash.ts` | 161 | `createBashTool`，带 `BashPrepare` 钩子（权限检查挂这） |
-| `read.ts` | 144 | `createReadTool`，可插 `ReadImageProcessor` |
-| `edit.ts` | 127 | `createEditTool` |
-| `image.ts` | 104 | 嗅探图片 MIME + base64 |
-| `file-mutation-queue.ts` | 56 | 同文件写入串行化 |
-| `write.ts` | 39 | 最小完整样本 |
-| `path-utils.ts` | 30 | 路径解析 |
-| `index.ts` | 23 | re-export |
-| `tool-context.ts` | 6 | `ExecutionToolContext { env }` |
+| `edit-diff.ts` | 500 | **模糊匹配 + diff 生成**。13 个导出函数分四组：行尾（`detectLineEnding` / `normalizeToLF` / `restoreLineEndings`）、归一化（`normalizeForFuzzyMatch`）、匹配应用（`fuzzyFindText` / `applyEditsToNormalizedContent` / `applyReplacementsPreservingUnchangedLines`）、输出（`generateUnifiedPatch` / `generateDiffString`）。另有 `stripBom` |
+| `bash.ts` | 161 | `createBashTool`。`BashPrepare` 钩子在执行前拦一道（**权限确认挂这**），`BashExecution` 描述一次执行 |
+| `read.ts` | 144 | `createReadTool`。schema 三个参数 `path/offset/limit`（分页读）；`ReadImageProcessor` 可插（图片缩放）；输出走 `utils/truncate.ts` 的 `truncateHead` |
+| `edit.ts` | 127 | `createEditTool`。schema 是 `{ path, edits: [{oldText, newText}] }` —— **一次多处替换，每处对原文匹配而非增量**（schema 的 description 里写死了这条约束）。还兼容旧的单 `oldText/newText` 形式 |
+| `image.ts` | 104 | `detectSupportedImageMimeType`（嗅探 magic bytes）+ `encodeBase64` |
+| `file-mutation-queue.ts` | 56 | **同文件写入串行化**。见下方三个设计点 |
+| `write.ts` | 39 | `createWriteTool`。**最小完整样本**，整个工具的形状一眼看完 |
+| `path-utils.ts` | 30 | **路径容错**。见下方 |
+| `index.ts` | 23 | 四个工具的 re-export |
+| `tool-context.ts` | 6 | `ExecutionToolContext { env: ExecutionEnv }` —— 内置工具对 context 的最小要求 |
 
 **依赖注入：一个 `ExecutionEnv`，走 `execute` 的第五个参数。**
 
@@ -247,6 +247,66 @@ export interface ExecutionToolContext { env: ExecutionEnv }   // tools/tool-cont
 > 为什么是 `Omit &` 不是 `extends`：多一个必需参数违反里氏替换，`extends` 编译不过。
 > 详见 [ts-notes.md](./ts-notes.md) 第 24 条。
 
+#### `path-utils.ts`（30 行）—— 对模型和 macOS 双重不可靠的容错
+
+```ts
+const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+
+function normalizeToolPath(path: string): string {
+	const normalized = path.replace(UNICODE_SPACES, " ");
+	return normalized.startsWith("@") ? normalized.slice(1) : normalized;   // 去掉 UI 里 @提及 的前缀
+}
+```
+
+`resolveReadToolPath` 更狠——**依次试 5 种变体，哪个存在用哪个**：
+
+```ts
+const variants = [
+	resolved,
+	resolved.replace(/ (AM|PM)\./gi, `${NARROW_NO_BREAK_SPACE}$1.`),   // macOS 截图文件名里的窄空格
+	resolved.normalize("NFD"),                                          // macOS 文件名的 Unicode 分解形式
+	resolved.replace(/'/g, "\u2019"),                                   // 直引号 → 弯引号
+	resolved.normalize("NFD").replace(/'/g, "\u2019"),
+];
+for (const variant of new Set(variants)) {
+	if (getOrThrow(await env.exists(variant, signal))) return variant;
+}
+```
+
+> **30 行里没有一行是「解析路径」，全是在猜模型到底想说哪个文件。**
+> macOS 的 NFD 文件名和截图里的窄空格是真实存在的坑。
+
+#### `edit-diff.ts` 的模糊匹配到底模糊在哪
+
+```ts
+export function normalizeForFuzzyMatch(text: string): string {
+	return text
+		.normalize("NFKC")
+		.split("\n").map((line) => line.trimEnd()).join("\n")   // 每行去尾部空白
+		.replace(/[\u2018\u2019\u201A\u201B]/g, "'")                          // 弯单引号 → '
+		.replace(/[\u201C\u201D\u201E\u201F]/g, '"')                          // 弯双引号 → "
+		.replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-")      // 各种破折号 → -
+		.replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ");  // 各种空格 → 普通空格
+}
+```
+
+**它不做 Levenshtein、不做行级 diff 匹配。** 只做一件事：把「排版意义上等价但字节不同」的字符归一化，然后精确匹配。
+
+```
+模型写出来的                实际文件里的              归一化后
+don\u2019t   （U+2019 弯撇）  don't  （U+0027 直撇）    都变成 U+0027   ✅
+a \u2014 b   （em dash）      a - b  （hyphen）         都变成 -        ✅
+行尾多了两个空格             没有                       都被 trimEnd    ✅
+缩进 4 空格                  缩进 Tab                   ❌ 不归一，匹配失败
+```
+
+> **归一化的是「模型复述文本时会无意改掉的东西」，不是「代码格式」。**
+> 缩进对不上照样匹配失败——那是模型没照抄，不是排版差异。
+
+`applyReplacementsPreservingUnchangedLines` 是配套的另一半：匹配在归一化文本上做，
+**替换要写回原始文本**，所以未改动的行必须保留原来的字节（含那些弯引号和尾部空白）。
+
+
 **`file-mutation-queue.ts`（56 行）小而精**，三个设计点：
 
 1. **队列挂在 `env` 上**（`WeakMap<ExecutionEnv, State>`），不是全局。多 env 互不干扰，env 被回收队列跟着回收
@@ -264,21 +324,21 @@ export interface ExecutionToolContext { env: ExecutionEnv }   // tools/tool-cont
 
 | 文件 | 行 | 职责 |
 |---|---|---|
-| `edit-diff.ts` | 560 | 同名但独立实现，多了产品化处理 |
-| `bash.ts` | 508 | + 权限、spawn 钩子、实时输出 |
-| `edit.ts` | 441 | |
-| `grep.ts` | 390 | **harness 没有** |
-| `find.ts` | 380 | **harness 没有** |
-| `read.ts` | 356 | |
-| `truncate.ts` | 276 | 输出截断（harness 的在 `utils/`） |
-| `write.ts` | 272 | |
-| `ls.ts` | 230 | **harness 没有** |
-| `output-accumulator.ts` | 222 | 流式输出攒批 |
-| `index.ts` | 196 | 工厂总表 |
-| `path-utils.ts` | 118 | |
-| `render-utils.ts` | 85 | **TUI 渲染**——harness 完全没有 |
+| `edit-diff.ts` | 560 | 同名但独立实现，比 harness 版多 60 行的产品化处理 |
+| `bash.ts` | 508 | `BashOperations` 接口可整个替换（默认 `createLocalBashOperations`）；`BashSpawnHook` 能在 spawn 前改上下文（**沙箱 / 环境变量注入挂这**）；实时输出走 `output-accumulator.ts` |
+| `edit.ts` | 441 | `EditOperations`（`readFile` / `writeFile` / `access`）可换；产出 diff 交给 `render-utils.ts` 渲染 |
+| `grep.ts` | 390 | **harness 没有**。`GrepOperations` 可换，默认走 ripgrep；**尊重 `.gitignore`**；单行超 `GREP_MAX_LINE_LENGTH`（500 字符）截断 |
+| `find.ts` | 380 | **harness 没有**。按文件名 glob 查找；`relativizeFindResultPath` 把结果转成相对路径显示 |
+| `read.ts` | 356 | 比 harness 版多：图片自动缩放、`ReadOperations` 里可插 `detectImageMimeType` |
+| `truncate.ts` | 276 | **输出截断**。双限制（2000 行 / 50KB）**谁先撞谁生效**；注释明写 *"Never returns partial lines"*（bash tail 是唯一例外） |
+| `write.ts` | 272 | 比 harness 版多：写前 diff 预览、权限交互 |
+| `ls.ts` | 230 | **harness 没有**。`LsOperations` 可换 |
+| `output-accumulator.ts` | 222 | **流式输出攒批，内存有界**。超限后**溢出到 `tmpdir()` 的临时文件**，`OutputSnapshot.fullOutputPath` 把完整日志的路径还给用户 |
+| `index.ts` | 196 | **工厂总表**。`ToolName` 七元联合 + `createTool` / `createToolDefinition` 两个 switch + 三个批量工厂 |
+| `path-utils.ts` | 118 | `expandPath`（展开 `~`）/ `resolveToCwd` / `resolveReadPath` |
+| `render-utils.ts` | 85 | **TUI 渲染**——`shortenPath`、`linkPath`（终端超链接）、`replaceTabs`、`normalizeDisplayText`。**harness 完全没有这层** |
 | `file-mutation-queue.ts` | 61 | 同名独立实现 |
-| `tool-definition-wrapper.ts` | 47 | ★ 见下 |
+| `tool-definition-wrapper.ts` | 47 | `ToolDefinition` → `AgentTool` 的转换。见下 |
 
 **依赖注入：每个工具一个 `XxxOperations` 接口，构造时传，且有默认实现。**
 
@@ -298,6 +358,45 @@ const defaultEditOperations: EditOperations = {
 ```ts
 createEditTool(cwd, options?)     // cwd 构造时就烤进去，不是每次调用传
 ```
+
+#### 每个工具还导出一段系统提示词片段
+
+```ts
+export const grepToolSystemPromptContribution = {
+	snippet: "Search file contents for patterns (respects .gitignore)",
+	guidelines: [],
+} as const;                                    // core/tools/grep.ts:38
+```
+
+`bash` / `grep` / `find` / `ls` 都有。**这解释了上一节那个奇怪的 import**：
+
+```ts
+// server/create-harness.ts
+import { createBashTool, ... } from "@earendil-works/pi-agent-core";       // 实现来自 agent 层
+import { bashToolSystemPromptContribution } from "../core/tools/bash.ts";  // 提示词来自产品层
+```
+
+**工具的「怎么做」和「怎么跟模型介绍自己」是分开的两件事**，可以来自不同的包。
+
+#### `output-accumulator.ts`（222 行）—— 内存有界的流式输出
+
+bash 跑 `npm install` 会吐几万行。三件事：
+
+```ts
+export interface OutputSnapshot {
+	content: string;            // 截断后的，给 LLM 和 UI
+	truncation: TruncationResult;
+	fullOutputPath?: string;    // ★ 完整日志溢出到 tmpdir() 的文件路径
+}
+```
+
+1. 边流边攒，只保尾部（`truncateTail`）
+2. 超限后**溢出到临时文件**（`join(tmpdir(), \`${prefix}-${随机 8 字节 hex}.log\`)`）
+3. 把那个路径还回去——**模型或用户想看全的，自己去读那个文件**
+
+> **截断不等于丢弃。** harness 那边的 `utils/truncate.ts` 只截不存，
+> 这 222 行的差别就在「存哪儿、怎么告诉你」。
+
 
 #### ★ 三层形状与 `tool-definition-wrapper.ts`
 
