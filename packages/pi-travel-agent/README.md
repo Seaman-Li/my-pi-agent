@@ -47,7 +47,9 @@ src/
 grep -rn "城市\|景点\|旅行\|trip\|amap" src/core
 grep -rn "streamSimple\|pi-ai/api" src --include=*.ts | grep -v "core/model.ts"
 find src -name '*.ts' -exec sh -c 'head -1 "$1" | grep -q "^/\*\*" || echo "缺文件头: $1"' _ {} \;
+find src -name '*.ts' -exec awk '/^(export )?(async )?function /{ if (prev !~ /\*\//) print FILENAME":"FNR": 缺注释 "$0 } { prev=$0 }' {} \;
 ```
 
-每个文件第一行写职责（一句话 + 层 + 边界，上限 8 行）。
-写不出一句话职责，就是该拆的信号。
+- **文件头**：第一行写职责（一句话 + 层 + 边界，上限 8 行）。写不出一句话职责，就是该拆的信号。
+- **函数注释**：每个函数都要有，会抛就写 `@throws`。判据是「说代码没说的东西」——
+  复述函数名的注释算负资产。

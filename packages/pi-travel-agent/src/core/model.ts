@@ -36,12 +36,24 @@ const DASHSCOPE_COMPAT: OpenAICompletionsCompat = {
 	supportsReasoningEffort: false,
 };
 
+/**
+ * 读一个必填环境变量。
+ *
+ * @throws 缺失或为空串时抛。空串按缺失处理 —— `TRAVEL_MODEL_ID=` 是配错了,
+ *         不是「配了个空值」,让它一路带到 HTTP 请求里只会换来一个难读的 400。
+ */
 function requireEnv(name: string): string {
 	const value = process.env[name];
 	if (!value) throw new Error(`缺少环境变量 ${name}。把 .env.example 复制成 .env 再改`);
 	return value;
 }
 
+/**
+ * 读一个必填的正数环境变量。
+ *
+ * @throws 缺失、不是有限数、或 <= 0 时抛。上下文窗口配成 0 不会立刻报错,
+ *         只会让后面的截断和压缩判定静默失效,所以在入口就拦掉。
+ */
 function envNumber(name: string): number {
 	const raw = requireEnv(name);
 	const value = Number(raw);
@@ -78,6 +90,11 @@ const PROVIDERS: Record<string, () => ModelSpec> = { qwen: qwenFromEnv };
 
 export const DEFAULT_MODEL = "qwen";
 
+/**
+ * 按名字取模型配置。名字来自 `--model`,默认 qwen。
+ *
+ * @throws 名字不认识时抛,错误信息里列出可用的 —— 打错字远比配错常见。
+ */
 export function resolveModel(name: string = DEFAULT_MODEL): ModelSpec {
 	const build = PROVIDERS[name];
 	if (!build) {

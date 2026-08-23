@@ -36,6 +36,12 @@ interface Args {
 	thinking: boolean;
 }
 
+/**
+ * 解析命令行。`--model` 吃掉后面一个参数,其余全部并成 prompt。
+ *
+ * 不认识的 `--xxx` 不报错,会被当成 prompt 的一部分 —— Step 1 只有两个开关,
+ * 严格校验换不来什么。等开关多到会打错字了再收紧。
+ */
 function parseArgs(argv: string[]): Args {
 	const rest: string[] = [];
 	let model = DEFAULT_MODEL;
@@ -100,6 +106,14 @@ function createRenderer(): EventSink {
 	};
 }
 
+/**
+ * 跑一次:读配置 → 装配 → 发请求 → 渲染 → 给退出码。
+ *
+ * 返回退出码而不是自己 `process.exit()`:exit 会掐断还没 flush 的 stdout,
+ * 逐字输出的最后一行可能丢。交给调用方设 `process.exitCode`,让 Node 自己收尾。
+ *
+ * @returns 0 正常;1 模型侧失败或被中断;2 用法错误
+ */
 async function main(): Promise<number> {
 	loadEnv();
 	const args = parseArgs(process.argv.slice(2));

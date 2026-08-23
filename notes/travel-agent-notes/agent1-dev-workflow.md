@@ -125,6 +125,7 @@ grep -rn "城市\|景点\|旅行\|trip\|amap" src/core src/session   # core 被�
 grep -rn "from \"\.\./features\|from \"\.\./tools" src/core     # 依赖倒挂
 grep -rn "streamSimple\|pi-ai/api" src/ --include=*.ts | grep -v "core/model.ts"  # 绕过 provider 边界
 find src -name '*.ts' -exec sh -c 'head -1 "$1" | grep -q "^/\*\*" || echo "缺文件头: $1"' _ {} \;
+find src -name '*.ts' -exec awk '/^(export )?(async )?function /{ if (prev !~ /\*\//) print FILENAME":"FNR": 缺注释 "$0 } { prev=$0 }' {} \;
 ```
 
 ### 两个关键文件的形状(现在只定接口,不写实现)
@@ -252,6 +253,41 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
 ```sh
 find src -name '*.ts' -exec sh -c 'head -1 "$1" | grep -q "^/\*\*" || echo "缺文件头: $1"' _ {} \;
 ```
+
+### 函数注释:每个函数都写
+
+TSDoc 块注释放在函数正上方,相当于 Python 的 docstring。
+
+**必写**
+
+- 第一行一句话:**做什么**,不是怎么做。怎么做看代码。
+- `@throws` —— 会抛就写。TS 的签名里看不出一个函数抛不抛,
+  这是类型系统缺的那一块,只能靠注释补上。
+
+**该写才写**
+
+- `@param` / `@returns`:只在名字说不清的时候写。
+  `(name: string)` 不需要配一句 `@param name 名字`。
+- **为什么这么写** —— 踩过的坑、试过又放弃的写法、看起来该改其实不能改的地方。
+  这是代码里唯一读不出来的东西,也是三个月后最值钱的一段。
+
+**不要写**
+
+- 复述函数名。`/** 解析参数 */ function parseArgs()` 是负资产:
+  占了位置、让检查变绿,却一个字的信息都没有。
+- 实现步骤流水账。步骤会改,注释不会跟着改,最后变成谎话。
+
+一条判据:**注释要说代码没说的东西。** 如果删掉注释、读代码能得到同样的信息,
+那这条注释不该以这个样子存在 —— 但函数还是得有一条,
+所以这恰恰说明该写的是「为什么」,不是「是什么」。
+
+自查(应无输出):
+
+```sh
+find src -name '*.ts' -exec awk '/^(export )?(async )?function /{ if (prev !~ /\*\//) print FILENAME":"FNR": 缺注释 "$0 } { prev=$0 }' {} \;
+```
+
+它只保证「有」,保证不了「有用」。有用与否靠上面那条判据自己把关。
 
 ### 红线
 
