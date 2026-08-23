@@ -166,7 +166,10 @@ node --experimental-strip-types src/cli.ts "你好"
 
 - 终端能看到逐字输出
 - 三种 block（text / thinking / toolCall）都能正确识别边界
-- 把 sink 换成一个 `await sleep(100)` 的版本，输出明显变慢 → **确认背压是真的**
+- 把 sink 换成一个 `await sleep(100)` 的版本，输出明显变慢 —— 但**变慢的原因不是背压**。
+  Step 1 实测：pi-ai 的 `EventStream.push()` 是同步入队（`packages/ai/src/utils/event-stream.ts:22`），
+  生产端不会因为 sink 慢而少读网络；慢 sink 下 producer 4.4s 就读完了，consumer 到 10.7s 才追上。
+  `await sink()` 换来的是**按序交付 + 异步 sink 不浮空**，不是背压。真背压得自己消费 fetch body。
 
 **要点**：`*_start` / `*_end` **是你自己造的**，OpenAI 那边没有。这一步做完，adapter-layer.md 就从「读过」变成「写过」。
 
