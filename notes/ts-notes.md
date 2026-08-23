@@ -1545,10 +1545,201 @@ Python 里没有对应物：`Callable[..., None]` 返回别的东西 mypy 直接
 
 ---
 
+## 24. 里氏替换：为什么 `extends` 不能给方法加参数（以及 `Omit &` 这个惯用法）
+
+从 `harness/types.ts:81` 来的——`AgentHarnessTool` 想给 `AgentTool.execute` 加第五个参数：
+
+```ts
+export type AgentHarnessTool<TContext, TParameters extends TSchema = TSchema, TDetails = unknown> =
+	Omit<AgentTool<TParameters, TDetails>, "execute"> & {
+		execute(toolCallId, params, signal, onUpdate, context: TContext): Promise<AgentToolResult<TDetails>>;
+	};
+```
+
+为什么不直接 `interface AgentHarnessTool extends AgentTool { execute(...5 个参数) }`？
+
+### `extends` 在承诺什么
+
+```ts
+interface Ext extends Base
+```
+
+意思是 **「任何一个 `Ext` 都可以当 `Base` 用」**。所以判断能不能 extends，
+不看 `Ext` 自己怎么用，看——**那些只认识 `Base` 的代码，拿到一个 `Ext` 会怎么调它**。
+
+```ts
+function run(t: Base) {
+	t.execute("x", 1);      // ← 它只看得见 Base 的签名，就传 2 个
+}
+```
+
+`Ext.execute` 的第三个参数是**必需的**，实现里一定会用；而 `run` 只传两个 → `undefined` → 炸。
+
+**方向是关键**：不是「函数被调用时能不能多传」，是**「被冒充的那个类型的调用方会传几个」**。
+
+### 跑一遍，真的崩
+
+```js
+const base = { execute(a, b)    { console.log("base ok:", a, b); } };
+const ext  = { execute(a, b, c) { console.log("ext:", a, b, c.env); } };   // c 必需
+function run(t) { t.execute("x", 1); }    // 只传 2 个
+
+run(base);   // base ok: x 1
+run(ext);    // 💥 TypeError: Cannot read properties of undefined (reading 'env')
+```
+
+**JS 对实参个数不做任何检查**——多传的看不见，少传的悄悄变 `undefined`，
+然后在你用它的时候才炸。类型系统是**唯一**能提前拦住的地方。
+
+### 少参数为什么安全
+
+```ts
+interface Ext2 extends Base { execute(a: string): void }   // ✅ 通过
+```
+
+`run` 传了 `("x", 1)`，`Ext2` 的实现只用 `"x"`，那个 `1` 被忽略。**多传实参在 JS 里完全合法。**
+
+> **少参数 = 我要的比你给的少 → 用不完，没事**
+> **多参数 = 我要的比你给的多 → 不够用，炸**
+
+这就是第 17 条「能少不能多」的实际含义。
+
+### 错误信息逐字解读
+
+```
+error TS2430: Interface 'Ext' incorrectly extends interface 'Base'.
+  Type '(a, b, c: object) => void' is not assignable to type '(a, b) => void'.
+    Target signature provides too few arguments. Expected 3 or more, but got 2.
+```
+
+- **Target** = 被冒充的那个 = `Base` 的签名
+- **provides too few arguments** = `Base` 的调用方只会**提供** 2 个实参
+- **Expected 3 or more** = 但你这个函数**期望** 3 个
+
+**主语是「调用方提供得不够」，不是「你的参数太多」。** 看懂主语这句话就顺了。
+
+### 参数个数 vs 参数类型：两条规则不一样
+
+实测（`tsc --strict`）：
+
+```ts
+// A. 参数「个数」——两种写法都严格
+interface M2 extends M1 { f(a: string, b: object): void }        // 方法简写   ❌ TS2430
+interface P2 extends P1 { f: (a: string, b: object) => void }    // 属性写法   ❌ TS2430
+
+// B. 参数「类型」收窄——只有属性写法严格
+interface T2 extends T1 { g(x: string): void }        // 方法简写   ✅ 通过（双变特例）
+interface U2 extends U1 { g: (x: string) => void }    // 属性写法   ❌ TS2430
+```
+
+（原类型是 `(x: string | number) => void`。）
+
+| | 方法简写 `f(a): R` | 属性写法 `f: (a) => R` |
+|---|---|---|
+| 参数**个数** | 严格 | 严格 |
+| 参数**类型** | **宽松（双变，历史遗留的坑）** | 严格逆变（`strictFunctionTypes`） |
+
+> **收窄参数类型同样不安全**（调用方可能传 `number`），但方法简写放行了。
+> 这是 TS 为了兼容早期代码留的口子，**不是有意的设计**。
+
+### `Omit<X, "k"> & { k: 新类型 }`：替换字段的惯用法
+
+TS **没有** override 成员的语法。要改一个字段的类型，标准做法是**先减掉，再交叉上新的**：
+
+```ts
+Omit<AgentTool<TParameters, TDetails>, "execute">   // 拿掉 execute，其余字段原样保留
+& { execute(..., context: TContext): ... }          // 交叉上新的 execute
+```
+
+`Omit` 是标准库里的映射类型（第 20 条），展开就是「遍历 `keyof X`，跳过 `"execute"`」。
+
+三件事要记住：
+
+1. **原类型一个字节都没变。** `Omit` 是**产生**一个新类型，不是修改原类型——
+   像 `const b = {...a, x: 1}`，`a` 还在。`AgentTool` 别处照用，还是 4 参。
+2. **整个是编译期的。** 运行时那个对象只有一个 `execute` 函数，
+   JS 里根本不存在 `AgentTool` / `AgentHarnessTool` 这两个名字（第 1 条：类型空间 vs 值空间）。
+3. **它不声称是子类型。** 两个类型互不兼容，谁也不能冒充谁。
+
+> **`Omit &` 不是绕过检查的技巧，是如实表达「这两个类型不兼容」。**
+> **`extends` 会撒一个谎；`Omit &` 说的是实话**——harness 工具确实不能当普通 `AgentTool` 用。
+
+其他常见变体：
+
+```ts
+Omit<T, "a" | "b">                      // 减多个
+Partial<T> & Pick<T, "id">              // 除 id 外全可选
+Omit<T, keyof U> & U                    // 用 U 覆盖 T 的同名字段（浅合并）
+```
+
+### 和 Python 对照：**这条规则两边一样**
+
+容易误以为「Python 子类可以随便加东西」。要分开两件事：
+
+| | Python | TS |
+|---|---|---|
+| 子类**新增**一个方法 | ✅ 完全 OK | ✅ 完全 OK |
+| 子类**覆盖同名方法并加必需参数** | ❌ mypy 报错 | ❌ 编译报错 |
+
+mypy 实测，措辞几乎一样：
+
+```python
+class Base:
+    def execute(self, a: str, b: int) -> None: ...
+
+class Ext(Base):
+    def execute(self, a: str, b: int, c: dict) -> None: ...   # 覆盖，多一个必需参数
+    def extra(self) -> None: ...                              # 纯新增
+```
+
+```
+t.py:6: error: Signature of "execute" incompatible with supertype "Base"  [override]
+    Superclass:  def execute(self, a: str, b: int) -> None
+    Subclass:    def execute(self, a: str, b: int, c: dict[Any, Any]) -> None
+Found 1 error in 1 file
+```
+
+**`extra()` 一个字都没报**——纯新增方法没人管。**两边是同一条规则：里氏替换。**
+
+#### 运行时反而是 Python 更严
+
+```
+Python:  💥 TypeError: Ext.execute() missing 1 required positional argument: 'c'
+JS:      💥 TypeError: Cannot read properties of undefined (reading 'env')
+```
+
+| | 什么时候炸 | 报什么 |
+|---|---|---|
+| Python | **调用那一刻** | 直指病根 |
+| JS | **用到那个值**的时候 | 只有症状，得自己回溯 |
+
+**TS 这条类型检查某种意义上是在补 JS 运行时的短板。**
+
+那为什么平时在 Python 里感觉「可以」？——**因为默认没人跑 mypy**。
+`Ext` 单独用一切正常，只有「拿 `Ext` 冒充 `Base`」时才炸，而那个场景不一定出现。
+TS 这边不存在这个选择：**编译就是检查**。
+
+#### Python 里对应 `Omit &` 的写法
+
+没有 `Omit`，对应的做法是**放弃继承**——用 `Protocol`（结构化类型，不需要继承关系）：
+
+```python
+from typing import Protocol
+
+class HarnessTool(Protocol):
+    name: str
+    description: str
+    def execute(self, a: str, b: int, c: dict) -> None: ...
+```
+
+或者干脆两个类各写各的。**关键是不声称继承关系。**
+
+---
+
 ## 待补
 
 遇到再加：
 
 - 装饰器（`experimentalDecorators: true` 开着，但 `packages/*/src` 里一处未用——大概率是模板残留。注意装饰器**不可擦除**，真用了会和 `erasableSyntaxOnly` 冲突）
 - `const` 类型参数（`model-catalog.ts:23` 的 `<const TProvider>`，与第 20 条相关）
-- 变型（协变/逆变）在函数类型赋值上的表现（第 17 条"能少不能多"背后的规则，与第 23 条的 `void` 特例相关）
+- 变型（协变/逆变）的完整规则（第 24 条已覆盖参数个数与方法简写的双变特例，还差返回类型的协变、泛型位置的变型标注）

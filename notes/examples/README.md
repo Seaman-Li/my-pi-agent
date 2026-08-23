@@ -10,6 +10,7 @@
 | [static-factory.ts](static-factory.ts) | 静态工厂方法、`private constructor`、`static` 成员的空间归属 | ts-notes 第 13 条 |
 | [which-space.ts](which-space.ts) | **怎么判断自己在类型空间还是值空间**——同一个 `typeof` 四个位置两种行为 | ts-notes 第 1 条 |
 | [emit-backpressure.ts](emit-backpressure.ts) | `await emit()` 到底在等什么——生产者代码不变，三种 sink 三种节奏 | agent-loop 第 7 节 |
+| [liskov-arity.ts](liskov-arity.ts) | 里氏替换：`extends` 给方法加参数为什么不行——编译期拦截 + 运行时真的崩 | ts-notes 第 24 条 |
 
 ## 运行
 
