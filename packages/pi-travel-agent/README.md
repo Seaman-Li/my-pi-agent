@@ -29,14 +29,19 @@ dashscope 的 OpenAI 兼容差异不在 .env 里：那是协议事实，写死�
 | 1 | `node src/cli.ts --thinking "北京到成都坐高铁大概多久"` | 先出灰色 `[思考]` 段，再出正文 |
 | 1 | `node src/cli.ts --model nope "x"` | 报「未知模型」，退出码 1 |
 | 1 | `mv .env .env.bak && node src/cli.ts hi; mv .env.bak .env` | 报「缺少环境变量 TRAVEL_MODEL_ID」 |
+| 2a | `node src/cli.ts "成都和重庆明天天气怎么样，对比一下"` | 两次 `[tool] weather(...)`，末行 `2 step / end completed` |
 
 ## 目录
 
 ```
 src/
 ├── core/          通用层，不出现「旅行」字样，Agent 2 直接搬
-│   ├── types.ts   对外事件 AgentEvent / EventSink
-│   └── model.ts   ★ 唯一 import pi-ai 函数的文件
+│   ├── types.ts   Tool / ToolResult / AgentEvent / EventSink / TurnEndReason
+│   ├── model.ts   ★ 唯一 import pi-ai 函数的文件
+│   ├── registry.ts 工具注册表
+│   └── loop.ts    ★ agent loop（Step 2b 接上 hooks 后进入只读）
+├── tools/         旅行域
+│   └── weather.ts Step 2a 是假数据，3a 换真接口
 └── cli.ts         入口
 ```
 
@@ -44,8 +49,8 @@ src/
 自查（应无输出）：
 
 ```sh
-grep -rn "城市\|景点\|旅行\|trip\|amap" src/core
-grep -rn "streamSimple\|pi-ai/api" src --include=*.ts | grep -v "core/model.ts"
+grep -rn "城市\|景点\|旅行\|trip\|amap" src/core | grep -vE ':[0-9]+:\s*(\*|//|/\*)'   # 域污染（跳过注释）
+grep -rn '^import ' src | grep '@earendil-works/pi-ai' | grep -v 'import type'          # pi-ai 值导入
 find src -name '*.ts' -exec sh -c 'head -1 "$1" | grep -q "^/\*\*" || echo "缺文件头: $1"' _ {} \;
 find src -name '*.ts' -exec awk '/^(export )?(async )?function /{ if (prev !~ /\*\//) print FILENAME":"FNR": 缺注释 "$0 } { prev=$0 }' {} \;
 ```

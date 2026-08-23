@@ -1,23 +1,62 @@
 /**
- * core 层对外的事件词汇表:agent 内部发生的事,用什么形状告诉外面。
+ * core 层对外的词汇表:工具长什么样、agent 内部发生的事怎么告诉外面。
  *
  * 层:core —— 不认识 UI、不认识旅行、不认识任何具体实现。
  * 边界:只放「被两个以上文件用到」的类型。单个文件自己用的类型留在那个文件里。
  */
 
-import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
+import type { Tool as AiTool, AssistantMessageEvent, Static, TextContent, TSchema } from "@earendil-works/pi-ai";
+
+/**
+ * 工具返回的两半。这个二分从第一天就得分清:
+ *
+ * - `content` 进上下文,给模型看。要精简 —— 每个字都在花 token。
+ * - `details` 不进上下文,给 UI 和 HTML 报告用。经纬度、图片 URL、原始响应全放这。
+ */
+export interface ToolResult {
+	content: TextContent[];
+	details?: unknown;
+}
+
+/**
+ * 一个可执行的工具 = pi-ai 的 `Tool`(name/description/parameters)+ `execute`。
+ *
+ * 前三个字段会**原样进请求体**,所以 description 和 schema 里那些 `description`
+ * 文字是 prompt 的一部分,不是写给人看的注释 —— 模型认不认得出这个工具全看它们。
+ */
+export interface Tool<S extends TSchema = TSchema> extends AiTool<S> {
+	execute(toolCallId: string, params: Static<S>, signal?: AbortSignal): Promise<ToolResult>;
+}
+
+/**
+ * turn 为什么结束。**默认是停,继续才需要理由** —— 只有「模型要调工具而且这条消息是完整的」
+ * 才继续下一步,其余全部落进这五种之一。
+ *
+ * - `completed`  模型没再要工具,正常说完
+ * - `truncated`  这条回复被 maxTokens 截断了,里面的工具参数不可信
+ * - `aborted`    Ctrl-C 或上游取消
+ * - `error`      模型侧失败
+ * - `max_steps`  步数触顶,防死循环的闸
+ */
+export type TurnEndReason = "completed" | "truncated" | "aborted" | "error" | "max_steps";
 
 /**
  * 对外事件。UI 只认这一层。
  *
- * 单向广播:sink 拿到事件后不能改数据、不能拦截 —— 那是 Step 2 的 hook 干的事。
- * 这个区分就是 dsh 里 `emit`(观察)和 `waterfall`(可改可短路)的区分,
- * 现在只有 emit 这一半。
+ * 单向广播:sink 拿到事件后不能改数据、不能拦截 —— 那是 Step 2b 的 hook 干的事。
+ * 这个区分就是 dsh 里 `emit`(观察)和 `waterfall`(可改可短路)的区分,现在只有 emit 这一半。
  *
  * `assistant_event` 直接透传 pi-ai 的 14 种流式事件,不再包一层:
- * 包一层只会在 Step 2 之前反复改,等真有第二个事件源了再说。
+ * 包一层只会在需求稳定前反复改,等真有第二个模型事件源了再说。
  */
-export type AgentEvent = { type: "assistant_event"; event: AssistantMessageEvent } | { type: "error"; message: string };
+export type AgentEvent =
+	| { type: "turn_start" }
+	| { type: "step_start"; step: number }
+	| { type: "assistant_event"; event: AssistantMessageEvent }
+	| { type: "tool_start"; toolCallId: string; name: string; args: unknown }
+	| { type: "tool_end"; toolCallId: string; name: string; text: string; isError: boolean; ms: number }
+	| { type: "turn_end"; reason: TurnEndReason; steps: number }
+	| { type: "error"; message: string };
 
 /**
  * 返回类型是 `void | Promise<void>` 这个联合。三种写法都试过,只有联合是对的:

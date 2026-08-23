@@ -121,9 +121,9 @@ core/  session/              ← 什么都不知道
 **自查命令**(每个 Step 收尾跑一次,应该无输出):
 
 ```sh
-grep -rn "城市\|景点\|旅行\|trip\|amap" src/core src/session   # core 被污染了
+grep -rn "城市\|景点\|旅行\|trip\|amap" src/core src/session | grep -vE ':[0-9]+:\s*(\*|//|/\*)'  # 域污染(跳过注释)
 grep -rn "from \"\.\./features\|from \"\.\./tools" src/core     # 依赖倒挂
-grep -rn "streamSimple\|pi-ai/api" src/ --include=*.ts | grep -v "core/model.ts"  # 绕过 provider 边界
+grep -rn '^import ' src | grep '@earendil-works/pi-ai' | grep -v 'import type'  # 绕过 provider 边界
 find src -name '*.ts' -exec sh -c 'head -1 "$1" | grep -q "^/\*\*" || echo "缺文件头: $1"' _ {} \;
 find src -name '*.ts' -exec awk '/^(export )?(async )?function /{ if (prev !~ /\*\//) print FILENAME":"FNR": 缺注释 "$0 } { prev=$0 }' {} \;
 ```
@@ -192,7 +192,11 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
        └── v8-mcp         (Step 10)   MCP 对照实验(选做)
 ```
 
-叠加式:`v2` 从 `v1` merge 后的 main 开出来。
+分支名 `pi-travel-agent-s<N>`,一个 Step 一条,从上一条的末尾开出来。
+
+**推送**:一个 Step 的所有批都完成、验收全过之后推一次 origin
+(`git@github.com:Seaman-Li/my-pi-agent.git`,**永远不推 upstream**)。
+**每次推之前都要先问过我** —— 完成了不等于该推,推不推是我的决定。
 
 ### 怎么分批
 
