@@ -190,6 +190,84 @@ export const streamSimple: StreamFunction<"openai-completions", SimpleStreamOpti
 
 `clampThinkingLevel` 查 `model.thinkingLevelMap` 做映射。**agent 层只认识 pi 的抽象，所以必然用 `streamSimple`**；`stream` 留给"我明确知道在调 OpenAI"的调用方。六个协议族每家都有这一对。
 
+### `stream` 的执行骨架（`:200-613`）
+
+六跳的最后一跳落在这里。整个函数只有三行是"骨架"，其余全是块状态机：
+
+```
+stream(model, context, options)                                        :200
+│
+├─ const stream = new AssistantMessageEventStream()                    :205
+│
+├─ (async () => { ... })()        ← 注意没有 await，后台跑             :207
+│   │
+│   │ 【准备】还没碰网络
+│   ├─ output = { content: [], usage: 全 0, stopReason: "pending" }    :208
+│   ├─ getClientApiKey / getCompat / createClient
+│   ├─ params = buildParams(...)      messages+tools 转成 OpenAI 形状
+│   └─ await onPayload?.(params)      上层最后一次改请求体的机会
+│   │
+│   │ 【握手】
+│   ├─ retryProviderRequest(() => create(params).withResponse())       :246
+│   │      ↑ 拿到的是响应头 + 一个还没开始读的 body
+│   ├─ await onResponse?.({ status, headers })                         :254
+│   │      ↑ 限流头、请求 id 这类东西在这儿交给上层
+│   └─ push { start, partial: output }        output 此刻是空壳        :255
+│   │
+│   │ 【定义块状态机】纯闭包，不产生任何行为
+│   ├─ blocks = output.content            ← 别名，不是拷贝             :280
+│   ├─ finishBlock / ensureTextBlock / ensureThinkingBlock / ensureToolCallBlock
+│   │                                                            :304-436
+│   │ 【收流】token 从这里才开始到
+│   └─ for await (const chunk of openaiStream)                         :440
+│        ├─ chunk.usage       → output.usage（整体替换，不是累加）
+│        ├─ chunk.id / model  → responseId / responseModel（`||=` 只认第一个）
+│        ├─ finish_reason     → output.stopReason = mapStopReason(...)
+│        └─ choice.delta 靠「哪个字段非空」分流：
+│             ├─ .content            → ensureTextBlock()      首次补 text_start
+│             │                        text += delta;  push text_delta
+│             ├─ .reasoning_content  → ensureThinkingBlock()  首次补 thinking_start
+│             │   / .reasoning         thinking += delta;  push thinking_delta
+│             └─ .tool_calls         → ensureToolCallBlock()  首次补 toolcall_start
+│                                      partialArgs += ;  push toolcall_delta
+│   │
+│   │ 【收尾】
+│   ├─ for (block of blocks) finishBlock(block)   一次性补齐所有 *_end  :568
+│   ├─ 四道闸：signal.aborted / stopReason==="aborted" / 缺 finish_reason
+│   │          / stopReason==="error" / 还是 "pending"  → 任一命中就 throw
+│   ├─ push { done, reason, message: output }                          :588
+│   └─ stream.end()
+│
+└─ catch                                                               :590
+    ├─ 删掉 partialArgs / customInput / streamIndex（scratch 字段不许落库）
+    ├─ output.stopReason = signal.aborted ? "aborted" : "error"
+    ├─ push { error, error: output }                                   :608
+    └─ stream.end()
+
+return stream    ← 同步返回，此时上面那个 IIFE 一行都还没跑完            :613
+```
+
+三个容易看错的地方：
+
+**① `create()` 返回不等于「调完 LLM」。** `stream: true` 时 SDK 在**响应头到达**就 resolve，
+一个 token 都还没来；`openaiStream` 是个还在流的 async iterable。那一行是握完手，不是拿到答案。
+所以 `:246` 到 `:440` 之间那 190 行（`onResponse`、`push start`、130 行闭包定义）
+全部发生在"已经连上、还没收到内容"的窗口里。
+
+**② 205 / 207 / 613 三行决定了 `stream()` 永远不抛。** 建流、起一个不 await 的 IIFE、立刻返回。
+调用方拿到 stream 的那一刻请求可能才刚发出去。这就是
+`types.ts:320` 那句契约的实现方式——"Once invoked, request/model/runtime failures should be
+encoded in the returned stream, not thrown"，`:590` 的 catch 把一切异常翻译成一个 `error` 事件。
+
+**③ `push start` 时 `output` 是空壳，但它是全程唯一那只碗。**
+`content: []`、`usage` 全 0、`stopReason: "pending"`、`responseId` 还没有（要等第一个 chunk）；
+已填的只有 role / api / provider / model / timestamp。
+`:280` 的 `blocks = output.content` 是**别名**，后面所有事件的 `partial` 推的都是这同一个引用
+——详见下面[一碗饭的比方](#output--delta--partial--一碗饭的比方)。
+
+> 顺带解释了 `:590` catch 里那几个 `delete` 为什么必要：block 早就挂在 `output.content` 上了，
+> 出错时不把 scratch 字段清干净，它们会跟着 `error` 事件一路进 session。
+
 ### 13 个事件不是 LLM 的出参，是 pi 自己的协议
 
 `types.ts:509` 的注释叫它 **"Event protocol for AssistantMessageEventStream"**。定义 13 种（`types.ts:516`）。原始 SSE 长这样：
