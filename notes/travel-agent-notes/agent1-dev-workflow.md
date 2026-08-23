@@ -124,6 +124,7 @@ core/  session/              ← 什么都不知道
 grep -rn "城市\|景点\|旅行\|trip\|amap" src/core src/session   # core 被污染了
 grep -rn "from \"\.\./features\|from \"\.\./tools" src/core     # 依赖倒挂
 grep -rn "streamSimple\|pi-ai/api" src/ --include=*.ts | grep -v "core/model.ts"  # 绕过 provider 边界
+find src -name '*.ts' -exec sh -c 'head -1 "$1" | grep -q "^/\*\*" || echo "缺文件头: $1"' _ {} \;
 ```
 
 ### 两个关键文件的形状(现在只定接口,不写实现)
@@ -217,6 +218,40 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
 1. `git diff --stat` —— 超 500 行说明拆错了,停下来拆
 2. 跑**本 Step 的验收命令 + 之前所有 Step 的验收命令**(它们都只要几秒)—— 防回归,这就是测试
 3. `git commit -m "stepN(scope): ..."` —— 不 push
+
+### 文件头:每个文件第一行写职责
+
+每个 `.ts` 文件的**第一行**(import 之前)是一段固定四项的注释:
+
+```ts
+/**
+ * <一句话:这个文件负责什么>
+ *
+ * 层:core | session | features | tools | 入口
+ * 边界:<谁能 import 它 / 它不许碰什么 / 什么时候不许改>
+ */
+```
+
+为什么值得花这三行:
+
+- **层和边界写在文件里,而不是只写在文档里。** 文档会过期,而且改代码的时候没人翻文档;
+  文件头就在你要改的那一行的正上方。
+- **写不出「一句话职责」= 这个文件职责不止一个**,当场拆,别等它长到 400 行。
+- 三个月后回来,或者 Agent 2 要搬这个文件,第一眼就知道能不能搬。
+
+规矩:
+
+- **上限 8 行。** 超了说明在写实现细节 —— 那些属于函数上方的注释。
+- 「边界」那行要能被证伪。写「保持整洁」没用,写
+  「只有本文件能 import pi-ai 的函数」有用,因为它对应一条 grep。
+- 文件头描述的是**现在**,不是计划。`loop.ts` 写完那天加上「Step 2 之后只读」,
+  因为那时它才真的只读。
+
+自查(应无输出):
+
+```sh
+find src -name '*.ts' -exec sh -c 'head -1 "$1" | grep -q "^/\*\*" || echo "缺文件头: $1"' _ {} \;
+```
 
 ### 红线
 

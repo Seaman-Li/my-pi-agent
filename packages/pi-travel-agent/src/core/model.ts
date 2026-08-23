@@ -1,15 +1,16 @@
+/**
+ * provider 边界:模型配置、取 key、发起一次模型请求。
+ *
+ * 层:core —— **整个项目里唯一 import pi-ai 函数的文件**。
+ * 边界:其余代码(loop / tools / features / cli)只认本文件导出的 `stream()`;
+ *       换 provider、换模型、哪天想自己手写适配层,都只动这里。
+ *       类型不受此限 —— pi-ai 的类型可以在任何地方 import。
+ */
+
 import { execFileSync } from "node:child_process";
 import type { AssistantMessage, Context, Model, OpenAICompletionsCompat, ThinkingLevel } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import type { EventSink } from "./types.ts";
-
-/**
- * 整个项目里唯一 import pi-ai 函数的文件。
- *
- * 其余所有代码(loop / tools / features / cli)只认本文件导出的 `stream()`。
- * 换 provider、换模型、哪天想自己手写适配层,都只动这里。
- * 类型不受此限 —— pi-ai 的类型可以在任何地方 import。
- */
 
 export interface ModelSpec {
 	model: Model<"openai-completions">;

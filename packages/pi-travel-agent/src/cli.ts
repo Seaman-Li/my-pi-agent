@@ -1,3 +1,11 @@
+/**
+ * 入口:读配置、解析参数、装配依赖、把事件渲染到终端。
+ *
+ * 层:入口 —— 唯一允许「知道一切」的地方,也是唯一允许有 console/stdout 的地方。
+ * 边界:不放业务逻辑。这里长出来的判断,该去 core 或 features。
+ *       Step 2 之后装配那部分搬去 compose.ts,本文件只留 IO 和渲染。
+ */
+
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";

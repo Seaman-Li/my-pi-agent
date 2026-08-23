@@ -46,4 +46,8 @@ src/
 ```sh
 grep -rn "城市\|景点\|旅行\|trip\|amap" src/core
 grep -rn "streamSimple\|pi-ai/api" src --include=*.ts | grep -v "core/model.ts"
+find src -name '*.ts' -exec sh -c 'head -1 "$1" | grep -q "^/\*\*" || echo "缺文件头: $1"' _ {} \;
 ```
+
+每个文件第一行写职责（一句话 + 层 + 边界，上限 8 行）。
+写不出一句话职责，就是该拆的信号。

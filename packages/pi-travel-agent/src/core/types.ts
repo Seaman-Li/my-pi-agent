@@ -1,3 +1,10 @@
+/**
+ * core 层对外的事件词汇表:agent 内部发生的事,用什么形状告诉外面。
+ *
+ * 层:core —— 不认识 UI、不认识旅行、不认识任何具体实现。
+ * 边界:只放「被两个以上文件用到」的类型。单个文件自己用的类型留在那个文件里。
+ */
+
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 
 /**
