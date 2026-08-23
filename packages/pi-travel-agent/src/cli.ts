@@ -7,6 +7,18 @@ import type { AgentEvent, EventSink } from "./core/types.ts";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+/**
+ * 读 .env。Node 22 自带 `process.loadEnvFile`,不需要 dotenv。
+ * 没有 .env 也能跑 —— 那就走进程本身的环境变量(CI / 临时覆盖)。
+ */
+function loadEnv(): void {
+	try {
+		process.loadEnvFile(join(PACKAGE_ROOT, ".env"));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+}
+
 const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
 
@@ -81,6 +93,7 @@ function createRenderer(): EventSink {
 }
 
 async function main(): Promise<number> {
+	loadEnv();
 	const args = parseArgs(process.argv.slice(2));
 	if (!args.prompt) {
 		process.stderr.write('用法: node src/cli.ts [--model qwen] [--thinking] "你的问题"\n');

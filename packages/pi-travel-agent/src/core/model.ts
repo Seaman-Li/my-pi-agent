@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import type { AssistantMessage, Context, Model, ThinkingLevel } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context, Model, OpenAICompletionsCompat, ThinkingLevel } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import type { EventSink } from "./types.ts";
 
@@ -17,43 +17,72 @@ export interface ModelSpec {
 	apiKeySource: string;
 }
 
-const qwen: Model<"openai-completions"> = {
-	id: process.env.TRAVEL_MODEL_ID ?? "qwen3.7-plus",
-	name: "Qwen3.7 Plus",
-	api: "openai-completions",
-	provider: "dashscope",
-	baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-	reasoning: true,
-	input: ["text"],
-	contextWindow: 1_000_000,
-	maxTokens: 65_536,
-	// 阿里云按量计费,这里只影响 usage 里的 cost 估算,不影响调用。
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-	// OpenAI 兼容 ≠ 和 OpenAI 一样。pi 靠 baseUrl 自动嗅探这些差异,
-	// 但它不认识 dashscope,所以这里显式写死 —— 数值抄 pi 自己的 qwen 目录:
-	//   packages/ai/src/providers/data/qwen-token-plan.json
-	// developer 角色:dashscope 只认 system,不写这条会 400。
-	// thinkingFormat qwen:思考开关是顶层 enable_thinking,不是 reasoning_effort。
-	compat: {
-		thinkingFormat: "qwen",
-		supportsDeveloperRole: false,
-		supportsStore: false,
-		supportsReasoningEffort: false,
-	},
+/**
+ * dashscope 的 OpenAI 兼容差异。
+ *
+ * 这些留在代码里而不是 .env:它们是**协议事实**(dashscope 就长这样),
+ * 不是部署配置(换个人跑要改的东西)。把它写进 .env 等于让每个使用者
+ * 重新踩一遍 400。数值抄 pi 自己的 qwen 目录:
+ *   packages/ai/src/providers/data/qwen-token-plan.json
+ *
+ * developer 角色:pi 对 reasoning 模型默认发 `developer`,dashscope 只认 `system`。
+ * thinkingFormat qwen:思考开关是顶层 enable_thinking,不是 reasoning_effort。
+ */
+const DASHSCOPE_COMPAT: OpenAICompletionsCompat = {
+	thinkingFormat: "qwen",
+	supportsDeveloperRole: false,
+	supportsStore: false,
+	supportsReasoningEffort: false,
 };
 
-export const MODELS: Record<string, ModelSpec> = {
-	qwen: { model: qwen, apiKeySource: "!security find-generic-password -ws pi-dashscope" },
-};
+function requireEnv(name: string): string {
+	const value = process.env[name];
+	if (!value) throw new Error(`缺少环境变量 ${name}。把 .env.example 复制成 .env 再改`);
+	return value;
+}
+
+function envNumber(name: string): number {
+	const raw = requireEnv(name);
+	const value = Number(raw);
+	if (!Number.isFinite(value) || value <= 0) throw new Error(`环境变量 ${name} 不是正数:${raw}`);
+	return value;
+}
+
+/**
+ * 配置从环境读,而且是**调用时**读不是模块加载时读 ——
+ * 入口先 `loadEnvFile()` 再 `resolveModel()`,顺序才成立:
+ * 模块体在 import 的那一刻就执行完了,比入口的第一行还早。
+ */
+function qwenFromEnv(): ModelSpec {
+	return {
+		model: {
+			id: requireEnv("TRAVEL_MODEL_ID"),
+			name: requireEnv("TRAVEL_MODEL_ID"),
+			api: "openai-completions",
+			provider: "dashscope",
+			baseUrl: requireEnv("TRAVEL_BASE_URL"),
+			reasoning: true,
+			input: ["text"],
+			contextWindow: envNumber("TRAVEL_CONTEXT_WINDOW"),
+			maxTokens: envNumber("TRAVEL_MAX_TOKENS"),
+			// 阿里云按量计费,这里只影响 usage 里的 cost 估算,不影响调用。
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			compat: DASHSCOPE_COMPAT,
+		},
+		apiKeySource: requireEnv("TRAVEL_API_KEY_SOURCE"),
+	};
+}
+
+const PROVIDERS: Record<string, () => ModelSpec> = { qwen: qwenFromEnv };
 
 export const DEFAULT_MODEL = "qwen";
 
 export function resolveModel(name: string = DEFAULT_MODEL): ModelSpec {
-	const spec = MODELS[name];
-	if (!spec) {
-		throw new Error(`未知模型 "${name}"。可用:${Object.keys(MODELS).join(", ")}`);
+	const build = PROVIDERS[name];
+	if (!build) {
+		throw new Error(`未知模型 "${name}"。可用:${Object.keys(PROVIDERS).join(", ")}`);
 	}
-	return spec;
+	return build();
 }
 
 /** 取 key。返回值绝不进日志、不进上下文、不进事件流 —— Step 8 会把这条写成检查。 */
@@ -100,7 +129,8 @@ export async function stream(spec: ModelSpec, request: StreamRequest): Promise<A
 		reasoning: request.reasoning,
 	});
 	for await (const event of events) {
-		// await:sink 慢,上游就等 —— 背压是真的,不是摆设。
+		// await 保证按序交付、异步 sink 不浮空。它不是背压:
+		// 上游照读不误,事件堆在 EventStream 的队列里。理由见 types.ts。
 		await request.sink?.({ type: "assistant_event", event });
 	}
 	return events.result();

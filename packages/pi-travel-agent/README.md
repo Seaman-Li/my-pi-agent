@@ -15,8 +15,9 @@ node src/cli.ts "成都三天怎么玩"
 零构建：Node 22.18+ 直接跑 `.ts`。`@earendil-works/pi-ai` 走 workspace 里的
 `packages/ai`，不需要额外 `npm install`。
 
-模型：dashscope `qwen3.7-plus`。key 取自 keychain
-（`security find-generic-password -ws pi-dashscope`），换模型 id 用 `TRAVEL_MODEL_ID`。
+配置在 `.env`（`cp .env.example .env`，不进 git）：模型 id、baseUrl、上下文窗口、
+以及**取 key 的方式**（`!<cmd>` 执行命令 / `env:<NAME>` 读环境变量）——存的是取法，不是 key 本身。
+dashscope 的 OpenAI 兼容差异不在 .env 里：那是协议事实，写死在 `src/core/model.ts`。
 
 ## 验收表
 
@@ -27,6 +28,7 @@ node src/cli.ts "成都三天怎么玩"
 | 1 | `node src/cli.ts "你好，用一句话介绍你自己"` | 逐字输出回复，末行打印 in/out token 和 stopReason |
 | 1 | `node src/cli.ts --thinking "北京到成都坐高铁大概多久"` | 先出灰色 `[思考]` 段，再出正文 |
 | 1 | `node src/cli.ts --model nope "x"` | 报「未知模型」，退出码 1 |
+| 1 | `mv .env .env.bak && node src/cli.ts hi; mv .env.bak .env` | 报「缺少环境变量 TRAVEL_MODEL_ID」 |
 
 ## 目录
 
