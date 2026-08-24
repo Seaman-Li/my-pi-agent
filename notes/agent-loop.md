@@ -341,6 +341,64 @@ const ordered = await Promise.all(          // :540  此刻才并发
 
 **准备阶段串行、执行阶段并行。** 因为 `beforeToolCall` 是权限确认——不可能同时弹三个确认框。而 `Promise.all` 保序，所以 `toolResults` 的顺序永远等于模型发出调用的顺序，与谁先执行完无关。
 
+### 我自己那版的一次完整 trace（pi-travel-agent，Step 2b）
+
+四个挂载点全挂上 trace 之后跑一次，整个 turn 的骨架就直接摊在终端上了。
+这段是 Step 2b 当时的输出，`weather` 还是假数据（真接口是 3a 才换的）：
+
+```
+$ node src/cli.ts --trace "成都和重庆明天天气怎么样，对比一下"
+
+[trace] beforeStep  #1  messages=1
+[tool] weather({"city":"成都","days":1})
+[trace] beforeToolCall  #1  weather {"city":"成都","days":1}
+[trace] afterToolCall   #1  weather ok [假数据] 成都未来1天:第1天 多云 14~22°C
+  → [假数据] 成都未来1天:第1天 多云 14~22°C (5ms)
+[tool] weather({"city":"重庆","days":1})
+[trace] beforeToolCall  #1  weather {"city":"重庆","days":1}
+[trace] afterToolCall   #1  weather ok [假数据] 重庆未来1天:第1天 阴 13~20°C
+  → [假数据] 重庆未来1天:第1天 阴 13~20°C (1ms)
+[trace] afterStep   #1  stop=toolUse content=[toolCall,toolCall] out=75 tools=2
+[trace] beforeStep  #2  messages=4
+**成都明天：** 多云，14~22°C
+**重庆明天：** 阴，13~20°C
+（对比略）
+[trace] afterStep   #2  stop=stop content=[text] out=73 tools=0
+[qwen3.7-plus] 2 step / in 942 / out 148 / end completed
+```
+
+**四条 trace 行对应 `loop.ts` 的四个调用点**：`:193` / `:122` / `:157` / `:200`。
+`[tool]` 和 `→` 那两行不是 hook，是 `EventSink` 的 `tool_start` / `tool_end`
+（走 stdout），trace 走 stderr。
+
+从这十几行能直接读出四件事：
+
+**① step 的粒度是「一次模型请求 + 它要的工具」，不是「一次工具调用」。**
+两次 `beforeToolCall` 都打 `#1` —— 同一步里的两次调用。
+
+**② `content=[toolCall,toolCall]` 说明模型一次回复就要了两个工具。**
+两个城市的天气互不依赖，所以能批量。换成有依赖的问法
+（「先查成都，如果是多云再查重庆」），同样两个城市会变成 **3 个 step**，
+每步一个 toolCall —— 第二次调用的参数取决于第一次的结果，模型没法提前发。
+**没有一行代码决定顺序，是模型看依赖关系自己排的**，这就是单 agent + 多 tool
+和固定编排的分界。
+
+**③ `messages=1 → 4`。** 一个 step 往上下文里加了 3 条：
+1 条 assistant（带两个 toolCall）+ 2 条 toolResult。
+
+**④ 末行的 `in 942` 是两个 step 的 input 之和，按计费算对，
+但它不等于「上下文有多大」** —— system prompt 和 tool schema 被重复计了两次。
+真正的上下文大小是最后一次请求的 input。压缩判定要用后者。
+
+> **订正**：这段 trace 最初打出来时，`afterStep #1` 出现在两个 `[tool]` **之前**。
+> 那是挂载点位置写错了 —— 文件头写着「step = 一次模型请求 + 它要的工具」，
+> 而 `runAfterStep` 却调在工具执行之前，等于在 step 中间触发。
+> 对它的认领者（Step 7 压缩判定）是实质问题：工具输出往往是上下文里最大的一块，
+> 在工具执行前判定等于每次都少看了这一步最重的部分。
+> 已挪到循环体末尾，并给 `AfterStepContext` 加了 `results`；
+> turn 结束那条路径也补了一次调用，保证**每个 step 恰好触发一次**。
+> —— 是这段 trace 本身把这个 bug 显出来的，这也是 trace 值得第一个做的理由。
+
 ### 拦截：`kind: "immediate"` 与我自己那版的 `ToolCallOverride`
 
 上面三段式里 `prepareToolCall` 的 `kind: "immediate"` 是**拦截出口**——三种情况共用它，

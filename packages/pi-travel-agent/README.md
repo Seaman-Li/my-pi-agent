@@ -32,6 +32,8 @@ dashscope 的 OpenAI 兼容差异不在 .env 里：那是协议事实，写死�
 | 2a | `node src/cli.ts "成都和重庆明天天气怎么样，对比一下"` | 两次 `[tool] weather(...)`，末行 `2 step / end completed` |
 | 2b | `node src/cli.ts --trace "成都明天天气怎么样"` | stderr 出现 `beforeStep`/`beforeToolCall`/`afterToolCall`/`afterStep` 四种 hook 行 |
 | 2b | `node src/cli.ts "成都明天天气怎么样"` | 不带 `--trace` 时输出和 2a 一致，没有 hook 行 |
+| 3a | `node src/cli.ts "成都有哪些值得去的历史景点，明天天气怎么样"` | 真数据：POI 带评分/地址，天气带日期，`[假数据]` 前缀消失 |
+| 3a | `node --input-type=module -e 'process.loadEnvFile("./.env"); import { fetchForecast } from "./src/tools/amap.ts"; try { await fetchForecast("火星") } catch (e) { console.log(e.message) }'` | 报「查不到城市」，**消息里没有 key** |
 
 ## 目录
 
@@ -46,7 +48,10 @@ src/
 ├── features/      一个文件 = 一块积木，只通过 hooks 挂进去
 │   └── trace.ts   --trace，Step 9 扩成完整版
 ├── tools/         旅行域
-│   └── weather.ts Step 2a 是假数据，3a 换真接口
+│   ├── amap.ts    高德 REST 客户端（不是 tool）★ key 只在这里出现
+│   ├── truncate.ts 双限制截断，永不返回半行
+│   ├── weather.ts
+│   └── search-poi.ts
 ├── compose.ts     ★ 唯一装配处，加一块积木 = 加一行
 └── cli.ts         入口
 ```
@@ -57,6 +62,7 @@ src/
 ```sh
 grep -rn "城市\|景点\|旅行\|trip\|amap" src/core | grep -vE ':[0-9]+:\s*(\*|//|/\*)'   # 域污染（跳过注释）
 grep -rn '^import ' src | grep '@earendil-works/pi-ai' | grep -v 'import type'          # pi-ai 值导入
+grep -rn 'AMAP_KEY\|restapi.amap.com' src | grep -v 'tools/amap.ts'                     # key 和 URL 只许待在 amap.ts
 find src -name '*.ts' -exec sh -c 'head -1 "$1" | grep -q "^/\*\*" || echo "缺文件头: $1"' _ {} \;
 find src -name '*.ts' -exec awk '/^(export )?(async )?function /{ if (prev !~ /\*\//) print FILENAME":"FNR": 缺注释 "$0 } { prev=$0 }' {} \;
 ```
