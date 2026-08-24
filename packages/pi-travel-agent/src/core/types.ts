@@ -1,11 +1,18 @@
 /**
- * core 层对外的词汇表:工具长什么样、agent 内部发生的事怎么告诉外面。
+ * core 层对外的词汇表:工具长什么样、agent 内部发生的事怎么告诉外面,以及一个读它的小工具。
  *
  * 层:core —— 不认识 UI、不认识旅行、不认识任何具体实现。
  * 边界:只放「被两个以上文件用到」的类型。单个文件自己用的类型留在那个文件里。
  */
 
-import type { Tool as AiTool, AssistantMessageEvent, Static, TextContent, TSchema } from "@earendil-works/pi-ai";
+import type {
+	Tool as AiTool,
+	AssistantMessageEvent,
+	ImageContent,
+	Static,
+	TextContent,
+	TSchema,
+} from "@earendil-works/pi-ai";
 
 /**
  * 工具返回的两半。这个二分从第一天就得分清:
@@ -26,6 +33,20 @@ export interface ToolResult {
  */
 export interface Tool<S extends TSchema = TSchema> extends AiTool<S> {
 	execute(toolCallId: string, params: Static<S>, signal?: AbortSignal): Promise<ToolResult>;
+}
+
+/**
+ * 把一条工具结果里的文本拼起来。
+ *
+ * 我们的工具只产出 `TextContent`,但 pi-ai 的 `ToolResultMessage.content` 是
+ * `(TextContent | ImageContent)[]` —— 宽出来的那一半现在用不到,以后(截图类工具)会用到。
+ * 所以这里按 type 收窄而不是断言:将来真出现图片时,它是被跳过,不是崩掉。
+ */
+export function textOf(content: (TextContent | ImageContent)[]): string {
+	return content
+		.filter((block): block is TextContent => block.type === "text")
+		.map((block) => block.text)
+		.join("");
 }
 
 /**

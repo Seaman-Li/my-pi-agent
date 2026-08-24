@@ -341,6 +341,56 @@ const ordered = await Promise.all(          // :540  此刻才并发
 
 **准备阶段串行、执行阶段并行。** 因为 `beforeToolCall` 是权限确认——不可能同时弹三个确认框。而 `Promise.all` 保序，所以 `toolResults` 的顺序永远等于模型发出调用的顺序，与谁先执行完无关。
 
+### 拦截：`kind: "immediate"` 与我自己那版的 `ToolCallOverride`
+
+上面三段式里 `prepareToolCall` 的 `kind: "immediate"` 是**拦截出口**——三种情况共用它，
+都是"直接成结果，不执行"：
+
+1. 工具没找到（模型编了个不存在的名字）
+2. schema 校验失败
+3. `beforeToolCall` 主动拦下
+
+我在 pi-travel-agent 里写的是同一个形状的最小版（`src/core/hooks.ts` + `loop.ts:121`）：
+
+```ts
+export interface ToolCallOverride {
+	result: ToolResult;    // content(给模型看) + details
+	isError?: boolean;
+}
+
+// loop 里
+const override = await runBeforeToolCall(hooks, { step, toolCall });
+if (override) { /* 用它当结果，工具不执行 */ }
+else if (!tool) { /* 没有名为 X 的工具 */ }
+else { /* tool.execute(...) */ }
+```
+
+三处值得记：
+
+**① 为什么包一层而不是直接返回结果。** 拦截有两种语义，`isError` 区分：
+guard 拒绝要 `true`（模型得知道自己被挡了，才可能换参数重试或如实告诉用户），
+缓存命中要 `false`（它就是个正常结果）。只返回 `ToolResult` 表达不了这个差别。
+
+**② 被拦的调用仍然必须产出一条 `toolResult`。** 这不是设计选择，是协议要求——
+assistant 消息里每个 `tool_call` 的 id，下一次请求必须有配对的 tool 消息，少一条整个请求不合法。
+所以拦截**不能是"跳过"**，只能是"换个结果"。`ToolCallOverride` 这个类型的存在就是逼你面对这件事。
+
+**③ 短路：第一个返回值的赢，后面的 handler 不再跑。**
+拦截是单点决策，两个 handler 同时说"我来给结果"没有合理的合并方式；
+只观察不拦截的 handler 什么都别返回。这正是 dsh 里 waterfall
+"调 `next()` 是委派、不调是短路"的最小版本。
+
+实测（临时挂一个"重庆不许查"的拦截器）：
+
+```
+toolResult(isError=false): [假数据] 成都未来1天:第1天 多云 14~22°C
+toolResult(isError=true):  拒绝:重庆不在服务范围内
+assistant: 成都明天多云 14~22°C。不过很抱歉，重庆不在我的服务范围内…
+```
+
+工具没跑，模型收到拒绝，自己把这件事解释给用户听了。
+Step 8b 的路径限制、域名白名单、调用预算，全是这个形状。
+
 ---
 
 ## 三、四条终止路径

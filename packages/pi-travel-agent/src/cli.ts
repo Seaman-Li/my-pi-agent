@@ -2,19 +2,17 @@
  * 入口:读配置、解析参数、装配依赖、把事件渲染到终端。
  *
  * 层:入口 —— 唯一允许「知道一切」的地方,也是唯一允许有 console/stdout 的地方。
- * 边界:不放业务逻辑。这里长出来的判断,该去 core 或 features。
- *       Step 2 之后装配那部分搬去 compose.ts,本文件只留 IO 和渲染。
+ * 边界:不放业务逻辑,也不放装配 —— 装配在 compose.ts。这里只剩参数、IO、渲染。
  */
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Context } from "@earendil-works/pi-ai";
+import { compose } from "./compose.ts";
 import { runTurn } from "./core/loop.ts";
 import { DEFAULT_MODEL, resolveApiKey, resolveModel } from "./core/model.ts";
-import { Registry } from "./core/registry.ts";
 import type { AgentEvent, EventSink } from "./core/types.ts";
-import { weather } from "./tools/weather.ts";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -37,6 +35,7 @@ interface Args {
 	prompt: string;
 	model: string;
 	thinking: boolean;
+	trace: boolean;
 }
 
 /**
@@ -49,17 +48,20 @@ function parseArgs(argv: string[]): Args {
 	const rest: string[] = [];
 	let model = DEFAULT_MODEL;
 	let thinking = false;
+	let trace = false;
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i]!;
 		if (arg === "--model") {
 			model = argv[++i] ?? model;
 		} else if (arg === "--thinking") {
 			thinking = true;
+		} else if (arg === "--trace") {
+			trace = true;
 		} else {
 			rest.push(arg);
 		}
 	}
-	return { prompt: rest.join(" "), model, thinking };
+	return { prompt: rest.join(" "), model, thinking, trace };
 }
 
 /**
@@ -144,7 +146,7 @@ async function main(): Promise<number> {
 	loadEnv();
 	const args = parseArgs(process.argv.slice(2));
 	if (!args.prompt) {
-		process.stderr.write('用法: node src/cli.ts [--model qwen] [--thinking] "你的问题"\n');
+		process.stderr.write('用法: node src/cli.ts [--model qwen] [--thinking] [--trace] "你的问题"\n');
 		return 2;
 	}
 
@@ -157,9 +159,7 @@ async function main(): Promise<number> {
 		messages: [{ role: "user", content: args.prompt, timestamp: Date.now() }],
 	};
 
-	// 装配。Step 2b 之后这几行搬去 compose.ts,本文件只留 IO 和渲染。
-	const tools = new Registry();
-	tools.register(weather);
+	const { tools, hooks } = compose({ trace: args.trace });
 
 	// Ctrl-C 不是杀进程,是把 signal 传下去让请求和工具自己收尾。
 	const controller = new AbortController();
@@ -170,6 +170,7 @@ async function main(): Promise<number> {
 		apiKey,
 		context,
 		tools,
+		hooks,
 		signal: controller.signal,
 		sink: createRenderer(),
 		reasoning: args.thinking ? "low" : undefined,

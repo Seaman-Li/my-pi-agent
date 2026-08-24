@@ -14,6 +14,18 @@ Step 2a 实测:想让模型故意用非法参数调工具触发 `execute` 抛错
 它们都需要「不依赖模型配合」的手段。Step 9 的 `--replay` 正好提供这个:
 喂一段固定的 assistant 消息进 loop,不发真请求。到那一步一起补。
 
+## `beforeStep` 需要能拒绝 —— Step 8a
+
+Step 8a 的域外拦截要做的是「用户问 transformer → 直接拒答,不发请求」,该挂 `beforeStep`。
+但现在 `runBeforeStep` 返回 `void`,handler 只能改 `context`,**没法说「这步别发了」**。
+
+到 8a 时给它加返回值(参考 dsh 的 `agent/pre-step`:waterfall,可以 reject 掉整个 step)。
+返回值具体长什么样等真做的时候再定 —— 现在提前加是猜。
+
+**这是一次计划内的 `loop.ts` 修改。** 「loop 只读」的准确含义是:
+改 loop 的唯一合法理由是**增加挂载点**;为了加功能而改 loop 不合法。
+这条属于前者,记在这里免得到时候当成意外。
+
 ## 参数校验 —— Step 3b
 
 `loop.ts` 的 `executeToolCalls` 里,`toolCall.arguments` 目前未经校验直接透传给 `execute`。

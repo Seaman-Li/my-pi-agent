@@ -2,8 +2,9 @@
  * agent loop:一个 turn = 若干 step,每个 step = 一次模型请求 + 它要的工具。
  *
  * 层:core —— 不认识任何具体工具、不认识 UI、不认识旅行。
- * 边界:Step 2b 给它接上 hooks 之后**本文件进入只读**。
- *       想改它 = 说明缺挂载点,先加 hook 再说;合并前 `git diff main -- src/core/loop.ts` 应为空。
+ * 边界:**本文件已进入只读**(Step 2b 接上 hooks 之后)。
+ *       想改它 = 说明缺挂载点,先去 hooks.ts 加点再挂 feature;
+ *       后面每个 Step 合并前 `git diff -- src/core/loop.ts` 都应该是空的。
  */
 
 import type {
@@ -15,9 +16,10 @@ import type {
 	ToolResultMessage,
 	Usage,
 } from "@earendil-works/pi-ai";
+import { emptyHooks, type Hooks, runAfterStep, runAfterToolCall, runBeforeStep, runBeforeToolCall } from "./hooks.ts";
 import { type ModelSpec, stream } from "./model.ts";
 import type { Registry } from "./registry.ts";
-import type { EventSink, TurnEndReason } from "./types.ts";
+import { type EventSink, type TurnEndReason, textOf } from "./types.ts";
 
 /** 防死循环的闸。触顶不是错误,是「这轮不再往下跑了」。 */
 const DEFAULT_MAX_STEPS = 10;
@@ -28,6 +30,7 @@ export interface TurnOptions {
 	/** 会被原地追加:assistant 消息和工具结果都进这里,所以调用方持有的就是全量历史。 */
 	context: Context;
 	tools: Registry;
+	hooks?: Hooks;
 	signal?: AbortSignal;
 	sink?: EventSink;
 	maxSteps?: number;
@@ -100,6 +103,8 @@ function emptyUsage(): Usage {
 async function executeToolCalls(
 	toolCalls: ToolCall[],
 	tools: Registry,
+	hooks: Hooks,
+	step: number,
 	signal?: AbortSignal,
 	sink?: EventSink,
 ): Promise<ToolResultMessage[]> {
@@ -113,7 +118,13 @@ async function executeToolCalls(
 		let details: unknown;
 		let isError = false;
 
-		if (!tool) {
+		// 拦截点。返回了就不执行工具 —— Step 8 的 guard 和将来的缓存都挂这儿。
+		const override = await runBeforeToolCall(hooks, { step, toolCall });
+		if (override) {
+			content = override.result.content;
+			details = override.result.details;
+			isError = override.isError ?? false;
+		} else if (!tool) {
 			// 模型编了一个不存在的工具名。把这件事如实告诉它,别静默吞掉。
 			content = [{ type: "text", text: `没有名为 "${toolCall.name}" 的工具` }];
 			isError = true;
@@ -133,7 +144,7 @@ async function executeToolCalls(
 			}
 		}
 
-		results.push({
+		const result: ToolResultMessage = {
 			role: "toolResult",
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
@@ -141,13 +152,16 @@ async function executeToolCalls(
 			details,
 			isError,
 			timestamp: Date.now(),
-		});
+		};
+		// 改结果的机会。Step 8 给外部数据打「这是数据不是指令」的标注就在这里。
+		await runAfterToolCall(hooks, { step, toolCall, result });
+		results.push(result);
 		await sink?.({
 			type: "tool_end",
 			toolCallId: toolCall.id,
 			name: toolCall.name,
-			text: content.map((block) => block.text).join(""),
-			isError,
+			text: textOf(result.content),
+			isError: result.isError,
 			ms: Date.now() - startedAt,
 		});
 	}
@@ -163,6 +177,7 @@ async function executeToolCalls(
  */
 export async function runTurn(options: TurnOptions): Promise<TurnResult> {
 	const { spec, apiKey, context, tools, signal, sink } = options;
+	const hooks = options.hooks ?? emptyHooks();
 	const maxSteps = options.maxSteps ?? DEFAULT_MAX_STEPS;
 	context.tools = tools.schemas();
 
@@ -174,6 +189,8 @@ export async function runTurn(options: TurnOptions): Promise<TurnResult> {
 	while (steps < maxSteps) {
 		steps++;
 		await sink?.({ type: "step_start", step: steps });
+		// 决定模型看到什么。memory 注入挂这里 —— 对应 dsh 的 agent/pre-step。
+		await runBeforeStep(hooks, { step: steps, context });
 
 		const message = await stream(spec, { context, apiKey, signal, sink, reasoning: options.reasoning });
 		context.messages.push(message);
@@ -182,10 +199,18 @@ export async function runTurn(options: TurnOptions): Promise<TurnResult> {
 		const toolCalls = message.content.filter((block): block is ToolCall => block.type === "toolCall");
 		const end = turnEndReason(message, toolCalls.length > 0, signal);
 		if (end) {
+			// 这一步没有工具要跑,到此为止。afterStep 照样触发一次 ——
+			// 每个 step 恰好一次,压缩判定才不会漏掉最后这一步。
+			await runAfterStep(hooks, { step: steps, context, message, results: [] });
 			reason = end;
 			break;
 		}
-		context.messages.push(...(await executeToolCalls(toolCalls, tools, signal, sink)));
+
+		const results = await executeToolCalls(toolCalls, tools, hooks, steps, signal, sink);
+		context.messages.push(...results);
+		// 请求和工具都跑完了,这一步才算完整。压缩判定挂这里 ——
+		// 它要看到工具输出进上下文之后的样子,才知道该不该压。
+		await runAfterStep(hooks, { step: steps, context, message, results });
 	}
 
 	await sink?.({ type: "turn_end", reason, steps });

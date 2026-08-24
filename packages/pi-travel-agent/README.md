@@ -30,18 +30,24 @@ dashscope 的 OpenAI 兼容差异不在 .env 里：那是协议事实，写死�
 | 1 | `node src/cli.ts --model nope "x"` | 报「未知模型」，退出码 1 |
 | 1 | `mv .env .env.bak && node src/cli.ts hi; mv .env.bak .env` | 报「缺少环境变量 TRAVEL_MODEL_ID」 |
 | 2a | `node src/cli.ts "成都和重庆明天天气怎么样，对比一下"` | 两次 `[tool] weather(...)`，末行 `2 step / end completed` |
+| 2b | `node src/cli.ts --trace "成都明天天气怎么样"` | stderr 出现 `beforeStep`/`beforeToolCall`/`afterToolCall`/`afterStep` 四种 hook 行 |
+| 2b | `node src/cli.ts "成都明天天气怎么样"` | 不带 `--trace` 时输出和 2a 一致，没有 hook 行 |
 
 ## 目录
 
 ```
 src/
 ├── core/          通用层，不出现「旅行」字样，Agent 2 直接搬
-│   ├── types.ts   Tool / ToolResult / AgentEvent / EventSink / TurnEndReason
+│   ├── types.ts   Tool / ToolResult / AgentEvent / EventSink / TurnEndReason / textOf
 │   ├── model.ts   ★ 唯一 import pi-ai 函数的文件
 │   ├── registry.ts 工具注册表
-│   └── loop.ts    ★ agent loop（Step 2b 接上 hooks 后进入只读）
+│   ├── hooks.ts   四个挂载点 + 串接规则
+│   └── loop.ts    ★ agent loop —— 只读，想改它说明缺 hook
+├── features/      一个文件 = 一块积木，只通过 hooks 挂进去
+│   └── trace.ts   --trace，Step 9 扩成完整版
 ├── tools/         旅行域
 │   └── weather.ts Step 2a 是假数据，3a 换真接口
+├── compose.ts     ★ 唯一装配处，加一块积木 = 加一行
 └── cli.ts         入口
 ```
 
