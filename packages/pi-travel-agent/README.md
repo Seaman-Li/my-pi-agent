@@ -34,6 +34,8 @@ dashscope 的 OpenAI 兼容差异不在 .env 里：那是协议事实，写死�
 | 2b | `node src/cli.ts "成都明天天气怎么样"` | 不带 `--trace` 时输出和 2a 一致，没有 hook 行 |
 | 3a | `node src/cli.ts "成都有哪些值得去的历史景点，明天天气怎么样"` | 真数据：POI 带评分/地址，天气带日期，`[假数据]` 前缀消失 |
 | 3a | `node --input-type=module -e 'process.loadEnvFile("./.env"); import { fetchForecast } from "./src/tools/amap.ts"; try { await fetchForecast("火星") } catch (e) { console.log(e.message) }'` | 报「查不到城市」，**消息里没有 key** |
+| 3b-1 | `node src/cli.ts "帮我规划成都2天行程，预算3000，喜欢历史文化，住武侯区附近"` | 四个工具协同出行程 + 预算，`end completed` |
+| 3b-1 | `node --input-type=module -e 'process.loadEnvFile("./.env"); import { validateArguments } from "./src/core/validate.ts"; import { weather } from "./src/tools/weather.ts"; console.log(JSON.stringify(validateArguments(weather, { city: "成都", days: "3" })))'` | 输出 `{"city":"成都","days":3}` —— 字符串数字被 Convert 救回 |
 
 ## 目录
 
@@ -44,6 +46,7 @@ src/
 │   ├── model.ts   ★ 唯一 import pi-ai 函数的文件
 │   ├── registry.ts 工具注册表
 │   ├── hooks.ts   四个挂载点 + 串接规则
+│   ├── validate.ts 参数 Convert → Check
 │   └── loop.ts    ★ agent loop —— 只读，想改它说明缺 hook
 ├── features/      一个文件 = 一块积木，只通过 hooks 挂进去
 │   └── trace.ts   --trace，Step 9 扩成完整版
@@ -51,7 +54,9 @@ src/
 │   ├── amap.ts    高德 REST 客户端（不是 tool）★ key 只在这里出现
 │   ├── truncate.ts 双限制截断，永不返回半行
 │   ├── weather.ts
-│   └── search-poi.ts
+│   ├── search-poi.ts
+│   ├── search-hotel.ts
+│   └── estimate-budget.ts  唯一不联网的工具
 ├── compose.ts     ★ 唯一装配处，加一块积木 = 加一行
 └── cli.ts         入口
 ```

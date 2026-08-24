@@ -20,9 +20,16 @@ import { emptyHooks, type Hooks, runAfterStep, runAfterToolCall, runBeforeStep, 
 import { type ModelSpec, stream } from "./model.ts";
 import type { Registry } from "./registry.ts";
 import { type EventSink, type TurnEndReason, textOf } from "./types.ts";
+import { validateArguments } from "./validate.ts";
 
-/** 防死循环的闸。触顶不是错误,是「这轮不再往下跑了」。 */
-const DEFAULT_MAX_STEPS = 10;
+/**
+ * 防死循环的闸。触顶不是错误,是「这轮不再往下跑了」。
+ *
+ * 20 是实测调的:一次「规划两天行程 + 预算」用掉了 10 步(搜景点、查天气、找酒店、算预算,
+ * 模型多半一步只调一个工具)。原来定 10,正好卡在边缘 —— 触顶产出的是半截行程,
+ * 比多花几次请求糟得多。真正管成本的闸是 Step 8b 的调用预算,不是这个。
+ */
+const DEFAULT_MAX_STEPS = 20;
 
 export interface TurnOptions {
 	spec: ModelSpec;
@@ -93,12 +100,27 @@ function emptyUsage(): Usage {
 	};
 }
 
+/** 一次工具调用跑完之后的三样东西。执行成功和被拦截产出的是同一个形状。 */
+interface ToolOutcome {
+	content: TextContent[];
+	details?: unknown;
+	isError: boolean;
+}
+
 /**
- * 顺序执行一批工具调用,把每个结果包成一条 `toolResult` 消息。
+ * 执行一批工具调用:**准备阶段串行,执行阶段并行。**
  *
- * 串行是 Step 2a 的临时选择,Step 3b 换成并行。
- * 这里**不判断成功失败就中断** —— 一批里某个工具炸了,其余照跑,
- * 因为模型下一步需要看到完整的一批结果才能决定怎么办。
+ * 为什么这么分(和 pi 的 `executeToolCalls` 一致):
+ * - 准备阶段要跑 `beforeToolCall`,那是拦截和将来的权限确认 ——
+ *   不可能同时弹三个确认框,必须串行、有确定顺序。
+ * - 执行阶段是纯 IO,并行才有意义。两个高德请求各花 1.5 秒,串行 3 秒并行 1.5 秒。
+ *
+ * `Promise.all` **保序**,所以返回的 toolResult 顺序永远等于模型发出调用的顺序,
+ * 和谁先跑完无关 —— 这点很重要,协议要求 toolResult 和 toolCall 一一对应。
+ * 但 `tool_end` 事件是谁先完谁先发,终端上看到的完成顺序可能和列表顺序不同。
+ *
+ * 这里**不因为某个工具失败就中断**:一批里某个炸了其余照跑,
+ * 模型下一步需要看到完整的一批结果才能决定怎么办。
  */
 async function executeToolCalls(
 	toolCalls: ToolCall[],
@@ -108,54 +130,19 @@ async function executeToolCalls(
 	signal?: AbortSignal,
 	sink?: EventSink,
 ): Promise<ToolResultMessage[]> {
-	const results: ToolResultMessage[] = [];
-	for (const toolCall of toolCalls) {
-		const startedAt = Date.now();
-		await sink?.({ type: "tool_start", toolCallId: toolCall.id, name: toolCall.name, args: toolCall.arguments });
-
-		const tool = tools.get(toolCall.name);
-		let content: TextContent[] = [];
-		let details: unknown;
-		let isError = false;
-
-		// 拦截点。返回了就不执行工具 —— Step 8 的 guard 和将来的缓存都挂这儿。
-		const override = await runBeforeToolCall(hooks, { step, toolCall });
-		if (override) {
-			content = override.result.content;
-			details = override.result.details;
-			isError = override.isError ?? false;
-		} else if (!tool) {
-			// 模型编了一个不存在的工具名。把这件事如实告诉它,别静默吞掉。
-			content = [{ type: "text", text: `没有名为 "${toolCall.name}" 的工具` }];
-			isError = true;
-		} else {
-			try {
-				// Step 3b 会在这里插入 Value.Convert → Check。
-				// 现在参数未经校验直接透传 —— 假数据工具扛得住,真工具不行。
-				const result = await tool.execute(toolCall.id, toolCall.arguments as never, signal);
-				content = result.content;
-				details = result.details;
-			} catch (error) {
-				// 工具的 execute 里不写 try/catch(pi 的约定),抛出来在这儿统一包成错误结果
-				// 回灌给模型 —— 它看到「城市名不对」这类错误往往能自己改参数重试,
-				// 比整个 turn 崩掉有用得多。
-				content = [{ type: "text", text: error instanceof Error ? error.message : String(error) }];
-				isError = true;
-			}
-		}
-
+	/** 把一次调用的产出包成消息、跑 afterToolCall、发事件。三条路径共用。 */
+	const finish = async (toolCall: ToolCall, outcome: ToolOutcome, startedAt: number): Promise<ToolResultMessage> => {
 		const result: ToolResultMessage = {
 			role: "toolResult",
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
-			content,
-			details,
-			isError,
+			content: outcome.content,
+			details: outcome.details,
+			isError: outcome.isError,
 			timestamp: Date.now(),
 		};
 		// 改结果的机会。Step 8 给外部数据打「这是数据不是指令」的标注就在这里。
 		await runAfterToolCall(hooks, { step, toolCall, result });
-		results.push(result);
 		await sink?.({
 			type: "tool_end",
 			toolCallId: toolCall.id,
@@ -164,8 +151,73 @@ async function executeToolCalls(
 			isError: result.isError,
 			ms: Date.now() - startedAt,
 		});
+		return result;
+	};
+
+	const runners: (() => Promise<ToolResultMessage>)[] = [];
+
+	// —— 第一阶段:串行准备 ——
+	for (const toolCall of toolCalls) {
+		const startedAt = Date.now();
+		await sink?.({ type: "tool_start", toolCallId: toolCall.id, name: toolCall.name, args: toolCall.arguments });
+
+		// 拦截点。返回了就不执行工具 —— Step 8 的 guard 和将来的缓存都挂这儿。
+		const override = await runBeforeToolCall(hooks, { step, toolCall });
+		if (override) {
+			const outcome: ToolOutcome = {
+				content: override.result.content,
+				details: override.result.details,
+				isError: override.isError ?? false,
+			};
+			runners.push(() => finish(toolCall, outcome, startedAt));
+			continue;
+		}
+
+		const tool = tools.get(toolCall.name);
+		if (!tool) {
+			// 模型编了一个不存在的工具名。把这件事如实告诉它,别静默吞掉。
+			const outcome: ToolOutcome = {
+				content: [{ type: "text", text: `没有名为 "${toolCall.name}" 的工具` }],
+				isError: true,
+			};
+			runners.push(() => finish(toolCall, outcome, startedAt));
+			continue;
+		}
+
+		let params: unknown;
+		try {
+			params = validateArguments(tool, toolCall.arguments);
+		} catch (error) {
+			// 校验失败也是一条结果,不是异常 —— 模型看到「days 必须是整数」能自己改。
+			const outcome: ToolOutcome = {
+				content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+				isError: true,
+			};
+			runners.push(() => finish(toolCall, outcome, startedAt));
+			continue;
+		}
+
+		// —— 第二阶段的活儿:只推函数,不执行 ——
+		runners.push(async () => {
+			let outcome: ToolOutcome;
+			try {
+				const result = await tool.execute(toolCall.id, params as never, signal);
+				outcome = { content: result.content, details: result.details, isError: false };
+			} catch (error) {
+				// 工具的 execute 里不写 try/catch(pi 的约定),抛出来在这儿统一包成错误结果
+				// 回灌给模型 —— 它看到「城市名不对」这类错误往往能自己改参数重试,
+				// 比整个 turn 崩掉有用得多。
+				outcome = {
+					content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+					isError: true,
+				};
+			}
+			return finish(toolCall, outcome, startedAt);
+		});
 	}
-	return results;
+
+	// —— 第二阶段:并行执行,保序返回 ——
+	return Promise.all(runners.map((run) => run()));
 }
 
 /**
@@ -187,6 +239,12 @@ export async function runTurn(options: TurnOptions): Promise<TurnResult> {
 
 	await sink?.({ type: "turn_start" });
 	while (steps < maxSteps) {
+		// 每步开头查一次。工具执行期间被取消的话,这里能省掉一次注定失败的模型请求 ——
+		// 不查的话要等下一次 stream() 自己撞上 signal 才发现。
+		if (signal?.aborted) {
+			reason = "aborted";
+			break;
+		}
 		steps++;
 		await sink?.({ type: "step_start", step: steps });
 		// 决定模型看到什么。memory 注入挂这里 —— 对应 dsh 的 agent/pre-step。

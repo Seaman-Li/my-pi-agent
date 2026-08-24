@@ -11,6 +11,8 @@
 import { emptyHooks, type Hooks } from "./core/hooks.ts";
 import { Registry } from "./core/registry.ts";
 import { installTrace } from "./features/trace.ts";
+import { estimateBudget } from "./tools/estimate-budget.ts";
+import { searchHotel } from "./tools/search-hotel.ts";
 import { searchPoi } from "./tools/search-poi.ts";
 import { weather } from "./tools/weather.ts";
 
@@ -33,6 +35,8 @@ export function compose(options: ComposeOptions = {}): Composed {
 	const tools = new Registry();
 	tools.register(weather);
 	tools.register(searchPoi);
+	tools.register(searchHotel);
+	tools.register(estimateBudget);
 
 	const hooks = emptyHooks();
 	if (options.trace) installTrace(hooks);
