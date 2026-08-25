@@ -1736,6 +1736,150 @@ class HarnessTool(Protocol):
 
 ---
 
+## 25. 闭包捕获：把「待会儿要做的事」连同上下文一起打包
+
+从 pi-travel-agent 的 `executeToolCalls` 来的（`src/core/loop.ts`）。
+这个函数要做的事是「准备阶段串行、执行阶段并行」，实现手段就是闭包。
+
+### 先说概念
+
+**闭包 = 一个函数 + 它记住的那些外部变量。** 「捕获」就是「记住」这个动作。
+
+函数在**定义**的地方能看到周围作用域的变量；把它带到别处、在别的时刻执行，
+它**仍然**看得到——因为它随身带着对那些变量的引用。三条实测（`node -e` 跑过）：
+
+**① 捕获的是变量，不是当时的值。**
+
+```js
+let x = 1;
+const f = () => x;
+x = 2;
+f();   // 2 ← 不是 1
+```
+
+这是最容易错的一条。闭包记住的是**绑定**（那个"盒子"），不是定义时盒子里的内容。
+
+**② 每次进入外层作用域，产生一份新的绑定。**
+
+```js
+function makeCounter() { let n = 0; return () => ++n; }
+const a = makeCounter(), b = makeCounter();
+a(); a(); a();   // 3
+b();             // 1  ← a 和 b 各自捕获了自己那份 n
+```
+
+顺带：`makeCounter` 早就返回了，但 `n` 没被回收——**只要闭包还活着，被捕获的变量就活着**。
+变量的生命周期由谁引用它决定，不由声明它的函数是否返回决定。
+
+**③ `var` 共享一个绑定，`let`/`const` 每轮一个新绑定。**
+
+```js
+const varFns = [];
+for (var i = 0; i < 3; i++) varFns.push(() => i);
+varFns.map(fn => fn());   // [3, 3, 3]   ← 三个闭包共享同一个 i，循环结束它是 3
+
+const letFns = [];
+for (let j = 0; j < 3; j++) letFns.push(() => j);
+letFns.map(fn => fn());   // [0, 1, 2]   ← 每轮一个新的 j
+```
+
+①和③是同一件事的两面：因为捕获的是变量而不是值，所以"这个变量是不是每轮都换一个"
+就直接决定了结果。
+
+**为什么需要它**：只要函数不是"定义完立刻执行"——推进数组待会儿跑、注册成回调、
+`setTimeout`、事件监听器——**执行时的上下文早就不是定义时的上下文了**。
+闭包就是把定义时的上下文一起打包带走的机制。
+
+
+### 三个阶段，代码位置 ≠ 执行时刻
+
+```ts
+async function executeToolCalls(toolCalls, tools, hooks, step, signal, sink) {
+	const finish = async (toolCall, outcome, startedAt) => { ... };   // ① 定义，没跑
+	const runners: (() => Promise<ToolResultMessage>)[] = [];         // ② 空数组
+
+	for (const toolCall of toolCalls) {                                // ③ 造闭包
+		const startedAt = Date.now();
+		...
+		runners.push(async () => {
+			const result = await tool.execute(toolCall.id, params, signal);
+			return finish(toolCall, outcome, startedAt);
+		});                                                            //    仍然没跑
+	}
+
+	return Promise.all(runners.map((run) => run()));                   // ④ 到这里才执行
+}
+```
+
+`const finish = async () => {...}` 的语义是**赋值**，不是执行——和 `const x = 5` 一样。
+`runners.push(async () => {...})` 同理：推进数组的是**一个函数对象**，
+函数体一行都没跑。真正执行发生在 ④ 的 `run()`。
+
+**所以 `finish` 写在最前面，却跑在最后。**
+
+### 每个闭包捕获的是「本轮」的绑定
+
+```ts
+for (const toolCall of toolCalls) {   // const：每轮迭代一个独立绑定
+	const startedAt = Date.now();
+	runners.push(async () => finish(toolCall, outcome, startedAt));
+	//                              ^^^^^^^^          ^^^^^^^^^ 都是本轮的
+}
+```
+
+第 0 轮造的 runner 里，`toolCall` 永远是第 0 个。
+换成 `var toolCall`，整个循环共享**一个**绑定，所有 runner 都会看到循环结束后的最后一个值
+——就是那个经典 bug。`for...of` + `const` 每轮新建绑定，天然避开。
+
+同一个循环里，两种捕获同时在发生，而且**都是对的**：
+
+| 捕获的东西 | 声明在哪 | 每个 runner 看到的 |
+|---|---|---|
+| `toolCall` / `startedAt` / `params` / `tool` | 循环体内（每轮一个新绑定） | **各自不同** |
+| `finish` / `hooks` / `step` / `sink` / `signal` | 外层函数（整次调用一个） | **同一份** |
+
+该独立的独立、该共享的共享，区别只在变量声明在哪一层——不需要额外机制。
+
+### 依赖方向：runner 认识 finish，finish 不认识 runners
+
+```
+finish     不引用 runners        ← 所以先定义它没问题
+runner     引用 finish（捕获）   ← 所以必须在 finish 之后创建
+```
+
+反过来写（先跑循环、最后定义 `finish`）也能创建成功，但那些 runner 引用的是一个还在
+**TDZ（暂时性死区）**里的 `const`；只要 `Promise.all` 在 `finish` 定义之前触发就会抛
+`Cannot access 'finish' before initialization`。现在的顺序把这个可能性从根上消掉。
+
+### 为什么 `finish` 定义在函数里而不是模块顶层
+
+它要用 `hooks` / `step` / `sink`——都是外层函数的参数。定义在里面靠闭包直接拿到；
+搬到顶层就得每次多传三个：
+
+```ts
+finish(toolCall, outcome, startedAt)                        // 现在
+finish(toolCall, outcome, startedAt, hooks, step, sink)     // 搬出去之后，四个调用点都要写
+```
+
+**闭包在这里的作用是「把不变的东西先绑上」**，和 runner 捕获 `toolCall` 是同一个手法，
+只是绑的东西不同：一个绑本轮变化的，一个绑整次调用不变的。
+
+### 这个模式解决的实际问题
+
+`runners` 里四种情况是同构的——被 hook 拦截、工具不存在、参数校验失败这三种在准备阶段
+就有结果了，只有第四种要真执行。但它们**都被包成同一种 `() => Promise<Result>`**，
+于是第二阶段只有一句话：
+
+```ts
+return Promise.all(runners.map((run) => run()));
+```
+
+不用在这里分辨谁要跑谁不用跑，差别在准备阶段就消化掉了。
+pi 用的是显式的 `kind: "immediate"` / `kind: "prepared"` 二分（`agent-loop.ts:600`），
+闭包是同一件事的另一种写法。
+
+---
+
 ## 待补
 
 遇到再加：

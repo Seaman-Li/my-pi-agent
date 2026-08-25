@@ -399,6 +399,82 @@ $ node src/cli.ts --trace "成都和重庆明天天气怎么样，对比一下"
 > turn 结束那条路径也补了一次调用，保证**每个 step 恰好触发一次**。
 > —— 是这段 trace 本身把这个 bug 显出来的，这也是 trace 值得第一个做的理由。
 
+### 我那版 `executeToolCalls`：两阶段 + 四条路径汇到一个尾巴
+
+pi 用 `kind: "immediate"` / `kind: "prepared"` 显式二分，我用闭包做了同一件事
+（`src/core/loop.ts:157-220`）。形状：
+
+```ts
+const finish = async (toolCall, outcome, startedAt) => { ... };   // 公共尾巴
+const runners: (() => Promise<ToolResultMessage>)[] = [];
+
+for (const toolCall of toolCalls) {          // —— 第一阶段：串行准备 ——
+    sink(tool_start)
+    :172  被 hook 拦截      → runners.push(() => finish(toolCall, outcome, startedAt))
+    :183  工具不存在        → runners.push(() => finish(...))
+    :196  参数校验失败      → runners.push(() => finish(...))
+    :201  正常              → runners.push(async () => {
+                                  const r = await tool.execute(...)   ← 工具在这儿跑
+                                  return finish(toolCall, outcome, startedAt)
+                              })
+}
+
+:220  return Promise.all(runners.map((run) => run()));   // —— 第二阶段：并行执行 ——
+```
+
+**四条路径的 `outcome` 来源完全不同**（hook 给的、现造的、校验器抛的、工具返回的），
+**但拿到 outcome 之后要做的事完全一样**：包成 `ToolResultMessage`、跑 `afterToolCall`、
+发 `tool_end`。抽成 `finish` 就是把这段公共尾巴只写一遍。
+模型那边也看不出区别——收到的都是 `toolResult`，只有 `isError` 和文本不同。
+
+注意 **`tool.execute` 在 runner 里、`finish` 之前，不在 `finish` 里面**。
+`finish` 拿到的是已经算好的 outcome，它只负责收尾。
+
+#### 并行不是 `Promise.all` 造成的，是 `.map()`
+
+```ts
+runners.map((run) => run())   // ← 同步遍历，立刻把每个 runner 都启动
+Promise.all(...)              // ← 只负责「等全部完成」
+```
+
+`run` 只是 map 回调的参数名，`runners` 里装的才是真函数。
+调用一个 `async` 函数会同步执行到第一个 `await` 然后返回 pending Promise，
+所以 `map` 一瞬间跑完时，所有 fetch **已经发出去了**。实测（三个各 300ms 的假任务）：
+
+```
++  1ms  runner1/2/3 都已启动
++305ms  Promise.all 完成                    ← 并行
+        对照：改成 for (const run of runners) await run()
++904ms  串行结束
+```
+
+三个容易写错的近邻：
+
+```ts
+runners.map((run) => run())    // ✅ 得到 Promise[]
+runners.map((run) => run)      // ❌ 什么都没调
+Promise.all(runners)           // ❌ 不报错但更糟：非 Promise 元素被当成已 resolve 的值，
+                               //    直接把函数数组原样返回，一个工具都没执行且毫无提示
+```
+
+#### 两个语义
+
+**① `Promise.all` 的结果按输入顺序，不按完成顺序。**
+这是 toolResult 能和 toolCall 一一对应的保证（协议要求配对）。
+但终端上 `tool_end` 事件是谁先完谁先发——**结果有序、事件无序**。
+
+**② `Promise.all` 遇任一 reject 就整体 reject，但这里永远不会。**
+runner 内部已经把 `execute` 的异常 catch 成 `isError: true` 的结果了。
+这是有意的：让异常穿透会导致**一个工具失败、整批结果全丢**，
+而模型下一步需要看到完整的一批才能决定怎么办（"天气查到了、酒店没查到，那我先说天气"）。
+另外 `Promise.all` **不取消**其他已启动的请求——真要取消只能靠 `signal`，
+这也是为什么 abort 必须单独走一条线，不能指望 Promise 的失败传播。
+
+#### 一个读 trace 时的坑
+
+前三条路径的 `ms` 会非常小（`→ 拒绝:… (0ms)`），因为中间什么都没干。
+**那不代表工具跑得快，代表工具压根没跑。** 要区分得等 Step 9 给 trace 加「是否执行过」的标记。
+
 ### 拦截：`kind: "immediate"` 与我自己那版的 `ToolCallOverride`
 
 上面三段式里 `prepareToolCall` 的 `kind: "immediate"` 是**拦截出口**——三种情况共用它，
@@ -448,6 +524,104 @@ assistant: 成都明天多云 14~22°C。不过很抱歉，重庆不在我的服
 
 工具没跑，模型收到拒绝，自己把这件事解释给用户听了。
 Step 8b 的路径限制、域名白名单、调用预算，全是这个形状。
+
+### 两个实战案例：「去马来西亚玩」
+
+一个问题跑出了两件事：一件是设计按预期工作，一件是真 bug。
+
+#### 案例 1：工具失败了，turn 为什么接着跑
+
+```
+[trace] afterToolCall #1  weather ERR 查不到城市「吉隆坡」的天气,换个写法试试
+[trace] afterToolCall #1  search_poi ok 在吉隆坡没搜到「景点」
+[trace] afterStep     #1  stop=toolUse content=[text,toolCall,toolCall,toolCall] tools=3
+[trace] beforeStep    #2  messages=5
+[tool] search_poi({"city":"Kuala Lumpur", ...})     ← 模型自己改成英文重试
+```
+
+**因为工具的成败根本不参与终止判定。** `turnEndReason` 只看四件事：
+
+```ts
+if (signal?.aborted || message.stopReason === "aborted") return "aborted";
+if (message.stopReason === "error")   return "error";     // 模型侧失败，不是工具失败
+if (message.stopReason === "length")  return "truncated";
+if (!hasToolCalls)                    return "completed";
+return null;                                              // 继续
+```
+
+`isError` 一个字都没出现。工具失败只影响**那条 toolResult 的内容**，
+`executeToolCalls` 里也明写了「不因为某个工具失败就中断」——一批里某个炸了其余照跑。
+
+这正是「错误包成结果回灌」想要的效果：模型看到错误，**自己换了个写法重试**，
+比整个 turn 崩掉有用得多。设计在按预期工作。
+
+#### 案例 2：静默返回错数据 —— 比失败危险得多
+
+上面那次英文重试返回了 15 条结果，**全是北京的**：
+
+```
+Kuala Lumpur「景点」搜到 15 条:
+1. 中国人民革命军事博物馆(海淀区) ★4.7
+2. 故宫博物院(东城区) ★4.9 AAA
+```
+
+直接问高德证实：
+
+```
+city="Kuala Lumpur"      status=1  count=1000   → 中国人民革命军事博物馆 | 北京市
+city="吉隆坡"            status=1  count=0      → 空
+city="不存在的城市xyz"    status=1  count=1000   → 同样是北京那几个
+```
+
+**高德解析不了 `city` 时，`citylimit=true` 被悄悄忽略**，接口照样返回 `status:"1"`，
+给一批按全国热度排的结果。没有任何错误信号。
+
+| | 表现 | 后果 |
+|---|---|---|
+| `weather` | 抛错 | 模型知道失败，会调整 ✅ |
+| `search_poi`（修之前） | **静默返回错数据** | 模型拿故宫规划吉隆坡行程 ❌ |
+
+**这是 Q7「幻觉还是 agent bug」的活标本。** 模型输出「吉隆坡行程：故宫博物院」，
+看起来像典型幻觉；但工具返回值里确实写着故宫——**信息进了上下文，而且是错的**，
+按三分法属于第②类（数据源问题），不是第③类（幻觉）。
+不看 trace 分不出来，这就是 trace 和 session 必须落盘的理由。
+
+修法：POI 响应每条自带 `cityname`，我们原来只留了 `adname`（区）把它扔了。
+加回 `AmapPoi.city`，在客户端层过滤掉城市对不上的条目：
+
+```ts
+function keepSameCity(pois: AmapPoi[], city: string): AmapPoi[] {
+	const wanted = normalizeCity(city);          // 「成都市」→「成都」
+	return pois.filter((poi) => {
+		if (!poi.city) return true;              // 判不了就别 judge，过度过滤会扔掉对的
+		const got = normalizeCity(poi.city);
+		return got.includes(wanted) || wanted.includes(got);
+	});
+}
+```
+
+放在 `amap.ts` 而不是工具里：**这是数据源的怪癖，不是某个工具的业务规则**，
+`search_poi` 和 `search_hotel` 都该受保护。修完：
+
+```
+成都               → 5 条  成都金融城双子塔 | 成都市
+北京               → 5 条  天安门广场 | 北京市
+Kuala Lumpur       → 0 条
+吉隆坡              → 0 条
+不存在的城市xyz      → 0 条
+重庆               → 5 条  洪崖洞民俗风貌区 | 重庆市
+```
+
+再跑同一个问题，模型的结论变成了正确的那个：
+
+```
+看起来工具可能不支持查询国外城市的信息。
+由于我无法通过工具获取实时的天气、具体景点评分和酒店价格信息,建议你...
+```
+
+**留下的一般教训**：接外部 API 时，「HTTP 200 + `status: "1"`」不等于「结果是你要的」。
+凡是**能被服务端悄悄放宽的约束**（城市限定、日期范围、条数上限），都要拿响应里的字段
+自己再验一遍。报错是礼物，静默降级才是要命的。
 
 ---
 

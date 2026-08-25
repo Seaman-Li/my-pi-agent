@@ -36,6 +36,34 @@ export interface Tool<S extends TSchema = TSchema> extends AiTool<S> {
 }
 
 /**
+ * 「向人提问」这个能力的**定义**。core 只声明它长什么样,不提供实现。
+ *
+ * 三个角色分开:定义在这里,实现由入口给(CLI 给终端版、HTTP 服务给推送版、
+ * 测试给固定答案版),使用者是 `ask_user` 工具。工具因此不认识 stdin、不认识 HTTP。
+ *
+ * 这是这个项目里唯一一个**必须由外部提供实现**的能力 —— 其余工具要么纯计算、
+ * 要么发 HTTP,而「问人」在不同宿主里差别根本性:终端是读一行,服务端是
+ * 推给前端然后挂起这个 turn 等回来。
+ */
+export interface Asker {
+	ask(questions: Question[], signal?: AbortSignal): Promise<Answer[]>;
+}
+
+export interface Question {
+	/** 短标识,如 days / budget。答复里原样带回,便于对应。 */
+	id: string;
+	question: string;
+	hint?: string;
+}
+
+export interface Answer {
+	id: string;
+	question: string;
+	/** 用户没答就是空串。空串和「没问过」是两回事,别合并。 */
+	answer: string;
+}
+
+/**
  * 把一条工具结果里的文本拼起来。
  *
  * 我们的工具只产出 `TextContent`,但 pi-ai 的 `ToolResultMessage.content` 是

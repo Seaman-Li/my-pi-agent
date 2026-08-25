@@ -36,6 +36,9 @@ dashscope 的 OpenAI 兼容差异不在 .env 里：那是协议事实，写死�
 | 3a | `node --input-type=module -e 'process.loadEnvFile("./.env"); import { fetchForecast } from "./src/tools/amap.ts"; try { await fetchForecast("火星") } catch (e) { console.log(e.message) }'` | 报「查不到城市」，**消息里没有 key** |
 | 3b-1 | `node src/cli.ts "帮我规划成都2天行程，预算3000，喜欢历史文化，住武侯区附近"` | 四个工具协同出行程 + 预算，`end completed` |
 | 3b-1 | `node --input-type=module -e 'process.loadEnvFile("./.env"); import { validateArguments } from "./src/core/validate.ts"; import { weather } from "./src/tools/weather.ts"; console.log(JSON.stringify(validateArguments(weather, { city: "成都", days: "3" })))'` | 输出 `{"city":"成都","days":3}` —— 字符串数字被 Convert 救回 |
+| 3b-2 | `node src/cli.ts "帮我规划一下成都的行程"` | 触发 `[tool] ask_user(...)`，终端出现 `? 您打算去几天？` 并等输入 |
+| 3b-2 | `node src/cli.ts "告诉我transformer的原理"` | 一句话拒答并把话题拉回旅行，不解释原理 |
+| 3b-2 | `echo | node src/cli.ts "帮我规划成都行程"` | 非交互环境下 ask_user 报「问不了用户」，模型改为带假设继续 |
 
 ## 目录
 
@@ -56,7 +59,8 @@ src/
 │   ├── weather.ts
 │   ├── search-poi.ts
 │   ├── search-hotel.ts
-│   └── estimate-budget.ts  唯一不联网的工具
+│   ├── estimate-budget.ts  唯一不联网的工具
+│   └── ask-user.ts         唯一会阻塞等人的工具
 ├── compose.ts     ★ 唯一装配处，加一块积木 = 加一行
 └── cli.ts         入口
 ```

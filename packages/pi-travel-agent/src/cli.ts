@@ -13,6 +13,7 @@ import { compose } from "./compose.ts";
 import { runTurn } from "./core/loop.ts";
 import { DEFAULT_MODEL, resolveApiKey, resolveModel } from "./core/model.ts";
 import type { AgentEvent, EventSink } from "./core/types.ts";
+import { createTerminalAsker } from "./terminal-asker.ts";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -159,7 +160,12 @@ async function main(): Promise<number> {
 		messages: [{ role: "user", content: args.prompt, timestamp: Date.now() }],
 	};
 
-	const { tools, hooks } = compose({ trace: args.trace });
+	// 有终端才给 asker。没有(被管道喂输入、CI)就不注册 ask_user,
+	// 模型看不到它,会按 system prompt 说的「带假设继续」。
+	const { tools, hooks } = compose({
+		trace: args.trace,
+		asker: process.stdin.isTTY ? createTerminalAsker() : undefined,
+	});
 
 	// Ctrl-C 不是杀进程,是把 signal 传下去让请求和工具自己收尾。
 	const controller = new AbortController();

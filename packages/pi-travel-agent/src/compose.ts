@@ -10,7 +10,9 @@
 
 import { emptyHooks, type Hooks } from "./core/hooks.ts";
 import { Registry } from "./core/registry.ts";
+import type { Asker } from "./core/types.ts";
 import { installTrace } from "./features/trace.ts";
+import { createAskUser } from "./tools/ask-user.ts";
 import { estimateBudget } from "./tools/estimate-budget.ts";
 import { searchHotel } from "./tools/search-hotel.ts";
 import { searchPoi } from "./tools/search-poi.ts";
@@ -19,6 +21,11 @@ import { weather } from "./tools/weather.ts";
 export interface ComposeOptions {
 	/** 打开后把四个挂载点的进出打到 stderr。 */
 	trace?: boolean;
+	/**
+	 * 怎么向人提问。**不给就不注册 `ask_user`** —— 模型看不到这个工具,
+	 * 也就不会在没人可问的环境里白花一次调用。宿主知道有没有人可问,工具不知道。
+	 */
+	asker?: Asker;
 }
 
 export interface Composed {
@@ -37,6 +44,7 @@ export function compose(options: ComposeOptions = {}): Composed {
 	tools.register(searchPoi);
 	tools.register(searchHotel);
 	tools.register(estimateBudget);
+	if (options.asker) tools.register(createAskUser(options.asker));
 
 	const hooks = emptyHooks();
 	if (options.trace) installTrace(hooks);

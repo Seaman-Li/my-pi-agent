@@ -40,6 +40,8 @@ export interface AmapPoi {
 	id: string;
 	name: string;
 	address: string;
+	/** 高德返回的城市名,如「成都市」。用来识破下面那个静默降级,别删。 */
+	city: string;
 	district: string;
 	/** "经度,纬度",静态地图和距离计算都要它。 */
 	location: string;
@@ -113,6 +115,38 @@ export async function fetchForecast(city: string, signal?: AbortSignal): Promise
 	return forecast;
 }
 
+/**
+ * 去掉行政区划后缀,好把「成都」和「成都市」看成一个。
+ *
+ * 只脱最外面一层:「黑龙江省」→「黑龙江」,不动「自治州」这类中间成分 ——
+ * 宁可少归一化(多留几条结果)也不要过度归一化(把对的滤掉)。
+ */
+function normalizeCity(name: string): string {
+	return name.trim().replace(/[市省]$/u, "");
+}
+
+/**
+ * 滤掉不属于目标城市的 POI。
+ *
+ * **这是在防高德的一个静默降级**:`city` 参数它解析不了时(外国城市、拼音、乱码),
+ * `citylimit=true` 会被**悄悄忽略**,接口照样返回 `status:"1"`,给一批按全国热度排的结果。
+ * 实测 `city="Kuala Lumpur"` 返回 count=1000,前三条是军事博物馆、故宫、天安门。
+ *
+ * 静默的错数据比报错危险得多:模型会拿故宫去规划吉隆坡行程,而看输出的人会以为是幻觉。
+ * 每条 POI 自带的 `cityname` 是唯一能识破这件事的证据,所以 `AmapPoi` 必须留着它。
+ *
+ * `cityname` 缺失的条目一律**保留** —— 判不了就别judge,过度过滤会把对的结果扔掉。
+ */
+function keepSameCity(pois: AmapPoi[], city: string): AmapPoi[] {
+	const wanted = normalizeCity(city);
+	if (!wanted) return pois;
+	return pois.filter((poi) => {
+		if (!poi.city) return true;
+		const got = normalizeCity(poi.city);
+		return got.includes(wanted) || wanted.includes(got);
+	});
+}
+
 /** 高德原始 POI 里可能是空数组占位的字段,取出来当字符串用。 */
 function optionalText(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 ? value : undefined;
@@ -131,13 +165,14 @@ export async function searchPoi(
 		{ keywords: options.keyword, city: options.city, citylimit: "true", offset: options.limit, page: 1 },
 		signal,
 	);
-	return (body.pois ?? []).map((poi) => {
+	const pois = (body.pois ?? []).map((poi) => {
 		const ext = (poi.biz_ext ?? {}) as Record<string, unknown>;
 		const photos = Array.isArray(poi.photos) ? (poi.photos as Record<string, unknown>[]) : [];
 		return {
 			id: String(poi.id ?? ""),
 			name: String(poi.name ?? ""),
 			address: optionalText(poi.address) ?? "",
+			city: optionalText(poi.cityname) ?? "",
 			district: optionalText(poi.adname) ?? "",
 			location: String(poi.location ?? ""),
 			type: String(poi.type ?? ""),
@@ -148,4 +183,5 @@ export async function searchPoi(
 			photos: photos.map((photo) => optionalText(photo.url)).filter((url): url is string => Boolean(url)),
 		};
 	});
+	return keepSameCity(pois, options.city);
 }
