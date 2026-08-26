@@ -37,6 +37,36 @@ const DASHSCOPE_COMPAT: OpenAICompletionsCompat = {
 };
 
 /**
+ * 局域网 Ollama 的 OpenAI 兼容差异。
+ *
+ * 和 dashscope 那套一样,这些是**协议事实**不是部署配置,所以写死在代码里,
+ * 地址和模型 id 才走 .env。
+ *
+ * `supportsStrictMode: false`:`strict` 是 OpenAI 的结构化输出约束,Ollama 不实现它。
+ * pi-ai 默认当成支持,发过去多半被忽略,但「多半」不是「一定」——显式关掉。
+ *
+ * `supportsReasoningEffort: true` 是**实测出来的,不是抄的**。五种关思考的写法只有一种被认:
+ *
+ * | 发过去的字段 | 思考段长度 |
+ * |---|---|
+ * | 什么都不发 / `think:false` / `chat_template_kwargs.enable_thinking:false` | 6000~9000 字 |
+ * | `reasoning_effort:"none"` | **0** |
+ *
+ * 6000 字思考 ≈ 3000 token,单步就吃掉 8192 窗口的三分之一,而且这个模型常把最终回答
+ * 也留在思考里、`content` 发空 —— 终端上看着像「只有思考没有回答」。所以本地这条路
+ * **默认必须关思考**。配合 model 上的 `thinkingLevelMap.off = "none"`,
+ * pi-ai 在不带 `--thinking` 时走 `api/openai-completions.ts:839` 那一支,发 `reasoning_effort:"none"`。
+ *
+ * 响应侧不用配:`reasoning` 字段 pi-ai 认(同文件 :492 试三个别名)。
+ */
+const OLLAMA_COMPAT: OpenAICompletionsCompat = {
+	supportsDeveloperRole: false,
+	supportsStore: false,
+	supportsReasoningEffort: true,
+	supportsStrictMode: false,
+};
+
+/**
  * 读一个必填环境变量。
  *
  * @throws 缺失或为空串时抛。空串按缺失处理 —— `TRAVEL_MODEL_ID=` 是配错了,
@@ -86,7 +116,41 @@ function qwenFromEnv(): ModelSpec {
 	};
 }
 
-const PROVIDERS: Record<string, () => ModelSpec> = { qwen: qwenFromEnv };
+/**
+ * 局域网上的 Ollama。
+ *
+ * `LOCAL_CONTEXT_WINDOW` 填的必须是**服务端实际开的那个 `num_ctx`**,
+ * 不是 `/api/tags` 报的 `context_length`(那是模型上限,Ollama 默认远小于它)。
+ * 填大了不会报错 —— Ollama 会从头静默丢消息,你只会看到模型「忘了前面说过什么」。
+ * 这正是 Q7 里第①类问题(信息压根没进上下文),而且是最难认出来的一种。
+ *
+ * key 走 `env:LOCAL_API_KEY`:Ollama 不校验,但 `resolveApiKey` 不接受空值,
+ * 所以 .env 里随便填个非空字符串。
+ */
+function ollamaFromEnv(): ModelSpec {
+	return {
+		model: {
+			id: requireEnv("LOCAL_MODEL_ID"),
+			name: requireEnv("LOCAL_MODEL_ID"),
+			api: "openai-completions",
+			provider: "ollama",
+			baseUrl: requireEnv("LOCAL_BASE_URL"),
+			reasoning: true,
+			// off 必须是字符串,不能是 null —— null 的语义是「这个模型关不掉思考,别发」,
+			// 那样就退回到 6000 字思考的默认行为了。
+			thinkingLevelMap: { off: "none", minimal: "low", low: "low", medium: "medium", high: "high" },
+			input: ["text"],
+			contextWindow: envNumber("LOCAL_CONTEXT_WINDOW"),
+			maxTokens: envNumber("LOCAL_MAX_TOKENS"),
+			// 自己的机器,电费不算在这儿。
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			compat: OLLAMA_COMPAT,
+		},
+		apiKeySource: "env:LOCAL_API_KEY",
+	};
+}
+
+const PROVIDERS: Record<string, () => ModelSpec> = { qwen: qwenFromEnv, local: ollamaFromEnv };
 
 export const DEFAULT_MODEL = "qwen";
 
