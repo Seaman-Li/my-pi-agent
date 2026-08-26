@@ -72,6 +72,23 @@ function apiKey(): string {
 }
 
 /**
+ * 拼出带 key 的完整 URL。
+ *
+ * **返回值就是凭据** —— 高德把 key 放在 query string 里。所以这个函数的结果
+ * 只许交给 `fetch`,不许进日志、不许进错误消息、不许进 HTML 报告。
+ * 抽成一个函数是为了让「拼 key」在整个项目里只有这一处,好审。
+ *
+ * @throws 没配 `AMAP_KEY` 时由 `apiKey()` 抛。
+ */
+function buildUrl(path: string, params: Record<string, string | number | undefined>): string {
+	const query = new URLSearchParams({ key: apiKey() });
+	for (const [name, value] of Object.entries(params)) {
+		if (value !== undefined) query.set(name, String(value));
+	}
+	return `${BASE}${path}?${query}`;
+}
+
+/**
  * 发一次高德请求。
  *
  * @throws HTTP 层失败、或高德返回 `status !== "1"` 时抛。
@@ -83,11 +100,7 @@ async function request<T>(
 	params: Record<string, string | number | undefined>,
 	signal?: AbortSignal,
 ): Promise<T> {
-	const query = new URLSearchParams({ key: apiKey() });
-	for (const [name, value] of Object.entries(params)) {
-		if (value !== undefined) query.set(name, String(value));
-	}
-	const response = await fetch(`${BASE}${path}?${query}`, { signal });
+	const response = await fetch(buildUrl(path, params), { signal });
 	if (!response.ok) {
 		throw new Error(`高德 ${path} 请求失败:HTTP ${response.status}`);
 	}
@@ -184,4 +197,40 @@ export async function searchPoi(
 		};
 	});
 	return keepSameCity(pois, options.city);
+}
+
+/** 静态地图上的一个点。`label` 是画在图钉里的那个字符。 */
+export interface MapMarker {
+	/** "经度,纬度",原样用 POI 的 `location`。 */
+	location: string;
+	/** 单个字符,高德只认 `0-9`、`A-Z` 和单个汉字。 */
+	label: string;
+}
+
+/** 一张图最多几个点。高德把参数放 query string 里,点太多会把 URL 撑爆。 */
+const MAX_MARKERS = 10;
+
+/**
+ * 取一张静态地图,返回 PNG 字节。
+ *
+ * 每个点单独成一个 marker 分组(`样式:坐标`,分组之间用 `|`)——
+ * 一个分组只能有一个 label,想让每个点显示不同的序号就只能这么拼。
+ *
+ * @throws 一个点都没有、HTTP 失败、或者高德返回的不是图片时抛。
+ *         **最后一条是必查的**:高德的业务错误是「HTTP 200 + 一段 JSON」,
+ *         不看 content-type 就会把一段错误 JSON 当成 PNG 存进报告里。
+ */
+export async function fetchStaticMap(markers: MapMarker[], signal?: AbortSignal): Promise<Buffer> {
+	if (markers.length === 0) throw new Error("静态地图至少要一个点");
+	const spec = markers
+		.slice(0, MAX_MARKERS)
+		.map((marker) => `mid,0x2563EB,${marker.label}:${marker.location}`)
+		.join("|");
+	const response = await fetch(buildUrl("/v3/staticmap", { markers: spec, size: "750*500" }), { signal });
+	if (!response.ok) throw new Error(`高德静态地图请求失败:HTTP ${response.status}`);
+	const contentType = response.headers.get("content-type") ?? "";
+	if (!contentType.startsWith("image/")) {
+		throw new Error(`高德静态地图没返回图片(content-type: ${contentType})`);
+	}
+	return Buffer.from(await response.arrayBuffer());
 }

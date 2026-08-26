@@ -14,11 +14,17 @@ import type { Asker } from "./core/types.ts";
 import { installTrace } from "./features/trace.ts";
 import { createAskUser } from "./tools/ask-user.ts";
 import { estimateBudget } from "./tools/estimate-budget.ts";
+import { createSavePlan } from "./tools/save-plan.ts";
 import { searchHotel } from "./tools/search-hotel.ts";
 import { searchPoi } from "./tools/search-poi.ts";
 import { weather } from "./tools/weather.ts";
 
 export interface ComposeOptions {
+	/**
+	 * HTML 报告写到哪儿。**必填,而且必须是绝对路径** —— 它不是功能开关,是宿主的资源。
+	 * 让工具自己从 `import.meta.url` 推目录,文件一挪位置就写到别处去了。
+	 */
+	outDir: string;
 	/** 打开后把四个挂载点的进出打到 stderr。 */
 	trace?: boolean;
 	/**
@@ -38,12 +44,13 @@ export interface Composed {
  *
  * @throws 工具重名时由 `Registry.register` 抛 —— 装配期炸掉,而不是运行期选错工具。
  */
-export function compose(options: ComposeOptions = {}): Composed {
+export function compose(options: ComposeOptions): Composed {
 	const tools = new Registry();
 	tools.register(weather);
 	tools.register(searchPoi);
 	tools.register(searchHotel);
 	tools.register(estimateBudget);
+	tools.register(createSavePlan({ outDir: options.outDir }));
 	if (options.asker) tools.register(createAskUser(options.asker));
 
 	const hooks = emptyHooks();

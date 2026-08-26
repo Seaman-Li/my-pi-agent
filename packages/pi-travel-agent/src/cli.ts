@@ -163,6 +163,7 @@ async function main(): Promise<number> {
 	// 有终端才给 asker。没有(被管道喂输入、CI)就不注册 ask_user,
 	// 模型看不到它,会按 system prompt 说的「带假设继续」。
 	const { tools, hooks } = compose({
+		outDir: join(PACKAGE_ROOT, "out"),
 		trace: args.trace,
 		asker: process.stdin.isTTY ? createTerminalAsker() : undefined,
 	});
