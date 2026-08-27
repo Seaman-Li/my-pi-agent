@@ -89,9 +89,49 @@ function buildUrl(path: string, params: Record<string, string | number | undefin
 }
 
 /**
- * 发一次高德请求。
+ * 退避重试的等待间隔,毫秒。长度 = 最多重试几次。
  *
- * @throws HTTP 层失败、或高德返回 `status !== "1"` 时抛。
+ * 两次就够:并发超限是**瞬时**的,错峰几百毫秒就过去了。再多是在赌配额,不是在等窗口。
+ */
+const RETRY_DELAYS = [350, 900];
+
+/** 睡一会儿,能被 abort 打断。@throws 等待期间被取消时抛。 */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(new Error("已取消"));
+		};
+		if (signal?.aborted) return onAbort();
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+/**
+ * 这次失败值不值得再试一次。
+ *
+ * **只认并发超限(QPS),不认日配额用完(`DAILY_QUERY_OVER_LIMIT`)。** 两者都是 "LIMIT",
+ * 但一个等几百毫秒就好,另一个等到明天也是白等 —— 对后者重试纯粹是把一次失败拖成三次。
+ * 所以匹配 `info` 里的 "QPS" 而不是 "LIMIT"。
+ */
+function isRateLimited(info: string): boolean {
+	return info.toUpperCase().includes("QPS");
+}
+
+/**
+ * 发一次高德请求,并发超限时退避重试。
+ *
+ * **为什么必须重试**:system prompt 要求「互相独立的查询一次性发出」,loop 的执行阶段
+ * 又是并行的,于是一批 6 个 `search_poi` 会同时打到高德 —— 个人 key 的并发额度就那么点,
+ * 实测稳定有一两个吃到 `CUQPS_HAS_EXCEEDED_THE_LIMIT(10021)`。
+ * 那一路的结果就整条没了,模型只能拿剩下的凑,而看输出的人根本看不出少了什么。
+ * 「并行发」和「不重试」这两条同时成立就是个 bug,而并行不该退。
+ *
+ * @throws HTTP 层失败、重试完仍然超限、或高德返回其它 `status !== "1"` 时抛。
  *         **抛出的消息里只有 path 和高德的 info/infocode,没有 URL** ——
  *         URL 带 key,而错误消息会被 loop 包成 toolResult 回灌给模型、再进 session 文件。
  */
@@ -100,15 +140,20 @@ async function request<T>(
 	params: Record<string, string | number | undefined>,
 	signal?: AbortSignal,
 ): Promise<T> {
-	const response = await fetch(buildUrl(path, params), { signal });
-	if (!response.ok) {
-		throw new Error(`高德 ${path} 请求失败:HTTP ${response.status}`);
-	}
-	const body = (await response.json()) as AmapEnvelope & T;
-	if (body.status !== "1") {
+	const url = buildUrl(path, params);
+	for (let attempt = 0; ; attempt++) {
+		const response = await fetch(url, { signal });
+		if (!response.ok) {
+			throw new Error(`高德 ${path} 请求失败:HTTP ${response.status}`);
+		}
+		const body = (await response.json()) as AmapEnvelope & T;
+		if (body.status === "1") return body;
+		if (isRateLimited(body.info) && attempt < RETRY_DELAYS.length) {
+			await sleep(RETRY_DELAYS[attempt] as number, signal);
+			continue;
+		}
 		throw new Error(`高德 ${path} 返回错误:${body.info}(${body.infocode})`);
 	}
-	return body;
 }
 
 /**

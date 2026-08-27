@@ -11,6 +11,7 @@
 import { emptyHooks, type Hooks } from "./core/hooks.ts";
 import { Registry } from "./core/registry.ts";
 import type { Asker } from "./core/types.ts";
+import { installConfirm } from "./features/confirm.ts";
 import { installTrace } from "./features/trace.ts";
 import { createAskUser } from "./tools/ask-user.ts";
 import { estimateBudget } from "./tools/estimate-budget.ts";
@@ -54,7 +55,27 @@ export function compose(options: ComposeOptions): Composed {
 	if (options.asker) tools.register(createAskUser(options.asker));
 
 	const hooks = emptyHooks();
+	// trace 先挂:它只观察不拦截,得让它先把这次调用记下来,再轮到 confirm 决定放不放。
 	if (options.trace) installTrace(hooks);
+	// 和 `ask_user` 同一条判断:没人可问就**根本不挂这块积木**。
+	// 管道 / CI 里 save_plan 照常执行 —— 拦截是为了尊重用户的意愿,没有用户就没有意愿要尊重。
+	if (options.asker) {
+		installConfirm(hooks, {
+			asker: options.asker,
+			rules: [
+				{
+					tool: "save_plan",
+					// 参数没经过校验(见 confirm.ts),所以 title 得这么取。
+					question: (args) => {
+						const title = typeof args.title === "string" && args.title ? args.title : "这份行程";
+						return `要把「${title}」存成 HTML 报告吗?`;
+					},
+					// 这句话是**写给模型看的**。不写「别再存了」的话,它多半会换个 title 再试一次。
+					declined: "用户这次不需要保存报告。不要再调 save_plan,除非他后面明确又提出来。",
+				},
+			],
+		});
+	}
 
 	return { tools, hooks };
 }

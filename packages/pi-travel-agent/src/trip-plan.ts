@@ -13,7 +13,7 @@ import { type Static, Type } from "typebox";
 /**
  * 行程里的一件事。
  *
- * `location` 直接抄 `search_poi` 返回的那一串,不要自己换算 —— 它是画地图的唯一输入。
+ * `location` **不用填** —— 报告会自己按名字去查(见 `tools/save-plan.ts` 的 `resolveLocations`)。
  * `source` 是给 Q7 用的:报告里每条具体信息都标出处,看的人能自己核对,
  * 而「没出处的字段留空」比「编一个」在事后可查得多。
  */
@@ -22,7 +22,11 @@ const planItem = Type.Object({
 	name: Type.String({ description: "去哪/做什么,如「武侯祠博物馆」「宽窄巷子吃晚饭」" }),
 	district: Type.Optional(Type.String({ description: "所在区,如「武侯区」" })),
 	location: Type.Optional(
-		Type.String({ description: "「经度,纬度」,原样抄 search_poi 返回的 location。有它这个点才会出现在地图上" }),
+		Type.String({
+			description:
+				"「经度,纬度」。**不知道就留空**,报告会自己按 name 去查。" +
+				"凭印象写的坐标会把图钉插到错的地方(实测差 750 米),比没有图钉糟得多",
+		}),
 	),
 	detail: Type.Optional(Type.String({ description: "具体安排:看什么、玩多久、怎么过去" })),
 	cost: Type.Optional(Type.Number({ description: "这一项大概花多少钱,人民币元。不确定就留空,别编" })),

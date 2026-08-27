@@ -10,7 +10,13 @@ import { Type } from "typebox";
 import type { Tool, ToolResult } from "../core/types.ts";
 import { fetchForecast } from "./amap.ts";
 
-/** 高德的免费预报只给「今天 + 后三天」,写 7 会让模型提出永远满足不了的要求。 */
+/**
+ * 高德的免费预报只给「今天 + 后三天」,写 7 会让模型提出永远满足不了的要求。
+ *
+ * 这个上限**必须出现在返回值里**,不能只写在参数 description 上:实测用户说
+ * 「10.1 去杭州」,模型照常调了 weather,拿到 8 月底这四天,然后把它当成国庆的天气报了出去。
+ * 参数说明只约束「能填几」,约束不了「拿到的是哪几天」—— 后者只有结果自己说得清。
+ */
 const MAX_DAYS = 4;
 
 const parameters = Type.Object({
@@ -39,8 +45,18 @@ export const weather: Tool<typeof parameters> = {
 		const summary = casts
 			.map((cast) => `${cast.date} ${cast.dayweather}转${cast.nightweather} ${cast.nighttemp}~${cast.daytemp}°C`)
 			.join("；");
+		const first = casts[0]?.date ?? "";
+		const last = casts[casts.length - 1]?.date ?? "";
 		return {
-			content: [{ type: "text", text: `${forecast.city} ${summary}(数据时间 ${forecast.reporttime})` }],
+			content: [
+				{
+					type: "text",
+					text:
+						`${forecast.city} ${summary}(数据时间 ${forecast.reporttime})。` +
+						`本次预报只覆盖 ${first} 到 ${last} —— 高德最多给今天起 ${MAX_DAYS} 天,` +
+						`出行日期不在这个区间里就是查不到,不要拿这几天的天气代替。`,
+				},
+			],
 			details: { ...forecast, casts },
 		};
 	},
