@@ -74,6 +74,8 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 ├── BACKLOG.md                冒出来的新想法丢这,当次不做
 ├── README.md                 每个 Step 的验收命令表
 ├── docs/
+│   ├── agent1-travel-plan.md      实施计划
+│   ├── agent1-dev-workflow.md     本文件:文件结构与开发流程
 │   ├── answers/              ★ 八个问题的答案,每篇引用自己代码的行号
 │   └── debugging.md          Step 9 产出:幻觉 vs agent bug 判据表
 ├── prompts/
@@ -84,14 +86,16 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   │   ├── model.ts          模型配置 + 取 key + 唯一的 pi-ai 调用点
 │   │   ├── registry.ts       工具注册表
 │   │   ├── hooks.ts          Hook 注册表(4 个挂载点)
+│   │   ├── context.ts        messages 形状的不变量(toolCall 必须配对)—— Step 5a
 │   │   └── loop.ts           ★ agent loop —— Step 2 之后只读
-│   ├── session/
-│   │   ├── types.ts          Entry 定义
-│   │   └── store.ts          JSONL append-only + parentId 回溯
+│   ├── session/              ★ harness:一次会话是什么,和终端无关 —— Step 5b
+│   │   ├── types.ts          Entry 定义(session / message / turn),parentId 串成树
+│   │   └── store.ts          JSONL append-only 写 + 四层校验的读 + --resume
 │   ├── features/             ★ 一个文件 = 一块积木,只通过 hooks 挂进去
 │   │   ├── memory.ts         Step 6
 │   │   ├── compaction.ts     Step 7
 │   │   ├── guard.ts          Step 8:出口白名单/路径/预算/外部数据标注
+│   │   ├── confirm.ts        不可逆的工具先问人 —— Step 8 权限确认的原型
 │   │   └── trace.ts          Step 9:trace + replay
 │   ├── tools/                ★ 旅行域
 │   │   ├── amap.ts           高德 REST 客户端(不是 tool)
@@ -103,7 +107,11 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   │   └── save-plan.ts
 │   ├── report.ts             TripPlan → 自包含 HTML
 │   ├── compose.ts            ★ 唯一接线处
-│   └── cli.ts                入口
+│   ├── terminal.ts           ★ 唯一碰 stdin/readline 的文件 —— Step 5a
+│   ├── terminal-asker.ts     Asker 的终端实现(只管排版)
+│   ├── render.ts             事件 → 终端文字,单轮多轮共用 —— Step 5a
+│   ├── repl.ts               多轮驱动 ★「轮次」只存在于这里 —— Step 5a
+│   └── cli.ts                入口:参数、资源、路由
 ├── data/                     gitignore:sessions/*.jsonl, memory.json
 └── out/                      gitignore:生成的 HTML
 ```
@@ -111,9 +119,9 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 ### 三层依赖方向(只允许往下)
 
 ```
-cli.ts / compose.ts          ← 知道一切
-   ↓
-features/  tools/            ← 知道下面两层,不知道彼此
+cli.ts / repl.ts / compose.ts          ← 知道一切
+   ↓                    ↘
+features/  tools/         terminal.ts / render.ts / terminal-asker.ts   ← 宿主设施
    ↓
 report.ts                    ← 只知道 trip-plan.ts
    ↓
@@ -129,10 +137,27 @@ trip-plan.ts   core/  session/   ← 什么都不知道
 > 这类事的处理方式是**改图,不是偷偷破例**。一条被违反过一次还留着的规则,
 > 下次就不会有人当真了。
 
+> **Step 5b 补充**:`session/` 从 repl.ts 里分出来了。5a 时「一次会话」那块逻辑
+> 混在终端循环里,当时是故意的 —— 只有一个宿主,提前拆就是在猜接口。
+> 5b 真要落盘、真要 `--resume`,边界立刻被逼出来:「历史怎么存、怎么校验、账怎么接」
+> 换成 HTTP 服务照样要,而「`/exit` 怎么打、Ctrl-C 按几次」不要。前者沉进 `session/`,
+> 后者留在 repl.ts。**混着的中间态是对的,拆的时机由需求定,不由洁癖定。**
+>
+> **Step 5a 补充**:「宿主设施」这一支是新拉出来的。触发它的是一件很具体的事 ——
+> REPL 要读一行,`ask_user` 也要读一行,而**终端只有一台**。
+> 实测同一个 stdin 上开两个 readline,一行输入会被送给**两个**接口(不是先到先得),
+> 于是「谁要读谁 createInterface」这条路直接死掉:设备必须有唯一持有者。
+> `terminal.ts` 就是那个持有者,`terminal-asker.ts` 退化成纯排版,
+> 连原来住在它里面的那把互斥锁也一起搬走了 —— **锁要跟着被保护的资源走**。
+>
+> 顺带把渲染从 `cli.ts` 拆成 `render.ts`:有了第二个驱动(repl),
+> 「单轮和多轮打出来的摘要格式必须一样」就成了硬要求,格式只能有一份。
+
 **自查命令**(每个 Step 收尾跑一次,应该无输出):
 
 ```sh
 grep -rn "城市\|景点\|旅行\|trip\|amap" src/core src/session | grep -vE ':[0-9]+:\s*(\*|//|/\*)'  # 域污染(跳过注释)
+grep -rn "node:readline\|process\.stdin" src | grep -v src/terminal.ts | grep -vE ':[0-9]+:\s*\*'  # 终端被第二个文件碰了
 grep -rn "from \"\.\./features\|from \"\.\./tools" src/core     # 依赖倒挂
 grep -rn '^import ' src | grep '@earendil-works/pi-ai' | grep -v 'import type' | grep -v core/model.ts  # 绕过 provider 边界(model.ts 是唯一合法的)
 find src -name '*.ts' -exec sh -c 'head -1 "$1" | grep -q "^/\*\*" || echo "缺文件头: $1"' _ {} \;
@@ -228,7 +253,7 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
 | 2 | v1-chat | 能调工具的对话循环 | 2 ✅ | `--trace` 打出 step/tool/hook 序列,turn 正常结束 |
 | 3 | v2-tools | 六个真工具 + 会追问,能出行程 | 2 ✅ | 一句话规划三天行程;信息不全会问;Ctrl-C 立刻停 |
 | 4 | v2-tools | 结构化产出 + HTML 报告 | 1 ✅ | `out/*.html` 双击可读,注入不执行 |
-| 5 | v3-session | 多轮对话 + 会话持久化 | 2 | 退出重进,历史还在 |
+| 5 | v3-session | 多轮对话 + 会话持久化 | 2 ✅ | 退出重进,历史还在 |
 | 6 | v4-memory | 跨会话记忆 | 1 | 新会话不推荐爬山 |
 | 7 | v5-compaction | 上下文压缩 | 1 | 触发压缩;压缩后跟的是**新**意图 |
 | 8 | v6-guard | 边界与拒答 | 2 | 对抗用例集全部被挡 |
@@ -243,8 +268,8 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
 | 2 | 2b | `hooks.ts` 接进 loop + `compose.ts` + 最小 `--trace` | ✅ 行为不变,挂载点就位 |
 | 3 | 3a | `tools/amap.ts` + `truncate.ts` + `weather`/`search_poi` 换真 API | ✅ 能查真天气真景点 |
 | 3 | 3b | `search_hotel` + `estimate_budget` + `ask_user` + **重写 system prompt** + 并行执行 + abort 贯穿 + 参数 Convert→Check | ✅ 能出完整行程,信息不全会问 |
-| 5 | 5a | REPL 多轮,`messages` 跨轮累积(仍在内存) | ✅ 能连着聊 |
-| 5 | 5b | `session/types.ts` + `store.ts` JSONL + `--resume` | ✅ 退出重进历史还在 |
+| 5 | 5a ✅ | REPL 多轮,`messages` 跨轮累积(仍在内存)+ `terminal.ts` 收口 stdin + 断链修补 | ✅ 能连着聊 |
+| 5 | 5b ✅ | `session/types.ts` + `store.ts` JSONL(parentId 树)+ `--resume` + 四层校验 | ✅ 退出重进历史还在 |
 | 8 | 8a | 域外拦截:`beforeStep` 廉价闸 + 拒答话术 + **对抗用例集** | ✅ 问 transformer 被拒 |
 | 8 | 8b | 注入标注 + 出口域名白名单 + 路径限制 + 调用预算 | ✅ 注入用例被挡,超预算停 |
 
@@ -260,7 +285,7 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
 **开场**(直接复制,只改编号):
 
 ```
-读 notes/travel-agent-notes/agent1-dev-workflow.md,执行 Step N 第 x 批。
+读 packages/pi-travel-agent/docs/agent1-dev-workflow.md,执行 Step N 第 x 批。
 代码在 packages/pi-travel-agent/。
 功能优先:这一批要交付一个能验收的切片,写不完就明说还差什么,别砍功能凑行数。
 新想法记进 BACKLOG.md,不当场做。
@@ -453,7 +478,7 @@ Step 8a 的主要产出不是那道闸,是**一组固定的对抗用例**(域外
 | 2 | context、event、hook 怎么配合 | Step 2 建骨架,Step 6-8 才验证 | `core/hooks.ts` + 三个 feature | Step 8 之后 `beforeToolCall` 上会挂着 2 个 handler(guard + memory),那时才有「多 handler 串起来」可讲 |
 | 3 | 工具调用怎么执行 | Step 3(3b) | `core/loop.ts` 的 execute 段 | 原计划把并行和 abort 放进「选做」,现在提到 Step 3b——否则这题只能答一半 |
 | 4 | 长上下文怎么压缩 | Step 7 | `features/compaction.ts` | 阈值调到 20k 真触发一次,并回答「压缩后追问细节还答得上吗」 |
-| 5 | session 怎么持久化和恢复 | Step 5(5b) | `session/store.ts` | 手改 JSONL 制造一次断链,确认报错而不是静默跳过。5a 的 REPL 是它的前提 |
+| 5 ✅ | session 怎么持久化和恢复 | Step 5(5b) | `session/store.ts` + **`docs/answers/q5-session.md`**(27 处行号引用,有脚本校验) | 四种手改都验过了:非法 JSON(报行号)、id 重复(报行号)、`parentId` 指向不存在的 id、删掉 toolResult 再把链接好。**四种全部报错,一种都不跳过**。`/new` 用换父节点表达,旧分支一条不删 —— 这是「树」这个设计唯一被真正用到的地方 |
 | 6 | 安全边界怎么设计,和沙箱是不是一回事 | Step 8(8a 拒答 / 8b 边界) | `features/guard.ts` | 见下。域外拦截和注入是两个方向,详见[意图与拒答](#三五意图与拒答) |
 | 7 | 出错了怎么定位,幻觉还是 agent bug | Step 9 | `--trace` / `--replay` | 见下 |
 | 8 | 用不用 MCP,无状态和有状态什么区别 | Step 10 | MCP 版 weather | 见下 |
