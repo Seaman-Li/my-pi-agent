@@ -39,8 +39,8 @@ node src/cli.ts [--model <名字>] [--thinking] [--trace] [--chat] ["你的问�
 
 | 开关 | 作用 | 备注 |
 |---|---|---|
-| `--model` | 选 provider，默认 `qwen`（云端 dashscope） | 可用值 = `src/core/model.ts` 的 `PROVIDERS` 的键；写错会报「未知模型」并列出可用的 |
-| `--thinking` | 开思考，正文前出灰色 `[思考]` 段 | 本地小模型**别开**，见下 |
+| `--model` | 选 provider，默认 `qwen`（云端 dashscope） | 现有三个：`qwen`（dashscope）、`deepseek`（官方 API）、`local`（局域网 Ollama）。可用值 = `src/core/model.ts` 的 `PROVIDERS` 的键；写错会报「未知模型」并列出可用的 |
+| `--thinking` | 开思考，正文前出灰色 `[思考]` 段 | 本地小模型**别开**，见下。`--model deepseek` 时它会被 `clampThinkingLevel` 抬到 `reasoning_effort: "high"`——那条路上没有中低档，代价不是「开一点点」 |
 | `--trace` | 往 stderr 打四个挂载点的进出 | 不影响 stdout，可以 `2>/dev/null` 只看正文 |
 | `--chat` | 给了话也进多轮 | 不给话时本来就是多轮，这个开关是给「第一句写在命令行里」用的 |
 | `--resume[=<id>]` | 恢复会话，隐含进多轮 | 写成 `--resume=<id>` 而不是 `--resume <id>`——后者没法和 prompt 区分开 |

@@ -32,7 +32,8 @@ const USAGE = `用法:
   node src/cli.ts --sessions          列出最近的会话
 
 开关:
-  --model <qwen|local>  选模型,默认 ${DEFAULT_MODEL}
+  --model <qwen|local|deepseek>
+                        选模型,默认 ${DEFAULT_MODEL}
   --thinking            打开思考
   --trace               把四个挂载点的进出打到 stderr
   --no-memory           这次不读也不写 data/memory.json

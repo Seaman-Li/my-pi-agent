@@ -67,6 +67,46 @@ const OLLAMA_COMPAT: OpenAICompletionsCompat = {
 };
 
 /**
+ * DeepSeek 官方 API 的兼容差异。
+ *
+ * 和 dashscope、Ollama 那两套一样,这些是**协议事实**不是部署配置,所以写死在代码里。
+ * 数值不是猜的,抄 pi 自己的:packages/ai/src/providers/data/deepseek.json
+ *
+ * `thinkingFormat: "deepseek"`:思考开关是 `thinking: { type: "enabled" | "disabled" }`,
+ * 不是 `reasoning_effort`(那个另外发,见 `deepseekFromEnv`)。**不带 `--thinking` 时会显式发
+ * `disabled`**,不是什么都不发 —— 这点和 qwen 不一样。
+ *
+ * `requiresReasoningContentOnAssistantMessages`:DeepSeek 要求把它上一轮吐的
+ * `reasoning_content` 原样带回去。pi-ai 负责回填,但得靠这个开关才知道该回填。
+ *
+ * pi-ai 的 `detectCompat` 认得 `deepseek.com` 这个域名,这三条它自己也推得出来
+ * (api/openai-completions.ts:1488)。仍然写明白,是因为**推断出来的东西不写在这儿就没人看得见** ——
+ * 哪天换个自建网关、域名一变,这些会悄悄失效,而症状是「模型忽然不肯思考了」这种查不动的问题。
+ * `getCompat` 是逐字段 `??` 合并的(:1542),显式给的赢,没给的仍走探测。
+ */
+const DEEPSEEK_COMPAT: OpenAICompletionsCompat = {
+	supportsStore: false,
+	supportsDeveloperRole: false,
+	requiresReasoningContentOnAssistantMessages: true,
+	thinkingFormat: "deepseek",
+};
+
+/**
+ * 价格,**美元 / 百万 token**(`calculateCost` 就是按这个单位除的,models.ts:892)。同样抄 deepseek.json。
+ *
+ * qwen 那边全填 0,DeepSeek 这边填真数 —— 因为它是这个项目里**第一个会上报
+ * `cached_tokens` 的 provider**(qwen3.6-plus 连这个字段都不返回)。`cacheRead` 比 `input`
+ * 便宜两个数量级(0.0028 vs 0.14),不填真价的话,摘要行里那个 `$` 看不出缓存到底省了多少。
+ *
+ * 认不出的 model id 一律记 0:**不猜价**。表现是摘要行里没有 `$`,而不是一个编出来的数。
+ * 加新型号 = 这里加一行,不用动别处。
+ */
+const DEEPSEEK_COST: Record<string, Model<"openai-completions">["cost"]> = {
+	"deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0 },
+	"deepseek-v4-pro": { input: 0.435, output: 0.87, cacheRead: 0.003625, cacheWrite: 0 },
+};
+
+/**
  * 读一个必填环境变量。
  *
  * @throws 缺失或为空串时抛。空串按缺失处理 —— `TRAVEL_MODEL_ID=` 是配错了,
@@ -150,7 +190,52 @@ function ollamaFromEnv(): ModelSpec {
 	};
 }
 
-const PROVIDERS: Record<string, () => ModelSpec> = { qwen: qwenFromEnv, local: ollamaFromEnv };
+/**
+ * DeepSeek 官方 API。
+ *
+ * `thinkingLevelMap` 抄 deepseek.json,低三档全是 `null`。**null 的意思是「这档不存在」**,
+ * 而 `clampThinkingLevel` 遇到不存在的档位会**往上取最近的可用档**(models.ts:923):
+ * 可用档只剩 off / high / max,于是 `low → medium(也没有)→ high`。
+ *
+ * 所以 `--thinking` 在这条路上**不是「开一点点思考」,是直接开到 high**。实测发出去的 body:
+ *
+ * | 命令 | body 里的思考字段 |
+ * |---|---|
+ * | 不带 `--thinking` | `thinking: { type: "disabled" }` |
+ * | 带 `--thinking` | `thinking: { type: "enabled" }` + `reasoning_effort: "high"` |
+ *
+ * qwen 那边 `--thinking` 只是 `enable_thinking: true`,没有档位之分 —— 同一个开关,
+ * 在两个 provider 上的**代价差得远**,DeepSeek 是按 token 真收钱的。
+ *
+ * 窗口和 maxTokens 走 .env 而不是写死:和 qwen 同一条理由,它们是**这次跑用什么档位**,
+ * 换个型号就得改。协议事实(compat、价格)才留在代码里。
+ */
+function deepseekFromEnv(): ModelSpec {
+	const id = requireEnv("DEEPSEEK_MODEL_ID");
+	return {
+		model: {
+			id,
+			name: id,
+			api: "openai-completions",
+			provider: "deepseek",
+			baseUrl: requireEnv("DEEPSEEK_BASE_URL"),
+			reasoning: true,
+			thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", max: "max" },
+			input: ["text"],
+			contextWindow: envNumber("DEEPSEEK_CONTEXT_WINDOW"),
+			maxTokens: envNumber("DEEPSEEK_MAX_TOKENS"),
+			cost: DEEPSEEK_COST[id] ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			compat: DEEPSEEK_COMPAT,
+		},
+		apiKeySource: requireEnv("DEEPSEEK_API_KEY_SOURCE"),
+	};
+}
+
+const PROVIDERS: Record<string, () => ModelSpec> = {
+	qwen: qwenFromEnv,
+	local: ollamaFromEnv,
+	deepseek: deepseekFromEnv,
+};
 
 export const DEFAULT_MODEL = "qwen";
 
