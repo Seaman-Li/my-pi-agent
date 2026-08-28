@@ -138,11 +138,50 @@ execute(params: Static<S>, ctx: ToolContext): Promise<ToolResult>
 | | 重复前缀 | 该压什么 |
 |---|---|---|
 | `qwen3.6-plus` | 全价 | 整个上下文 |
-| `deepseek` | 1/50(`cacheRead` $0.0028 vs `input` $0.14) | 只有新增的那部分,主要是 `toolResult` |
+| `deepseek` | 1/31(`cacheRead` $0.007 vs `input` $0.22) | 只有新增的那部分,主要是 `toolResult` |
 
 所以 Step 7 **不能定一个写死的阈值**。要么按 `contextWindow` 的百分比(和价格无关),
 要么把「这个 provider 报不报缓存」变成 `ModelSpec` 上的一个字段,阈值跟着它走。
 先做哪个到时候再说,但**写死一个数是错的**这件事现在就定了。
+
+## `reserve` 也不能是常数 —— Step 7
+
+计划里抄的那三行判定是 `shouldCompact(ctx, contextWindow, reserveTokens = 16384)`。
+`reserve` 的含义是「给这次的输出留多少」,可 `maxTokens` 在三条 provider 上差 23 倍:
+
+| | contextWindow | maxTokens | reserve=16384 够吗 |
+|---|---|---|---|
+| `qwen3.6-plus` | 1M(**输入上限 991.8K**) | 65,536 | 差 4 倍 |
+| `deepseek-v4-flash` | 1M | 384,000 | **差 23 倍** |
+| local ollama | 8,192 | 2,048 | 勉强 |
+
+现在没出事是巧合:`1000000 − 16384 = 983,616`,正好落在 qwen 的 991.8K 输入上限里面。
+换到 deepseek、模型真吐满 384K 的话,`983K 输入 + 384K 输出 = 1.37M > 1M`,provider 甩 400。
+
+**`reserve` 该跟着 `maxTokens` 走**(至少 `max(maxTokens, 某个下限)`),这条现在就定,
+不用等做的时候再想。顺带记住一个语义差别:`contextWindow` 是**总信封**,不是最大输入 ——
+qwen 的模型卡写得很清楚,1M 里输入最多占 991.8K。
+
+这也是 `contextWindow` 这个字段**第一次被人读**:`grep -rn contextWindow src/` 目前只有
+`model.ts` 自己往里写,没有一处读。所以那几个数**从来没被验证过**,是 Step 7 开工前
+先该实测的东西 —— 已经查过一轮,1M / 384K / 65,536 三个来源对得上(pi 的
+`deepseek.json`、官方 api-docs、模型卡),但「查过文档」和「实测撞过上限」还是两回事。
+
+## 成本表装不下按时段计价 —— 抽框架包那一刻
+
+`Model.cost` 是一张静态表(`{ input, output, cacheRead, cacheWrite }`),而 DeepSeek
+自 **2026-08-16** 起按时段计价:峰时(UTC 01:00-04:00、06:00-10:00,周一到周五)翻倍。
+也就是说真实单价取决于「这次请求发生在几点」,**这个形状表达不了**。
+
+现在的做法是填 off-peak 价,有意选偏低的那头 —— 一个偏低的数方向明确(真实花费不会更少),
+填峰时价会让 off-peak 的账凭空翻倍。
+
+真要修得让 `cost` 变成函数,而它是 pi-ai 那一层的类型,不是我们能在这个包里改的。
+抽框架包时如果要自己定义 `ModelSpec`,顺手把这个口子留出来。
+
+**留这条记录是因为它是一类问题的样板**:抄上游的配置表会连它的**时效**一起抄进来。
+`DEEPSEEK_COST` 一开始是照抄 pi 的 `packages/ai/src/providers/data/deepseek.json`,
+那张表停在 2026-04-24 那版,比涨价早 13 天 —— 抄的时候两边都对,过一阵就只有一边对了。
 
 ## 压缩之后 JSONL 怎么记 —— Step 7
 

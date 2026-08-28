@@ -92,18 +92,28 @@ const DEEPSEEK_COMPAT: OpenAICompletionsCompat = {
 };
 
 /**
- * 价格,**美元 / 百万 token**(`calculateCost` 就是按这个单位除的,models.ts:892)。同样抄 deepseek.json。
+ * 价格,**美元 / 百万 token**(`calculateCost` 就是按这个单位除的,models.ts:892)。
  *
  * qwen 那边全填 0,DeepSeek 这边填真数 —— 因为它是这个项目里**第一个会上报
  * `cached_tokens` 的 provider**(qwen3.6-plus 连这个字段都不返回)。`cacheRead` 比 `input`
- * 便宜两个数量级(0.0028 vs 0.14),不填真价的话,摘要行里那个 `$` 看不出缓存到底省了多少。
+ * 便宜 31 倍,不填真价的话,摘要行里那个 `$` 看不出缓存到底省了多少。
+ *
+ * **这里填的是 off-peak 价,而账因此是偏低的。** 一开始是照抄 pi 的
+ * `packages/ai/src/providers/data/deepseek.json`,后来查官方定价页发现那张表停在
+ * 2026-04-24 那版(flash `0.14 / 0.0028 / 0.28`);DeepSeek 从 **2026-08-16 起改成按时段计价**,
+ * 峰时(UTC 01:00-04:00、06:00-10:00,周一到周五)翻倍。
+ *
+ * 也就是说 **`cost` 这个字段的形状就装不下现在的价**:它是一张静态表,而真实单价取决于
+ * 「这次请求发生在几点」。填 off-peak 是有意选偏低的那头 —— 一个偏低的数至少方向明确
+ * (真实花费不会更少),而填峰时价会让 off-peak 的账凭空翻倍。想要准的,得让 `cost`
+ * 变成一个函数,那是 pi-ai 那一层的事,不是我们能在这儿修的。见 BACKLOG。
  *
  * 认不出的 model id 一律记 0:**不猜价**。表现是摘要行里没有 `$`,而不是一个编出来的数。
  * 加新型号 = 这里加一行,不用动别处。
  */
 const DEEPSEEK_COST: Record<string, Model<"openai-completions">["cost"]> = {
-	"deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0 },
-	"deepseek-v4-pro": { input: 0.435, output: 0.87, cacheRead: 0.003625, cacheWrite: 0 },
+	"deepseek-v4-flash": { input: 0.22, output: 0.66, cacheRead: 0.007, cacheWrite: 0 },
+	"deepseek-v4-pro": { input: 0.66, output: 1.98, cacheRead: 0.022, cacheWrite: 0 },
 };
 
 /**
@@ -208,7 +218,10 @@ function ollamaFromEnv(): ModelSpec {
  * 在两个 provider 上的**代价差得远**,DeepSeek 是按 token 真收钱的。
  *
  * 窗口和 maxTokens 走 .env 而不是写死:和 qwen 同一条理由,它们是**这次跑用什么档位**,
- * 换个型号就得改。协议事实(compat、价格)才留在代码里。
+ * 换个型号就得改。留在代码里的是 `compat` —— 那是协议事实,不会因为换型号而变。
+ *
+ * **价格是第三类,两边都不太对**:它既不随档位变(不该进 .env),也不是协议事实
+ * (它会过期,而且现在还按时段浮动)。放在 `DEEPSEEK_COST` 是权宜,见那里的注释和 BACKLOG。
  */
 function deepseekFromEnv(): ModelSpec {
 	const id = requireEnv("DEEPSEEK_MODEL_ID");
