@@ -127,6 +127,23 @@ execute(params: Static<S>, ctx: ToolContext): Promise<ToolResult>
 等真觉得需要了再做。做的时候注意 `written` 那个计数器要跟着重算,
 不然 `sync` 会把已经落盘的消息又追加一遍。
 
+## 压缩阈值要跟着 provider 的缓存能力走 —— Step 7
+
+原来这条写的是「prompt 缓存时命中时不命中,条件不知道」。**已经查清了,不是悬案** ——
+是 08-28 换模型换掉的:`qwen3.7-plus` 会返回 `cached_tokens`,`qwen3.6-plus` 连这个字段都不返回
+(3.7 免费额度用完了才换的)。完整排查记录见 [`docs/prompt-cache.md`](docs/prompt-cache.md)。
+
+**留下来的真问题**:重复前缀的价格在两个 provider 上差一个数量级 ——
+
+| | 重复前缀 | 该压什么 |
+|---|---|---|
+| `qwen3.6-plus` | 全价 | 整个上下文 |
+| `deepseek` | 1/50(`cacheRead` $0.0028 vs `input` $0.14) | 只有新增的那部分,主要是 `toolResult` |
+
+所以 Step 7 **不能定一个写死的阈值**。要么按 `contextWindow` 的百分比(和价格无关),
+要么把「这个 provider 报不报缓存」变成 `ModelSpec` 上的一个字段,阈值跟着它走。
+先做哪个到时候再说,但**写死一个数是错的**这件事现在就定了。
+
 ## 压缩之后 JSONL 怎么记 —— Step 7
 
 Step 7 要做上下文压缩:一段历史被换成一句摘要。这件事在 append-only 的记录里

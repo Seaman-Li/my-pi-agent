@@ -99,9 +99,14 @@ export function createRenderer(): EventSink {
  * 「这轮产生了多少」,没有信息量;多轮之下它是唯一能一眼看见「历史在涨」的数字 ——
  * 而历史在涨正是 `in` 也跟着涨的原因,两个数放一起才讲得通。
  *
- * `cache` 也是 Step 5 才有意义的:多轮之下前缀高度重合,dashscope 会把命中缓存的
- * 那部分从 `input` 里扣掉单独记。**不把它打出来,`in` 会看着莫名其妙地变小** ——
- * 实测第二轮 `in` 从 2677 掉到 507,不是历史变短了,是 2000 多进了 cacheRead。
+ * `cache` 也是 Step 5 才有意义的:多轮之下前缀高度重合,provider 会把命中缓存的
+ * 那部分从 `input` 里扣掉单独记(`in` 其实是**减出来**的:`prompt_tokens − cached_tokens`,
+ * 见 packages/ai/src/api/openai-completions.ts:1385)。
+ * **不把它打出来,`in` 会看着莫名其妙地变小** ——
+ * 实测 `qwen3.7-plus` 第二轮 `in` 从 2677 掉到 507,不是历史变短了,是 2000 多进了 cacheRead。
+ *
+ * **模型名不是可省的**:同一份代码在 `qwen3.6-plus` 上这一项恒为 0(它根本不返回
+ * `cached_tokens` 字段),在 DeepSeek 上又能到 96%。见 docs/prompt-cache.md。
  */
 export function formatTurnSummary(spec: ModelSpec, result: TurnResult, context: Context, turn?: number): string {
 	const { usage } = result;

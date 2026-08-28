@@ -77,6 +77,8 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   ├── agent1-travel-plan.md      实施计划
 │   ├── agent1-dev-workflow.md     本文件:文件结构与开发流程
 │   ├── memory.md             Step 6 产出:什么时候记、怎么影响上下文
+│   ├── prompt.md             每次发给模型的三块:systemPrompt / tools / messages
+│   ├── prompt-cache.md       缓存为什么归零的排查记录(方法比结论重要)
 │   ├── answers/              ★ 八个问题的答案,每篇引用自己代码的行号
 │   └── debugging.md          Step 9 产出:幻觉 vs agent bug 判据表
 ├── prompts/
