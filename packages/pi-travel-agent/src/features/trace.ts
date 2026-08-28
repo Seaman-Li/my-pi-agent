@@ -42,11 +42,15 @@ export function installTrace(hooks: Hooks): void {
 		const mark = result.isError ? "ERR" : "ok";
 		line(`afterToolCall   #${step}  ${toolCall.name} ${mark} ${brief(textOf(result.content))}`);
 	});
-	hooks.afterStep.push(({ step, message, results }) => {
+	// `sys=` 挂在 afterStep 而不是 beforeStep:注入 system prompt 的 handler
+	// 也在 beforeStep 上,而且排在 trace 后面 —— 在那儿打出来的是**注入之前**的长度,
+	// 正好错过要看的东西。afterStep 拿到的才是这一步真正发出去的那份。
+	// Q7 的分诊线要的就是它:模型忘了「不爬山」时,先看这个数有没有比 base 大。
+	hooks.afterStep.push(({ step, message, results, context }) => {
 		const kinds = message.content.map((block) => block.type).join(",") || "empty";
 		line(
 			`afterStep   #${step}  stop=${message.stopReason} content=[${kinds}]` +
-				` out=${message.usage.output} tools=${results.length}`,
+				` out=${message.usage.output} tools=${results.length} sys=${context.systemPrompt?.length ?? 0}`,
 		);
 	});
 }

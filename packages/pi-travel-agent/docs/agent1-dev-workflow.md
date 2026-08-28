@@ -76,10 +76,12 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 ├── docs/
 │   ├── agent1-travel-plan.md      实施计划
 │   ├── agent1-dev-workflow.md     本文件:文件结构与开发流程
+│   ├── memory.md             Step 6 产出:什么时候记、怎么影响上下文
 │   ├── answers/              ★ 八个问题的答案,每篇引用自己代码的行号
 │   └── debugging.md          Step 9 产出:幻觉 vs agent bug 判据表
 ├── prompts/
-│   └── system.md
+│   ├── system.md
+│   └── extract.md            Step 6:从转录里抽长期偏好的规则(域知识,不进 memory/)
 ├── src/
 │   ├── core/                 ★ 通用层,不含任何「旅行」字样,Agent 2 直接搬
 │   │   ├── types.ts          Tool / ToolResult / StepContext / Hook 上下文
@@ -91,8 +93,12 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   ├── session/              ★ harness:一次会话是什么,和终端无关 —— Step 5b
 │   │   ├── types.ts          Entry 定义(session / message / turn),parentId 串成树
 │   │   └── store.ts          JSONL append-only 写 + 四层校验的读 + --resume
+│   ├── memory/               ★ harness:用户是个什么样的人,和旅行无关 —— Step 6
+│   │   ├── types.ts          MemoryItem / 三类 kind / 上限
+│   │   ├── store.ts          整体读整体写(.tmp + rename),手改坏了当场报错
+│   │   └── extract.ts        会话散场后抽一次(规则在 prompts/extract.md)
 │   ├── features/             ★ 一个文件 = 一块积木,只通过 hooks 挂进去
-│   │   ├── memory.ts         Step 6
+│   │   ├── memory.ts         Step 6:记忆 → systemPrompt,挂 beforeStep
 │   │   ├── compaction.ts     Step 7
 │   │   ├── guard.ts          Step 8:出口白名单/路径/预算/外部数据标注
 │   │   ├── confirm.ts        不可逆的工具先问人 —— Step 8 权限确认的原型
@@ -104,6 +110,7 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   │   ├── search-poi.ts
 │   │   ├── search-hotel.ts
 │   │   ├── estimate-budget.ts
+│   │   ├── remember.ts       Step 6:记忆的显式写入口(记 / 忘)
 │   │   └── save-plan.ts
 │   ├── report.ts             TripPlan → 自包含 HTML
 │   ├── compose.ts            ★ 唯一接线处
@@ -254,7 +261,7 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
 | 3 | v2-tools | 六个真工具 + 会追问,能出行程 | 2 ✅ | 一句话规划三天行程;信息不全会问;Ctrl-C 立刻停 |
 | 4 | v2-tools | 结构化产出 + HTML 报告 | 1 ✅ | `out/*.html` 双击可读,注入不执行 |
 | 5 | v3-session | 多轮对话 + 会话持久化 | 2 ✅ | 退出重进,历史还在 |
-| 6 | v4-memory | 跨会话记忆 | 1 | 新会话不推荐爬山 |
+| 6 ✅ | v4-memory | 跨会话记忆 | 1 ✅ | 新会话不推荐爬山 —— **但验收地点要选对**,见下 |
 | 7 | v5-compaction | 上下文压缩 | 1 | 触发压缩;压缩后跟的是**新**意图 |
 | 8 | v6-guard | 边界与拒答 | 2 | 对抗用例集全部被挡 |
 | 9 | v7-debug | 可定位:trace + replay | 1 | 同一 session 能重放,结论可复现 |
@@ -277,6 +284,15 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
 >
 > Step 3b 的 `ask_user` 和 system prompt 重写也是补的:原计划全程没提**意图不完整时怎么办**。
 > 详见下面「意图与拒答」。
+
+> Step 6 的验收句「新会话不推荐爬山」差点白验:第一次拿**桂林**试,记忆开着的那次没推爬山 ——
+> 可是 `--no-memory` 的对照组**也没推**。桂林两天的标准答案本来就是坐船加骑行,
+> 这个目的地对「爬不爬山」根本没有区分度。换成**黄山**才分得开:不带记忆是光明顶、
+> 西海大峡谷、迎客松、9 次索道;带记忆直接放弃登顶,改宏村加屯溪老街的平地游。
+>
+> 教训不是「换个城市」,是**一句验收词必须配一个会失败的对照组**。
+> 「A 情况下没发生 X」不算证据,「B 情况下发生了 X 而 A 情况下没有」才算。
+> 这条对后面每个 Step 都成立。
 
 预计 14 批、约 3100 行。**这是预估不是预算**:某一批写着写着发现是两批,就拆成两批。
 
@@ -475,7 +491,7 @@ Step 8a 的主要产出不是那道闸,是**一组固定的对抗用例**(域外
 | # | 问题 | 落在 | 代码产出 | 光有代码还不够,要额外做的事 |
 |---|---|---|---|---|
 | 1 | 一次 prompt 如何进入 loop,turn 怎么结束 | Step 2 | `core/loop.ts` | 把 **turn 的四个结束条件**在代码里写成一个显式函数,不要散在 while 条件里:无 toolCall / stopReason≠toolUse / abort / 触顶 maxSteps |
-| 2 | context、event、hook 怎么配合 | Step 2 建骨架,Step 6-8 才验证 | `core/hooks.ts` + 三个 feature | Step 8 之后 `beforeToolCall` 上会挂着 2 个 handler(guard + memory),那时才有「多 handler 串起来」可讲 |
+| 2 | context、event、hook 怎么配合 | Step 2 建骨架,Step 6-8 才验证 | `core/hooks.ts` + 四个 feature | ~~`beforeToolCall` 上挂 guard + memory~~ —— Step 6 做下来发现**记忆不该挂在这个点上**:注入上下文和拦截调用是两件事,凑在一个点上只会让顺序变得要紧而没有理由。实际是 `beforeStep` 挂 memory(`features/memory.ts`)、`beforeToolCall` 挂 confirm,Step 8 的 guard 上来之后 `beforeToolCall` 才有两个 handler。「多 handler 串起来」照样有得讲,而且多出一条「怎么选挂载点」 |
 | 3 | 工具调用怎么执行 | Step 3(3b) | `core/loop.ts` 的 execute 段 | 原计划把并行和 abort 放进「选做」,现在提到 Step 3b——否则这题只能答一半 |
 | 4 | 长上下文怎么压缩 | Step 7 | `features/compaction.ts` | 阈值调到 20k 真触发一次,并回答「压缩后追问细节还答得上吗」 |
 | 5 ✅ | session 怎么持久化和恢复 | Step 5(5b) | `session/store.ts` + **`docs/answers/q5-session.md`**(27 处行号引用,有脚本校验) | 四种手改都验过了:非法 JSON(报行号)、id 重复(报行号)、`parentId` 指向不存在的 id、删掉 toolResult 再把链接好。**四种全部报错,一种都不跳过**。`/new` 用换父节点表达,旧分支一条不删 —— 这是「树」这个设计唯一被真正用到的地方 |

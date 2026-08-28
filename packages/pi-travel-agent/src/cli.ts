@@ -13,11 +13,13 @@ import type { Context } from "@earendil-works/pi-ai";
 import { type Composed, compose } from "./compose.ts";
 import { runTurn } from "./core/loop.ts";
 import { DEFAULT_MODEL, type ModelSpec, resolveApiKey, resolveModel } from "./core/model.ts";
-import { createRenderer, formatTurnSummary } from "./render.ts";
+import { extractMemories } from "./memory/extract.ts";
+import { type MemoryStore, openMemory } from "./memory/store.ts";
+import { createRenderer, DIM, formatTurnSummary, RESET } from "./render.ts";
 import { runRepl } from "./repl.ts";
 import { createSession, hashPrompt, listSessions, resumeSession } from "./session/store.ts";
+import { isInteractive, openTerminal, type Terminal } from "./terminal.ts";
 import { createTerminalAsker } from "./terminal-asker.ts";
-import { type Terminal, isInteractive, openTerminal } from "./terminal.ts";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -33,6 +35,7 @@ const USAGE = `用法:
   --model <qwen|local>  选模型,默认 ${DEFAULT_MODEL}
   --thinking            打开思考
   --trace               把四个挂载点的进出打到 stderr
+  --no-memory           这次不读也不写 data/memory.json
   --help                这份说明
 `;
 
@@ -79,6 +82,8 @@ interface Args {
 	sessions: boolean;
 	/** `undefined` = 不恢复;`""` = 恢复最近一个;其余 = 恢复这个 id。 */
 	resume: string | undefined;
+	/** 跨会话记忆开不开。`--no-memory` 关。 */
+	memory: boolean;
 }
 
 /**
@@ -95,6 +100,7 @@ function parseArgs(argv: string[]): Args {
 	let chat = false;
 	let help = false;
 	let sessions = false;
+	let memory = true;
 	let resume: string | undefined;
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i]!;
@@ -108,6 +114,8 @@ function parseArgs(argv: string[]): Args {
 			chat = true;
 		} else if (arg === "--sessions") {
 			sessions = true;
+		} else if (arg === "--no-memory") {
+			memory = false;
 		} else if (arg === "--resume") {
 			// 写成 `--resume=<id>` 而不是 `--resume <id>`:后者没法区分
 			// 「恢复最近一个,然后问这句话」和「恢复这个 id」—— 会把 prompt 吃掉。
@@ -120,7 +128,7 @@ function parseArgs(argv: string[]): Args {
 			rest.push(arg);
 		}
 	}
-	return { prompt: rest.join(" "), model, thinking, trace, chat, help, sessions, resume };
+	return { prompt: rest.join(" "), model, thinking, trace, chat, help, sessions, resume, memory };
 }
 
 /**
@@ -160,6 +168,49 @@ async function runOnce(
 }
 
 /**
+ * 散场之后抽记忆最多等这么久。用户已经说完再见了,超过这个数就不值得再等 ——
+ * 大不了这次没收成,下次对话再说一遍。
+ */
+const EXTRACT_TIMEOUT_MS = 25_000;
+
+/**
+ * 会话散场之后回看一遍转录,把长期偏好收进记忆。
+ *
+ * 放在 `runRepl` **返回之后**而不是 repl.ts 里面:repl 只该管「终端上那个 while」,
+ * 它不认识记忆、不认识旅行 —— 这条边界是将来把 repl.ts 整个搬进框架包的前提。
+ * 代价是这行提示落在「会话结束」那行之后,而那正好也是它该在的位置。
+ *
+ * 这时候 readline 已经关了,所以 Ctrl-C 又回到了 `process` 上(terminal.ts 里有实测)。
+ *
+ * 出了任何事都只打一行、不改退出码:这一步跑不成,不影响这次对话已经完成的事。
+ */
+async function harvest(setup: {
+	spec: ModelSpec;
+	apiKey: string;
+	store: MemoryStore;
+	context: Context;
+}): Promise<void> {
+	const controller = new AbortController();
+	const onInterrupt = () => controller.abort();
+	process.on("SIGINT", onInterrupt);
+	try {
+		const result = await extractMemories({
+			spec: setup.spec,
+			apiKey: setup.apiKey,
+			prompt: readFileSync(join(PACKAGE_ROOT, "prompts", "extract.md"), "utf8"),
+			messages: setup.context.messages,
+			store: setup.store,
+			signal: AbortSignal.any([controller.signal, AbortSignal.timeout(EXTRACT_TIMEOUT_MS)]),
+		});
+		process.stdout.write(`${DIM}[记忆] ${result.note}(现有 ${setup.store.items().length} 条)${RESET}\n`);
+	} catch (error) {
+		process.stderr.write(`[记忆] 这次没收成:${error instanceof Error ? error.message : String(error)}\n`);
+	} finally {
+		process.off("SIGINT", onInterrupt);
+	}
+}
+
+/**
  * 读配置 → 装配 → 路由。
  *
  * @returns 进程退出码
@@ -187,20 +238,33 @@ async function main(): Promise<number> {
 
 	const spec = resolveModel(args.model);
 	const apiKey = resolveApiKey(spec.apiKeySource);
-	const systemPrompt = withToday(readFileSync(join(PACKAGE_ROOT, "prompts", "system.md"), "utf8"));
+	/**
+	 * `rules` 和 `systemPrompt` 要分开拿,因为**只有前者该进 promptHash**。
+	 *
+	 * promptHash 回答的是「这段历史是不是在同一套规则下产生的」。而 `withToday`
+	 * 每天都不一样、记忆块每记一条就变 —— 把它们算进去的话,昨天的会话今天 `--resume`
+	 * 必然报「system prompt 变了」。**每次都报的提醒等于没有提醒**,真改了规则那次也认不出来。
+	 */
+	const rules = readFileSync(join(PACKAGE_ROOT, "prompts", "system.md"), "utf8");
+	const systemPrompt = withToday(rules);
 	const context: Context = { systemPrompt, messages: [] };
+	const memoryPath = join(PACKAGE_ROOT, "data", "memory.json");
 
 	/**
 	 * 装配。`asker` 只在**有终端而且是真人在敲**时才给。
 	 *
 	 * 管道喂进来的 chat 不算:那些行是一轮一轮的**提问**,`ask_user` 一旦注册,
 	 * 它会把下一行当成答复吃掉,静默少跑一轮 —— 比「不会追问」难查得多。
+	 *
+	 * `basePrompt` 给的是 `systemPrompt`(含「今天」不含记忆)—— 和 `context.systemPrompt`
+	 * 初值是同一份,这样记忆注入是「重新拼」而不是「往后接」。
 	 */
-	const build = (terminal: Terminal | undefined): Composed =>
+	const build = (terminal: Terminal | undefined, memory: MemoryStore | undefined): Composed =>
 		compose({
 			outDir: join(PACKAGE_ROOT, "out"),
 			trace: args.trace,
 			asker: terminal && isInteractive() ? createTerminalAsker(terminal) : undefined,
+			memory: memory && { store: memory, basePrompt: systemPrompt },
 		});
 
 	const reasoning = args.thinking ? ("low" as const) : undefined;
@@ -208,13 +272,15 @@ async function main(): Promise<number> {
 	// 两条路各自决定要不要终端。单轮 + 管道两头不沾,根本不开 ——
 	// 开着就得记得关(readline 不关,Node 不肯退),不开就没这回事。
 	if (!chat) {
+		const memory = args.memory ? openMemory(memoryPath) : undefined;
 		const terminal = isInteractive() ? openTerminal() : undefined;
 		context.messages.push({ role: "user", content: args.prompt, timestamp: Date.now() });
-		return runOnce({ spec, apiKey, context, terminal }, build(terminal), reasoning);
+		return runOnce({ spec, apiKey, context, terminal }, build(terminal, memory), reasoning);
 	}
-	const terminal = openTerminal();
-	const composed = build(terminal);
-	const promptHash = hashPrompt(systemPrompt);
+
+	// **开终端放在这一段的最后。** 上面这几步都可能抛(会话文件被手改坏、记忆文件被手改坏),
+	// 而 readline 一旦开着,Node 就不肯退 —— 屏幕上会是「一条错误 + 一个不动的进程」。
+	const promptHash = hashPrompt(rules);
 	const restored =
 		args.resume === undefined ? undefined : resumeSession(dataDir, { id: args.resume || undefined, promptHash });
 	if (restored) {
@@ -225,7 +291,13 @@ async function main(): Promise<number> {
 			process.stderr.write("[提示] 这个会话存的时候 system prompt 和现在不一样,行为可能对不上\n");
 		}
 	}
-	return runRepl({
+	const session = restored?.session ?? createSession(dataDir, { model: spec.model.id, promptHash });
+	// 记忆条目上盖一个会话号:人翻 memory.json 看到一条离谱的记忆,能顺着它回到当时的对话。
+	const memory = args.memory ? openMemory(memoryPath, { session: session.id }) : undefined;
+	const terminal = openTerminal();
+	const composed = build(terminal, memory);
+
+	const code = await runRepl({
 		spec,
 		apiKey,
 		context,
@@ -234,9 +306,11 @@ async function main(): Promise<number> {
 		terminal,
 		reasoning,
 		seed: args.prompt || undefined,
-		session: restored?.session ?? createSession(dataDir, { model: spec.model.id, promptHash }),
+		session,
 		ledger: restored?.ledger,
 	});
+	if (memory && context.messages.length > 0) await harvest({ spec, apiKey, store: memory, context });
+	return code;
 }
 
 main().then(

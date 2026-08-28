@@ -12,9 +12,12 @@ import { emptyHooks, type Hooks } from "./core/hooks.ts";
 import { Registry } from "./core/registry.ts";
 import type { Asker } from "./core/types.ts";
 import { installConfirm } from "./features/confirm.ts";
+import { installMemory } from "./features/memory.ts";
 import { installTrace } from "./features/trace.ts";
+import type { MemoryStore } from "./memory/store.ts";
 import { createAskUser } from "./tools/ask-user.ts";
 import { estimateBudget } from "./tools/estimate-budget.ts";
+import { createRemember } from "./tools/remember.ts";
 import { createSavePlan } from "./tools/save-plan.ts";
 import { searchHotel } from "./tools/search-hotel.ts";
 import { searchPoi } from "./tools/search-poi.ts";
@@ -33,6 +36,13 @@ export interface ComposeOptions {
 	 * 也就不会在没人可问的环境里白花一次调用。宿主知道有没有人可问,工具不知道。
 	 */
 	asker?: Asker;
+	/**
+	 * 跨会话记忆。不给就**既不注册 `remember` 也不注入记忆块** —— 整块积木不存在。
+	 *
+	 * `basePrompt` 必须和 `context.systemPrompt` 是同一份:注入是「拿它重新拼一遍」,
+	 * 不是往当前值上追加。两者对不上的话,第二步开始 prompt 就悄悄变了。
+	 */
+	memory?: { store: MemoryStore; basePrompt: string };
 }
 
 export interface Composed {
@@ -53,10 +63,14 @@ export function compose(options: ComposeOptions): Composed {
 	tools.register(estimateBudget);
 	tools.register(createSavePlan({ outDir: options.outDir }));
 	if (options.asker) tools.register(createAskUser(options.asker));
+	if (options.memory) tools.register(createRemember(options.memory.store));
 
 	const hooks = emptyHooks();
 	// trace 先挂:它只观察不拦截,得让它先把这次调用记下来,再轮到 confirm 决定放不放。
 	if (options.trace) installTrace(hooks);
+	// 记忆挂 `beforeStep`,和 confirm 的 `beforeToolCall` 是两个不同的挂载点 ——
+	// 注入上下文和拦截调用是两件事,凑在一个点上只会让顺序变得要紧而没有理由。
+	if (options.memory) installMemory(hooks, options.memory);
 	// 和 `ask_user` 同一条判断:没人可问就**根本不挂这块积木**。
 	// 管道 / CI 里 save_plan 照常执行 —— 拦截是为了尊重用户的意愿,没有用户就没有意愿要尊重。
 	if (options.asker) {

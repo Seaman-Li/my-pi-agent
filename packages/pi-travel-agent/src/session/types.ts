@@ -32,9 +32,12 @@ export interface EntryBase {
 /**
  * 会话头,每个文件恰好一条,永远是根。
  *
- * `promptHash` 记的是**当时那份 system prompt 的指纹**,不是内容本身
+ * `promptHash` 记的是**当时那份规则文件的指纹**,不是内容本身
  * (内容两千多字,每个会话存一份纯属浪费)。`--resume` 时对不上就提醒一句:
  * 你接着聊的这段历史,是在另一套规则下产生的 —— 这种事不说,查起来能查半天。
+ *
+ * 只算 `prompts/system.md`,**不算运行时拼上去的那些**(今天几号、跨会话记忆)。
+ * 后两者每天/每记一条就变,算进来的话这个提醒每次都响,等于没有 —— 见 cli.ts 里 `rules`。
  */
 export interface SessionEntry extends EntryBase {
 	type: "session";
