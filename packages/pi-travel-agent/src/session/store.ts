@@ -13,7 +13,15 @@ import { join } from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { TurnResult } from "../core/loop.ts";
 import { textOf } from "../core/types.ts";
-import type { Entry, Ledger, MessageEntry, SessionEntry, TurnEntry } from "./types.ts";
+import {
+	type CompactionEntry,
+	compactionSummaryMessage,
+	type Entry,
+	type Ledger,
+	type MessageEntry,
+	type SessionEntry,
+	type TurnEntry,
+} from "./types.ts";
 
 /** system prompt 的指纹。取前 12 位够用 —— 它只回答「变了没」,不用来防碰撞。 */
 export function hashPrompt(prompt: string): string {
@@ -40,8 +48,28 @@ export interface Session {
 	/** 把当前全量历史里还没落盘的那部分追加进去。 */
 	sync(messages: Message[]): void;
 	recordTurn(result: TurnResult): void;
+	/**
+	 * 记一次压缩,并返回**压缩后应该用的那份历史**。
+	 *
+	 * 调用方必须拿返回值替换掉自己手里的 `context.messages` —— 这个方法是
+	 * 「历史变短」这件事在记录侧的唯一合法出口,绕过它直接改数组的话,
+	 * 下一次 `sync` 会因为 `messages.length < written` 当场抛。
+	 */
+	compact(options: CompactRequest): Message[];
 	/** `/new`:游标回到会话头,之后的消息挂在它下面。**旧分支一条都不删。** */
 	reset(): void;
+}
+
+/** 一次压缩要记下来的东西。 */
+export interface CompactRequest {
+	/** **压缩前**的全量历史。先把它落盘,再记压缩点 —— 否则被压掉的那几条永远进不了文件。 */
+	messages: Message[];
+	summary: string;
+	/** 保留不压的尾巴。必须是 `messages` 的后缀,而且第一条得是 user 消息(见 features/compaction.ts)。 */
+	retainedTail: Message[];
+	/** `null` = 不知道(本进程还没发过请求)。**不要拿 0 顶替**,见 types.ts。 */
+	tokensBefore: number | null;
+	reason: CompactionEntry["reason"];
 }
 
 interface WriterState {
@@ -87,6 +115,31 @@ function makeSession(id: string, path: string, state: WriterState): Session {
 		return { id, parentId };
 	}
 
+	/**
+	 * @throws 历史比已落盘的还短时抛 —— append-only 表达不了「删掉中间某条」。
+	 *         **压缩是这条规则唯一的合法例外**,它走 `compact()`,那里会把 `written` 重新对齐。
+	 */
+	function syncMessages(messages: Message[]): void {
+		if (messages.length < state.written) {
+			throw new Error(`历史从 ${state.written} 条变成了 ${messages.length} 条,append-only 记录没法表达这件事`);
+		}
+		const tail = messages.slice(state.written);
+		if (tail.length === 0) return;
+		const entries: MessageEntry[] = tail.map((message) => {
+			const { id: entryId, parentId } = advance();
+			return {
+				type: "message",
+				id: entryId,
+				parentId,
+				// 用消息自己的时间戳,不用「写盘的时间」—— 记录要回答「这句话什么时候说的」。
+				timestamp: message.timestamp,
+				message,
+			};
+		});
+		flush(entries);
+		state.written = messages.length;
+	}
+
 	return {
 		id,
 		path,
@@ -94,26 +147,37 @@ function makeSession(id: string, path: string, state: WriterState): Session {
 			return state.broken;
 		},
 
-		/** @throws 历史比已落盘的还短时抛 —— append-only 表达不了「删掉中间某条」。 */
-		sync(messages: Message[]): void {
-			if (messages.length < state.written) {
-				throw new Error(`历史从 ${state.written} 条变成了 ${messages.length} 条,append-only 记录没法表达这件事`);
-			}
-			const tail = messages.slice(state.written);
-			if (tail.length === 0) return;
-			const entries: MessageEntry[] = tail.map((message) => {
-				const { id: entryId, parentId } = advance();
-				return {
-					type: "message",
-					id: entryId,
-					parentId,
-					// 用消息自己的时间戳,不用「写盘的时间」—— 记录要回答「这句话什么时候说的」。
-					timestamp: message.timestamp,
-					message,
-				};
-			});
-			flush(entries);
-			state.written = messages.length;
+		sync: syncMessages,
+
+		/**
+		 * 顺序是**先落盘、再记压缩点**,不能反过来。
+		 *
+		 * 压缩发生在 turn 中间,而 `repl.ts` 是 turn 结束才 `sync` 的 —— 也就是说
+		 * 这一刻文件里还没有本轮产生的那几条消息。先记压缩点的话,那几条就此消失:
+		 * 「恢复成压缩前的样子」这条路当场断掉,而且**没有任何报错**,
+		 * 要等哪天真想看细节时才发现记录里没有。
+		 *
+		 * 之后 `written` 重新对齐到「压缩后这份历史有几条」。这几条在文件里都有对应物:
+		 * 摘要那条对应这个 CompactionEntry 本身,尾巴对应它的 `retainedTail`。
+		 * 所以下一次 `sync` 只会追加压缩**之后**新说的话,不会重复写。
+		 */
+		compact(options: CompactRequest): Message[] {
+			syncMessages(options.messages);
+			const { id: entryId, parentId } = advance();
+			const entry: CompactionEntry = {
+				type: "compaction",
+				id: entryId,
+				parentId,
+				timestamp: Date.now(),
+				summary: options.summary,
+				retainedTail: options.retainedTail,
+				tokensBefore: options.tokensBefore,
+				reason: options.reason,
+			};
+			flush([entry]);
+			const next = [compactionSummaryMessage(entry), ...options.retainedTail];
+			state.written = next.length;
+			return next;
 		},
 
 		recordTurn(result: TurnResult): void {
@@ -171,6 +235,41 @@ export interface Resumed {
 	ledger: Ledger;
 	/** 存的时候那份 system prompt 和现在这份不一样。 */
 	promptChanged: boolean;
+	/**
+	 * 这条链上有几次压缩。**0 以外的值一定要告诉用户** ——
+	 * 恢复出来的历史比他上次看见的短,不说的话他会以为记录丢了。
+	 */
+	compactions: number;
+	/** 恢复的是压缩前的完整历史(`--resume-full`)。`compactions > 0` 时这两个一起才说得清恢复的是什么。 */
+	full: boolean;
+}
+
+/**
+ * 把一条链拼成要发给模型的那份历史。
+ *
+ * **默认不读过最后一个压缩点**:从后往前找到第一个 compaction,它之前的 MessageEntry
+ * 一条都不要 —— 那段已经被它的 `summary` 代表了。这和 pi 的
+ * `defaultContextEntryTransform`(`packages/agent/src/harness/session/context.ts:45`)是同一个做法。
+ *
+ * `full = true` 就当压缩没发生过,把链上所有 MessageEntry 原样吐出来。
+ * **这是 CompactionEntry 存 `retainedTail` 副本换来的能力**:两份历史都在文件里,
+ * 恢复的时候才有得选 —— 要省 token 就走默认,要看细节就走 full。
+ */
+function rebuild(chain: Entry[], full: boolean): Message[] {
+	const messagesFrom = (from: number): Message[] =>
+		chain
+			.slice(from)
+			.filter((entry): entry is MessageEntry => entry.type === "message")
+			.map((entry) => entry.message);
+
+	if (!full) {
+		for (let index = chain.length - 1; index >= 0; index--) {
+			const entry = chain[index];
+			if (entry?.type !== "compaction") continue;
+			return [compactionSummaryMessage(entry), ...entry.retainedTail, ...messagesFrom(index + 1)];
+		}
+	}
+	return messagesFrom(0);
 }
 
 /**
@@ -200,11 +299,38 @@ function parseEntries(path: string): Entry[] {
 			throw new Error(`${at} 缺 id 或 type`);
 		}
 		if (seen.has(entry.id)) throw new Error(`${at} id "${entry.id}" 和前面某条重复了`);
+		if (entry.type === "compaction") checkCompactionEntry(entry as Partial<CompactionEntry>, at);
 		seen.add(entry.id);
 		entries.push(entry as Entry);
 	}
 	if (entries.length === 0) throw new Error(`${path} 是空的`);
 	return entries;
+}
+
+/**
+ * compaction 行的字段检查。**只查人手改得坏的那几个**,和 memory 那边同一条判据:
+ * 机器写的(id / timestamp)可以宽,人写的必须严。
+ *
+ * 为什么单独查它而别的 Entry 不查:压缩点决定了「哪一段历史不再发给模型」。
+ * 一个 summary 被清空的 compaction 行不会让任何东西报错,只会让模型
+ * **静悄悄地少看一大段**,而人从终端上完全看不出来 —— 这正是本文件反复防的那类事。
+ *
+ * @throws 四个字段任一不对时抛,带行号。
+ */
+function checkCompactionEntry(entry: Partial<CompactionEntry>, at: string): void {
+	if (typeof entry.summary !== "string" || entry.summary.trim() === "") {
+		throw new Error(`${at} compaction 的 summary 是空的`);
+	}
+	if (!Array.isArray(entry.retainedTail)) {
+		throw new Error(`${at} compaction 的 retainedTail 不是数组`);
+	}
+	// null 是合法值(「不知道」),但别的非数字不是。手写 "unknown" 之类的一律拦下来。
+	if (entry.tokensBefore !== null && (typeof entry.tokensBefore !== "number" || !Number.isFinite(entry.tokensBefore))) {
+		throw new Error(`${at} compaction 的 tokensBefore 既不是数字也不是 null`);
+	}
+	if (entry.reason !== "manual" && entry.reason !== "threshold") {
+		throw new Error(`${at} compaction 的 reason 只能是 manual 或 threshold,现在是 ${JSON.stringify(entry.reason)}`);
+	}
 }
 
 /**
@@ -319,7 +445,7 @@ export function listSessions(dir: string, limit = 10): SessionSummary[] {
  *         `checkToolCallsPaired`)时抛。**一条都不容忍** —— 恢复一段自己都说不清
  *         是否完整的历史,比拒绝恢复危险得多:模型不会告诉你它少看了三句话。
  */
-export function resumeSession(dir: string, options: { id?: string; promptHash: string }): Resumed {
+export function resumeSession(dir: string, options: { id?: string; promptHash: string; full?: boolean }): Resumed {
 	const id = options.id ?? listSessionIds(dir)[0];
 	if (!id) throw new Error(`${dir} 里没有会话可以恢复`);
 	const path = join(dir, `${id}.jsonl`);
@@ -329,9 +455,8 @@ export function resumeSession(dir: string, options: { id?: string; promptHash: s
 	const chain = chainToRoot(entries, path);
 	const head = chain[0] as SessionEntry;
 
-	const messages = chain
-		.filter((entry): entry is MessageEntry => entry.type === "message")
-		.map((entry) => entry.message);
+	const full = options.full ?? false;
+	const messages = rebuild(chain, full);
 	checkToolCallsPaired(messages, path);
 
 	const ledger: Ledger = { turns: 0, input: 0, output: 0, cost: 0 };
@@ -350,6 +475,9 @@ export function resumeSession(dir: string, options: { id?: string; promptHash: s
 		nextId: maxId + 1,
 		rootId: head.id,
 		leafId: chain[chain.length - 1]?.id ?? head.id,
+		// 压缩过的会话这里也成立:摘要那条在文件里对应 CompactionEntry 本身,
+		// 尾巴对应它的 retainedTail —— 恢复出来的每一条**都已经有落盘的对应物**,
+		// 所以下一次 sync 只追加这次新说的话。
 		written: messages.length,
 		broken: undefined,
 	};
@@ -358,5 +486,7 @@ export function resumeSession(dir: string, options: { id?: string; promptHash: s
 		messages,
 		ledger,
 		promptChanged: head.promptHash !== options.promptHash,
+		compactions: chain.filter((entry) => entry.type === "compaction").length,
+		full,
 	};
 }

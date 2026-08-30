@@ -10,6 +10,7 @@
 import type { Context, ThinkingLevel } from "@earendil-works/pi-ai";
 import { dropEmptyAssistantMessages, repairDanglingToolCalls } from "./core/context.ts";
 import type { Hooks } from "./core/hooks.ts";
+import type { Compactor } from "./features/compaction.ts";
 import { runTurn } from "./core/loop.ts";
 import type { ModelSpec } from "./core/model.ts";
 import type { Registry } from "./core/registry.ts";
@@ -33,6 +34,11 @@ export interface ReplOptions {
 	session: Session;
 	/** `--resume` 恢复出来的账。不给就从 0 开始。 */
 	ledger?: Ledger;
+	/**
+	 * 手动压一次上下文。不给就**没有 `/compact` 这个命令** ——
+	 * 和 `ask_user`、`remember` 同一条:能力不在,入口也不该在。
+	 */
+	compact?: Compactor;
 }
 
 /**
@@ -45,6 +51,7 @@ const HELP = [
 	"/exit        退出(Ctrl-D 或连按两次 Ctrl-C 一样)",
 	"/new         清空历史,从头开始(记录文件里旧的那段不删,只是不再发给模型)",
 	"/ctx         看看现在的历史有多少、都是些什么、记到哪个文件了",
+	"/compact     现在就把前面的历史压成一句摘要(平时它会在快撑满时自己压)",
 	"/help        这份说明",
 	"",
 	"退出之后 `node src/cli.ts --resume` 接着聊,`--sessions` 看有哪些会话。",
@@ -74,7 +81,12 @@ function describeContext(context: Context): string {
  *
  * @returns true 表示该退出了
  */
-function handleCommand(input: string, context: Context, session: Session): boolean {
+async function handleCommand(
+	input: string,
+	context: Context,
+	session: Session,
+	compact: Compactor | undefined,
+): Promise<boolean> {
 	const name = input.split(/\s+/)[0];
 	switch (name) {
 		case "/exit":
@@ -90,6 +102,17 @@ function handleCommand(input: string, context: Context, session: Session): boole
 		case "/ctx":
 			process.stdout.write(`${DIM}${describeContext(context)}\n记录:${session.path}${RESET}\n`);
 			return false;
+		case "/compact": {
+			if (!compact) {
+				process.stdout.write(`${DIM}这次运行没开压缩(--no-compact),/compact 不可用${RESET}\n`);
+				return false;
+			}
+			// 手动这条路**不看阈值**:用户说压就压。阈值是替他判断「什么时候该压」,
+			// 他自己开口的时候那个判断就没有意义了。
+			const outcome = await compact(context, "manual");
+			process.stdout.write(`${DIM}${outcome.note}${RESET}\n`);
+			return false;
+		}
 		case "/help":
 			process.stdout.write(`${DIM}${HELP}${RESET}\n`);
 			return false;
@@ -174,7 +197,7 @@ export async function runRepl(options: ReplOptions): Promise<number> {
 		const text = line.trim();
 		if (!text) continue;
 		if (text.startsWith("/")) {
-			if (handleCommand(text, context, session)) break;
+			if (await handleCommand(text, context, session, options.compact)) break;
 			continue;
 		}
 

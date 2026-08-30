@@ -262,7 +262,35 @@ export function resolveModel(name: string = DEFAULT_MODEL): ModelSpec {
 	if (!build) {
 		throw new Error(`未知模型 "${name}"。可用:${Object.keys(PROVIDERS).join(", ")}`);
 	}
-	return build();
+	const spec = build();
+	checkWindow(name, spec);
+	return spec;
+}
+
+/**
+ * 窗口和 maxTokens 的关系检查。
+ *
+ * `contextWindow` 是**总信封**,输入和输出都得装进去(qwen 的模型卡写得最清楚:
+ * 1M 里输入最多占 991.8K)。所以 `contextWindow <= maxTokens` 意味着
+ * **留给输入的空间是 0 或负数**,这份配置从第一次请求起就不成立。
+ *
+ * 为什么值得在启动时单独抛一次:Step 7 的压缩阈值取在 `contextWindow − maxTokens` 上。
+ * 这个差是负数的话阈值也是负数 —— 表现是**每一步都判定该压、压完还超**,
+ * 看着完全像压缩逻辑写坏了。而验收压缩时要把窗口调到 20k 试触发,
+ * 正是最容易只改一个数就撞上它的时候。
+ *
+ * 在**配错的那一刻**报,比在压缩逻辑里报便宜得多 —— 和 `requireEnv` 空串就抛同一条理由。
+ *
+ * @throws contextWindow <= maxTokens 时抛,两个数和该怎么改都写进消息里。
+ */
+function checkWindow(name: string, spec: ModelSpec): void {
+	const { contextWindow, maxTokens } = spec.model;
+	if (contextWindow > maxTokens) return;
+	throw new Error(
+		`模型 "${name}" 的 contextWindow(${contextWindow})不大于 maxTokens(${maxTokens})。` +
+			"contextWindow 是输入+输出的总信封,这么配等于没给输入留空间。" +
+			"调小 *_MAX_TOKENS 或调大 *_CONTEXT_WINDOW。",
+	);
 }
 
 /** 取 key。返回值绝不进日志、不进上下文、不进事件流 —— Step 8 会把这条写成检查。 */

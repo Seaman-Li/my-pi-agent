@@ -11,6 +11,7 @@
 import { emptyHooks, type Hooks } from "./core/hooks.ts";
 import { Registry } from "./core/registry.ts";
 import type { Asker } from "./core/types.ts";
+import { type CompactionOptions, type Compactor, installCompaction } from "./features/compaction.ts";
 import { installConfirm } from "./features/confirm.ts";
 import { installMemory } from "./features/memory.ts";
 import { installTrace } from "./features/trace.ts";
@@ -43,11 +44,21 @@ export interface ComposeOptions {
 	 * 不是往当前值上追加。两者对不上的话,第二步开始 prompt 就悄悄变了。
 	 */
 	memory?: { store: MemoryStore; basePrompt: string };
+	/**
+	 * 上下文压缩。不给就**一次都不会压** —— 上下文照常长下去,长到撞窗口为止。
+	 *
+	 * 里面要 `session` 是硬性的:压缩会让历史变短,而「这段历史不再发给模型了」
+	 * 不落盘的话,就成了一次没人知道、事后也查不回来的信息丢失。
+	 * 所以**没有会话记录的运行(单轮模式)压根不装这块积木**。
+	 */
+	compaction?: CompactionOptions;
 }
 
 export interface Composed {
 	tools: Registry;
 	hooks: Hooks;
+	/** 手动压一次(`/compact`)。没开压缩就没有它 —— 命令也就跟着不存在。 */
+	compact?: Compactor;
 }
 
 /**
@@ -71,6 +82,9 @@ export function compose(options: ComposeOptions): Composed {
 	// 记忆挂 `beforeStep`,和 confirm 的 `beforeToolCall` 是两个不同的挂载点 ——
 	// 注入上下文和拦截调用是两件事,凑在一个点上只会让顺序变得要紧而没有理由。
 	if (options.memory) installMemory(hooks, options.memory);
+	// 压缩挂 `afterStep`,不是 `beforeStep`:要看到**这一步的工具结果也进了上下文之后**的样子。
+	// 挂在 beforeStep 的话,一步里查了六个 POI 撑爆上下文,得等到下一步才发现。
+	const compact = options.compaction ? installCompaction(hooks, options.compaction) : undefined;
 	// 和 `ask_user` 同一条判断:没人可问就**根本不挂这块积木**。
 	// 管道 / CI 里 save_plan 照常执行 —— 拦截是为了尊重用户的意愿,没有用户就没有意愿要尊重。
 	if (options.asker) {
@@ -91,5 +105,5 @@ export function compose(options: ComposeOptions): Composed {
 		});
 	}
 
-	return { tools, hooks };
+	return { tools, hooks, compact };
 }

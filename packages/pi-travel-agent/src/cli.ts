@@ -17,7 +17,7 @@ import { extractMemories } from "./memory/extract.ts";
 import { type MemoryStore, openMemory } from "./memory/store.ts";
 import { createRenderer, DIM, formatTurnSummary, RESET } from "./render.ts";
 import { runRepl } from "./repl.ts";
-import { createSession, hashPrompt, listSessions, resumeSession } from "./session/store.ts";
+import { createSession, hashPrompt, listSessions, resumeSession, type Session } from "./session/store.ts";
 import { isInteractive, openTerminal, type Terminal } from "./terminal.ts";
 import { createTerminalAsker } from "./terminal-asker.ts";
 
@@ -37,6 +37,8 @@ const USAGE = `用法:
   --thinking            打开思考
   --trace               把四个挂载点的进出打到 stderr
   --no-memory           这次不读也不写 data/memory.json
+  --no-compact          这次不压上下文(长了也不压,撞窗口就撞)
+  --resume-full         恢复时忽略压缩点,读回压缩前的完整历史
   --help                这份说明
 `;
 
@@ -85,6 +87,10 @@ interface Args {
 	resume: string | undefined;
 	/** 跨会话记忆开不开。`--no-memory` 关。 */
 	memory: boolean;
+	/** 上下文压缩开不开。`--no-compact` 关。 */
+	compaction: boolean;
+	/** 恢复时读压缩前的完整历史。`--resume-full` 开。 */
+	resumeFull: boolean;
 }
 
 /**
@@ -102,6 +108,8 @@ function parseArgs(argv: string[]): Args {
 	let help = false;
 	let sessions = false;
 	let memory = true;
+	let compaction = true;
+	let resumeFull = false;
 	let resume: string | undefined;
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i]!;
@@ -117,6 +125,13 @@ function parseArgs(argv: string[]): Args {
 			sessions = true;
 		} else if (arg === "--no-memory") {
 			memory = false;
+		} else if (arg === "--no-compact") {
+			compaction = false;
+		} else if (arg === "--resume-full") {
+			// 只影响「读回来的是哪一份历史」,不影响往后怎么记 —— 压缩点还在文件里,
+			// 这次聊的照样往后追加。
+			resumeFull = true;
+			resume ??= "";
 		} else if (arg === "--resume") {
 			// 写成 `--resume=<id>` 而不是 `--resume <id>`:后者没法区分
 			// 「恢复最近一个,然后问这句话」和「恢复这个 id」—— 会把 prompt 吃掉。
@@ -129,7 +144,7 @@ function parseArgs(argv: string[]): Args {
 			rest.push(arg);
 		}
 	}
-	return { prompt: rest.join(" "), model, thinking, trace, chat, help, sessions, resume, memory };
+	return { prompt: rest.join(" "), model, thinking, trace, chat, help, sessions, resume, memory, compaction, resumeFull };
 }
 
 /**
@@ -260,12 +275,24 @@ async function main(): Promise<number> {
 	 * `basePrompt` 给的是 `systemPrompt`(含「今天」不含记忆)—— 和 `context.systemPrompt`
 	 * 初值是同一份,这样记忆注入是「重新拼」而不是「往后接」。
 	 */
-	const build = (terminal: Terminal | undefined, memory: MemoryStore | undefined): Composed =>
+	const build = (terminal: Terminal | undefined, memory: MemoryStore | undefined, session?: Session): Composed =>
 		compose({
 			outDir: join(PACKAGE_ROOT, "out"),
 			trace: args.trace,
 			asker: terminal && isInteractive() ? createTerminalAsker(terminal) : undefined,
 			memory: memory && { store: memory, basePrompt: systemPrompt },
+			// **没有 session 就不装压缩。** 单轮模式不建会话文件(见 BACKLOG),
+			// 而压缩必须留下压缩点 —— 一段历史被换掉却没人记下来,是查不回来的信息丢失。
+			compaction:
+				args.compaction && session
+					? {
+							spec,
+							apiKey,
+							prompt: readFileSync(join(PACKAGE_ROOT, "prompts", "compact.md"), "utf8"),
+							session,
+							notify: (outcome) => process.stdout.write(`${DIM}[压缩] ${outcome.note}${RESET}\n`),
+						}
+					: undefined,
 		});
 
 	const reasoning = args.thinking ? ("low" as const) : undefined;
@@ -283,9 +310,19 @@ async function main(): Promise<number> {
 	// 而 readline 一旦开着,Node 就不肯退 —— 屏幕上会是「一条错误 + 一个不动的进程」。
 	const promptHash = hashPrompt(rules);
 	const restored =
-		args.resume === undefined ? undefined : resumeSession(dataDir, { id: args.resume || undefined, promptHash });
+		args.resume === undefined
+			? undefined
+			: resumeSession(dataDir, { id: args.resume || undefined, promptHash, full: args.resumeFull });
 	if (restored) {
 		context.messages = restored.messages;
+		if (restored.compactions > 0) {
+			// **必须说。** 压缩过的会话恢复出来比用户上次看见的短,不说的话他会以为记录丢了。
+			process.stderr.write(
+				restored.full
+					? `[提示] 这个会话压缩过 ${restored.compactions} 次,--resume-full 读的是压缩前的完整历史\n`
+					: `[提示] 这个会话压缩过 ${restored.compactions} 次,前面那段是摘要;想看原文用 --resume-full\n`,
+			);
+		}
 		if (restored.promptChanged) {
 			// 不拦,只说一声。**接着聊的这段历史是在另一套规则下产生的** ——
 			// 模型突然改了口径的时候,人得能想起来是这个原因。
@@ -296,7 +333,7 @@ async function main(): Promise<number> {
 	// 记忆条目上盖一个会话号:人翻 memory.json 看到一条离谱的记忆,能顺着它回到当时的对话。
 	const memory = args.memory ? openMemory(memoryPath, { session: session.id }) : undefined;
 	const terminal = openTerminal();
-	const composed = build(terminal, memory);
+	const composed = build(terminal, memory, session);
 
 	const code = await runRepl({
 		spec,
@@ -309,6 +346,7 @@ async function main(): Promise<number> {
 		seed: args.prompt || undefined,
 		session,
 		ledger: restored?.ledger,
+		compact: composed.compact,
 	});
 	if (memory && context.messages.length > 0) await harvest({ spec, apiKey, store: memory, context });
 	return code;
