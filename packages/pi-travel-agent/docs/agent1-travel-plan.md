@@ -483,7 +483,7 @@ return compaction === undefined ? entries : [compaction, ...entries.slice(idx + 
 | S4 | HTML 报告 | 一天 | ☐ |
 | S5 | 会话持久化 | 半天 | ☐ |
 | S6 | 跨会话 memory | 半天 | ☐ |
-| S7 | 上下文压缩 | 半天 | ☐ |
+| S7 | 上下文压缩 | 半天 | ☑ |
 | S8 | 打磨（选做） | 半天 | ☐ |
 
 **卡住超过 40 分钟就跳过、记进笔记、往下走。** 和读 pi 时一条规则。

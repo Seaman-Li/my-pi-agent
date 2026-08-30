@@ -3,6 +3,7 @@
 用 pi 的架构从零手写的旅行助手。计划和笔记在 [`docs/`](docs/)：
 [实施计划](docs/agent1-travel-plan.md) ·
 [文件结构与开发流程](docs/agent1-dev-workflow.md) ·
+[变量与概念速查](docs/glossary.md) ·
 [跨会话记忆](docs/memory.md) ·
 [每次发给模型的 prompt 里有什么](docs/prompt.md) ·
 [prompt 缓存排查](docs/prompt-cache.md) ·
@@ -47,6 +48,8 @@ node src/cli.ts [--model <名字>] [--thinking] [--trace] [--chat] ["你的问�
 | `--chat` | 给了话也进多轮 | 不给话时本来就是多轮，这个开关是给「第一句写在命令行里」用的 |
 | `--resume[=<id>]` | 恢复会话，隐含进多轮 | 写成 `--resume=<id>` 而不是 `--resume <id>`——后者没法和 prompt 区分开 |
 | `--no-memory` | 这次不读也不写 `data/memory.json` | 做对照实验用：同一句话跑两遍只差这一个开关，就知道行为的变化是不是记忆造成的 |
+| `--no-compact` | 这次不压上下文 | 同样是对照实验用。关掉之后长了也不压，撞窗口就撞 |
+| `--resume-full` | 恢复时忽略压缩点，读回压缩前的完整历史 | 隐含 `--resume`。压缩过的会话默认恢复的是「摘要 + 尾巴」，想看原文用它 |
 | `--sessions` | 列会话后退出 | id 是时间戳，认会话靠列表里那句「第一句用户说的话」 |
 | `--help` | 打用法 | |
 
@@ -90,13 +93,14 @@ node src/cli.ts
 
 **第二句为什么不用重说一遍城市和日期**——因为 `context.messages` 没清空，
 上一轮的 user / assistant / toolResult 原样又发了一遍。代价也在那行摘要里：`ctx` 和 `in` 一起涨。
-压缩是 Step 7 的事。
+涨到快装不下时会自己压一次，见[上下文压缩](#上下文压缩)。
 
 | 命令 | |
 |---|---|
 | `/exit`（或 `/quit`） | 退出。Ctrl-D、连按两次 Ctrl-C 一样 |
 | `/new` | 清空历史重开，system prompt 不变 |
 | `/ctx` | 看现在的历史有多少条、都是些什么 |
+| `/compact` | 现在就把前面的历史压成一句摘要（平时它会在快撑满时自己压） |
 | `/help` | 命令表 |
 
 不认识的 `/xxx` 不会被当成聊天发出去——打错一个命令白花一次请求太亏。真要发 `/` 开头的话，前面加个空格。
@@ -278,6 +282,64 @@ Step 5b 的 `promptHash` 原来是对 `context.systemPrompt` 取的，而那份�
 记忆一来更是每记一条就变。每次都响的提醒等于没有提醒。所以 Step 6 把它改成只算
 `prompts/system.md` 的内容（`src/cli.ts` 里的 `rules`），运行时拼上去的那些一概不算。
 
+### 上下文压缩
+
+历史一直涨，总有装不下的一天。快到那一步时，把**前面一段**换成一句摘要，最近两轮留着原文。
+
+```
+[压缩] 已压缩:28 条 → 13 条(压缩前 prompt 8266 token)
+```
+
+自动触发之外，`/compact` 可以现在就压一次。设计取舍和实测记录在
+[Q4：长上下文怎么压缩](docs/answers/q4-compaction.md)，这里只说用起来要知道的三件。
+
+#### 阈值取在「可用输入」上，不是整个窗口
+
+```
+usable = contextWindow - maxTokens      # 真正能留给输入的
+压  when  promptTokens > usable * 0.8
+```
+
+`contextWindow` 是**输入 + 输出的总信封**。取在它上面的话，留下的 20% 对 qwen
+（`maxTokens` 65K）绰绰有余，对 deepseek（384K）根本不够——模型吐满照样撞窗口。
+取在可用输入上，一个常数就够，**23 倍的 `maxTokens` 差异自动被吸收**。
+
+配套地，`contextWindow <= maxTokens` 在**启动时**就抛：
+
+```
+$ DEEPSEEK_CONTEXT_WINDOW=2048 DEEPSEEK_MAX_TOKENS=4096 node src/cli.ts --model deepseek "你好"
+模型 "deepseek" 的 contextWindow(2048)不大于 maxTokens(4096)。…调小 *_MAX_TOKENS 或调大 *_CONTEXT_WINDOW。
+```
+
+想试触发压缩就把窗口调小，但**两个数要一起调**——只改窗口的话 `usable` 变负数，
+阈值跟着变负，表现是每一步都判定该压，看着完全像压缩坏了。这道校验就是为了把那半小时省掉。
+
+#### 压缩点落盘，旧消息一条不删
+
+一次压缩在 JSONL 里是**一条新 Entry**，不是「删掉那几行」：
+
+```json
+{"type":"compaction","summary":"…","retainedTail":[…],"tokensBefore":10947,"reason":"manual"}
+```
+
+所以恢复的时候有得选：
+
+| | 恢复出来的历史 |
+|---|---|
+| `--resume` | 摘要 + 尾巴。实测 11 条 / 3623 字符 |
+| `--resume-full` | 压缩前的原文。同一个会话 27 条 / 12524 字符 |
+
+压缩过的会话恢复时会提示一句——**不说的话，用户会以为记录丢了**。
+
+#### 摘要要留什么，是 prompt 的事
+
+`prompts/compact.md`。五段：用户要什么 / **改过的主意** / 硬约束 / 已经查到的事实 / 做到哪一步了。
+
+「改过的主意」单列一段，是因为**摘要最容易丢的就是否定和转折**。丢了它的后果不是答得含糊，
+是助手拿着作废的旧目标接着干活。实测第三次压缩后的摘要里这一行是：
+
+> 改过的主意：本来去成都3天，后改为西安3天（成都行程作废）
+
 ### 本地模型：`--model local`
 
 `.env` 里配好 `LOCAL_*` 之后（见 `.env.example`），所有命令加一个 `--model local` 即可，
@@ -431,6 +493,16 @@ node src/cli.ts --model <新模型> "帮我规划成都2天行程，预算3000�
 | 6 | 手写一条只有 `kind`/`text` 的记忆，启动一次再看文件 | `id` 被补上；`forget` 掉一条之后新记的**不复用**旧 id |
 | 6 | 灌满 20 条再让它记 | `没记「…」:记忆满了(上限 20 条)。先 forget 掉一条过时的再记` |
 | 6 | 会话里说「我不爱爬山」再 `/exit` | 末行 `[记忆] …(现有 N 条)`；已经记过的不会重复记，打「没抽到值得长期记的东西」 |
+| 7 | `DEEPSEEK_CONTEXT_WINDOW=12000 DEEPSEEK_MAX_TOKENS=2048 printf '成都 3 天怎么玩?…\n帮我看看成都后天的天气\n算了不去成都了,改去西安,还是 3 天\n西安有哪些适合我的餐厅\n那第二天上午安排什么?\n/exit\n' \| node src/cli.ts --model deepseek --chat` | 出现 `[压缩] 已压缩:28 条 → 13 条`（实测触发 3 次）；最后一轮回答**全是西安**，成都出现 0 次 |
+| 7 | 接上，`node src/cli.ts --resume=<那个会话>` 之后问「我们预算多少来着?几个人?第三天原本排的是什么?」 | 三个全答对（3000/2 人/陕历博+大雁塔）——**此时它们只存在于摘要里**，尾巴里没有 |
+| 7 | 三轮以上的会话里 `/compact`，再 `/ctx` | `已压缩:27 条 → 11 条`；`/ctx` 的条数和字符数同步变小 |
+| 7 | 同一个压缩过的会话，`--resume` 和 `--resume-full` 各跑一次 `/ctx` | 11 条 / 3623 字符 vs 27 条 / 12524 字符；两次都提示「这个会话压缩过 N 次」 |
+| 7 | `--resume` 一个压缩过的会话,**不说话直接** `/compact` | `已压缩:N 条 → M 条(压缩前多大不知道:这个进程还没发过请求)`;JSONL 里 `tokensBefore` 是 **null 不是 0** |
+| 7 | 手改 JSONL 把 `tokensBefore` 改成 `"unknown"` | 报 `tokensBefore 既不是数字也不是 null`;改成 `null` 照常读得动 |
+| 7 | 只有两轮的会话里 `/compact` | `压不动:能压的只有 0 条,最近 2 轮要留着`——**不报错也不空转，后面轮数够了照样能压** |
+| 7 | 手改 JSONL 的 compaction 行：`summary` 清空 / `reason` 改成 `auto` / `retainedTail` 改成字符串 | 三种都带行号报错（`…jsonl:32 compaction 的 summary 是空的`） |
+| 7 | `DEEPSEEK_CONTEXT_WINDOW=2048 DEEPSEEK_MAX_TOKENS=4096 node src/cli.ts --model deepseek "你好"` | 启动就抛 `contextWindow(2048)不大于 maxTokens(4096)`，退出码 1 |
+| 7 | 任意会话加 `--no-compact` 跑，再 `/compact` | 一次都不压；`/compact` 报「这次运行没开压缩(--no-compact)」 |
 | local | `node src/cli.ts --model local "成都和重庆明天天气怎么样，对比一下"` | 同一 step 并行两个 `weather`，**没有 `[思考]` 段**（有就是 `reasoning_effort` 没生效） |
 | local | `node src/cli.ts --model local "帮我规划成都2天行程，8月28号出发，2个人，预算3000，最后存成报告"` | 4 step 跑完，`out/*.html` 七个区块齐全 |
 

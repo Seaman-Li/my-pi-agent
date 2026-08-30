@@ -76,6 +76,7 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 ├── docs/
 │   ├── agent1-travel-plan.md      实施计划
 │   ├── agent1-dev-workflow.md     本文件:文件结构与开发流程
+│   ├── glossary.md           ★ 变量与概念速查,按层分
 │   ├── memory.md             Step 6 产出:什么时候记、怎么影响上下文
 │   ├── prompt.md             每次发给模型的三块:systemPrompt / tools / messages
 │   ├── prompt-cache.md       缓存为什么归零的排查记录(方法比结论重要)
@@ -83,7 +84,8 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   └── debugging.md          Step 9 产出:幻觉 vs agent bug 判据表
 ├── prompts/
 │   ├── system.md
-│   └── extract.md            Step 6:从转录里抽长期偏好的规则(域知识,不进 memory/)
+│   ├── extract.md            Step 6:从转录里抽长期偏好的规则(域知识,不进 memory/)
+│   └── compact.md            Step 7:摘要要留下什么(同上,域知识不进 features/)
 ├── src/
 │   ├── core/                 ★ 通用层,不含任何「旅行」字样,Agent 2 直接搬
 │   │   ├── types.ts          Tool / ToolResult / StepContext / Hook 上下文
@@ -93,15 +95,15 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   │   ├── context.ts        messages 形状的不变量(toolCall 必须配对)—— Step 5a
 │   │   └── loop.ts           ★ agent loop —— Step 2 之后只读
 │   ├── session/              ★ harness:一次会话是什么,和终端无关 —— Step 5b
-│   │   ├── types.ts          Entry 定义(session / message / turn),parentId 串成树
-│   │   └── store.ts          JSONL append-only 写 + 四层校验的读 + --resume
+│   │   ├── types.ts          Entry 定义(session / message / turn / compaction),parentId 串成树
+│   │   └── store.ts          JSONL append-only 写 + 校验的读 + --resume / --resume-full
 │   ├── memory/               ★ harness:用户是个什么样的人,和旅行无关 —— Step 6
 │   │   ├── types.ts          MemoryItem / 三类 kind / 上限
 │   │   ├── store.ts          整体读整体写(.tmp + rename),手改坏了当场报错
 │   │   └── extract.ts        会话散场后抽一次(规则在 prompts/extract.md)
 │   ├── features/             ★ 一个文件 = 一块积木,只通过 hooks 挂进去
 │   │   ├── memory.ts         Step 6:记忆 → systemPrompt,挂 beforeStep
-│   │   ├── compaction.ts     Step 7
+│   │   ├── compaction.ts     Step 7:阈值判定 + 切点 + 摘要,挂 afterStep
 │   │   ├── guard.ts          Step 8:出口白名单/路径/预算/外部数据标注
 │   │   ├── confirm.ts        不可逆的工具先问人 —— Step 8 权限确认的原型
 │   │   └── trace.ts          Step 9:trace + replay
@@ -264,7 +266,7 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
 | 4 | v2-tools | 结构化产出 + HTML 报告 | 1 ✅ | `out/*.html` 双击可读,注入不执行 |
 | 5 | v3-session | 多轮对话 + 会话持久化 | 2 ✅ | 退出重进,历史还在 |
 | 6 ✅ | v4-memory | 跨会话记忆 | 1 ✅ | 新会话不推荐爬山 —— **但验收地点要选对**,见下 |
-| 7 | v5-compaction | 上下文压缩 | 1 | 触发压缩;压缩后跟的是**新**意图 |
+| 7 ✅ | v5-compaction | 上下文压缩 | 1 ✅ | 触发压缩;压缩后跟的是**新**意图 —— **但要让被问的东西只可能来自摘要**,见下 |
 | 8 | v6-guard | 边界与拒答 | 2 | 对抗用例集全部被挡 |
 | 9 | v7-debug | 可定位:trace + replay | 1 | 同一 session 能重放,结论可复现 |
 | 10 | v8-mcp | MCP 对照实验(选做) | 1 | 两条路径同一问题输出一致 |
@@ -447,7 +449,7 @@ description: "查询某个城市未来几天的天气。需要按天安排户外
 | 信息不全(没说日期/预算/人数) | **Step 3b**:`ask_user` 工具 + system prompt 划清「什么必须问、什么可以带默认值」 |
 | 单次会话内的约束收集(不爬山、素食) | **Step 4**:`TripPlan` schema 就是槽位定义,`save_plan` 必填字段拿不到就调不成 —— **用 schema 逼出追问**,比在 prompt 里写「请先问清楚」可靠 |
 | 跨会话偏好 | Step 6,已有 |
-| 意图变更(「算了不去成都了」) | **Step 7 验收**:压缩前改主意,压缩后跟的是新意图还是旧的 —— 比单纯考记忆更能检验摘要质量 |
+| 意图变更(「算了不去成都了」) | **Step 7 已验**:压缩前改主意,压缩后跟的是新意图还是旧的。做下来发现光这样还不够 —— 改口那句会落在「保留最近两轮」里,测的其实是原文还在不在。**得再多聊两轮把它推进摘要,再 `--resume` 问只存在于摘要里的细节**(预算/人数/第三天原本排什么),那才是在考摘要质量 |
 
 `ask_user` 值得单独说一句:它把「问用户」从一段自然语言变成 **loop 里可观测、可 trace 的一步**,
 顺带给 Q1/Q2 多一个真实分支可讲 —— 一个会暂停等人类的工具,turn 在这里怎么处理。
@@ -495,7 +497,7 @@ Step 8a 的主要产出不是那道闸,是**一组固定的对抗用例**(域外
 | 1 | 一次 prompt 如何进入 loop,turn 怎么结束 | Step 2 | `core/loop.ts` | 把 **turn 的四个结束条件**在代码里写成一个显式函数,不要散在 while 条件里:无 toolCall / stopReason≠toolUse / abort / 触顶 maxSteps |
 | 2 | context、event、hook 怎么配合 | Step 2 建骨架,Step 6-8 才验证 | `core/hooks.ts` + 四个 feature | ~~`beforeToolCall` 上挂 guard + memory~~ —— Step 6 做下来发现**记忆不该挂在这个点上**:注入上下文和拦截调用是两件事,凑在一个点上只会让顺序变得要紧而没有理由。实际是 `beforeStep` 挂 memory(`features/memory.ts`)、`beforeToolCall` 挂 confirm,Step 8 的 guard 上来之后 `beforeToolCall` 才有两个 handler。「多 handler 串起来」照样有得讲,而且多出一条「怎么选挂载点」 |
 | 3 | 工具调用怎么执行 | Step 3(3b) | `core/loop.ts` 的 execute 段 | 原计划把并行和 abort 放进「选做」,现在提到 Step 3b——否则这题只能答一半 |
-| 4 | 长上下文怎么压缩 | Step 7 | `features/compaction.ts` | 阈值调到 20k 真触发一次,并回答「压缩后追问细节还答得上吗」 |
+| 4 ✅ | 长上下文怎么压缩 | Step 7 | `features/compaction.ts` + **`docs/answers/q4-compaction.md`** | 窗口调到 12k 真触发了 3 次。阈值取在 `contextWindow − maxTokens` 上而不是整个窗口 —— 后者对 `maxTokens` 384K 的 provider 不成立。**最值钱的是那个写错的闸**:「压不动就永久关掉压缩」看着显然正确,实测第 2 轮就撞阈值、那时压不动,于是后面三次压缩一次都不会发生,还不报错 |
 | 5 ✅ | session 怎么持久化和恢复 | Step 5(5b) | `session/store.ts` + **`docs/answers/q5-session.md`**(27 处行号引用,有脚本校验) | 四种手改都验过了:非法 JSON(报行号)、id 重复(报行号)、`parentId` 指向不存在的 id、删掉 toolResult 再把链接好。**四种全部报错,一种都不跳过**。`/new` 用换父节点表达,旧分支一条不删 —— 这是「树」这个设计唯一被真正用到的地方 |
 | 6 | 安全边界怎么设计,和沙箱是不是一回事 | Step 8(8a 拒答 / 8b 边界) | `features/guard.ts` | 见下。域外拦截和注入是两个方向,详见[意图与拒答](#三五意图与拒答) |
 | 7 | 出错了怎么定位,幻觉还是 agent bug | Step 9 | `--trace` / `--replay` | 见下 |
