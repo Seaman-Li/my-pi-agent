@@ -95,6 +95,131 @@ max_tokens = min(maxTokens, max(1, available))
 Step 8b 做完之后这条更要紧了一点:`beforeToolCall` 上现在挂着**两个** handler
 (预算 + 确认),准备阶段比 Step 5b 时长。但只要确认闸不弹,量级还是微秒,先记着。
 
+## amap 的重试只覆盖 QPS,而且没有超时 —— 有需要再说,超时那条优先
+
+`tools/amap.ts:138` 的 `request()` 现在只在一种情况下重试:高德返回 `status !== "1"`
+且 `info` 里含 "QPS"(`:121`),退避 350ms / 900ms(`:96`)。这个判断本身是对的
+(日配额用完等到明天也是白等,见那段注释),但**三种同样瞬时的故障一次都不重试**:
+
+| 缺口 | 现在的行为 | 位置 |
+|---|---|---|
+| HTTP 5xx / 502 / 504 | `!response.ok` 直接抛 | `:146` |
+| `fetch` 自己抛(DNS 抖动、ECONNRESET、TLS) | 根本没进重试循环 | `:145` |
+| **没有 per-request 超时** | 连接挂住就无限期卡着 | 整个 `request()` |
+
+第三条最要紧,而且是唯一一个**会让 agent 完全无响应**的:有 `signal` 但没有超时,
+`max_steps`(`loop.ts:32`)数的是步数不是时间,救不了。用户只能 Ctrl-C。
+
+**上游有现成的判据可以抄**:`packages/ai/src/utils/provider-retry.ts:23` 的
+`isRetryableProviderError` —— 408 / 409 / 429 / ≥500 重试,而且
+**`error.status === undefined` 也重试**(`:28`),那正是「fetch 自己抛了」这一类。
+它还认 `retry-after` 头(`:51`),退避带 jitter(`:66`)。
+
+**重试为什么不能挪到 loop 里**:loop 不知道哪个工具幂等。`weather` / `search_poi` 重试无害,
+`save_plan` 重试会落两份文件,`ask_user` 重试等于把同一个问题问人两遍。
+上游也是这么分的 —— 重试全在 provider 层,`core/tools/*.ts` 里一条 retry 都没有
+(它的工具是本地的,没得重试)。
+
+顺带记一笔:**还有一层重试是不用写代码的** —— 错误被包成 toolResult 回灌(`loop.ts:206`),
+模型自己改参数再调。语义类错误(城市名不对)靠的全是这个。
+
+## 工具 schema 占 prompt 的 67%,一半是 `save_plan` 一个 —— 有需要再说
+
+2026-08-31 实测(默认 dashscope 模型,同一句「在吗」,发了 8 次真请求):
+
+```
+不带工具            1064 token
+带 6 个工具         3228 token
+────────────────────────────
+工具 schema 占      2164 token   ← 占整个 prompt 的 67%
+```
+
+逐个单独测再扣掉约 164 token 的固定框架费,得到每个工具的边际开销:
+
+| 工具 | token | 占比 |
+|---|---|---|
+| weather | 151 | 7% |
+| search_poi | 194 | 9% |
+| search_hotel | 245 | 11% |
+| estimate_budget | 285 | 13% |
+| **save_plan** | **1035** | **48%** |
+| ask_user | 255 | 12% |
+
+`save_plan` 一个吃掉一半,因为 `save-plan.ts:182` 是 `parameters: tripPlanSchema` ——
+整份行程结构内联进 schema,光 `itinerary` 一个字段就 966 字符。
+
+**要动就动它一个,顶动其余五个。** 不需要任何新机制,所以排在「渐进式加载」前面。
+
+**为什么现在不做**:见 [下一条](#渐进式加载会废掉缓存前缀所以现在不做--工具数过-20或单次-schema-超过窗口-10-时再评估) ——
+这 2164 token 从第二步起走 cacheRead,单价只有 1/31。省的是**窗口**不是钱,
+而窗口现在还没紧张(压缩阈值是 `usable × 0.8`)。
+
+## 渐进式加载会废掉缓存前缀,所以现在不做 —— 工具数过 20、或单次 schema 超过窗口 10% 时再评估
+
+工具块在 prompt 的**最前面**,是缓存前缀。会话 `20260830-223410-ade9` 的真实 usage:
+
+```json
+{"input": 94, "cacheRead": 2944, "cacheWrite": 0}
+```
+
+`input` 只有 94 —— 这一步新增的用户消息;system + 全部工具 schema 那 2944 token 全在
+`cacheRead` 里,单价 0.007/M vs 0.22/M,**便宜 31 倍**。
+
+也就是说:**工具集只要不变,从第二步起 schema 几乎是免费的。**
+一旦改成「这一步给三个工具、下一步给五个」,前缀每次都变,缓存全废,
+**而且是连它后面的整段历史一起废** —— 那部分本来是命中的。
+
+6 个工具、2164 token 这个规模,渐进式加载大概率净亏。真正必须上的条件有两个,满足其一:
+
+1. **schema 本身开始吃窗口** —— 几十上百个工具,静态全带已经挤掉了历史该占的位置。
+   这时省的是窗口,而窗口不是钱能换的。
+2. **工具集在一次会话内天然分段** —— 比如「规划阶段一套 / 落盘阶段一套」,
+   一次会话最多失效一两次缓存,而不是每步一次。
+
+只有「工具有点多」而两条都不满足,就不该动。
+
+**上游的两个参照**:
+
+- pi 的 coding agent 一共 **7 个工具**(`packages/coding-agent/src/core/tools/index.ts:83`),
+  默认只开 **4 个**(`core/sdk.ts:245`:`["read","bash","edit","write"]`)——
+  grep/find/ls 不在默认集里,因为 **bash 覆盖了它们**。一个通吃工具顶四个 schema。
+- 真要「按需展开」,pi 走的**不是工具 schema 这条路**,是 skills:
+  prompt 里只放 name/description/location 三行(`core/skills.ts:335`),
+  正文让模型**用 `read` 工具自己去读**(`:344`)。description 上限 1024 字符(`:14`)。
+  这条路子省得多 —— 索引进缓存前缀,正文按需进上下文,而且**前缀不变**。
+
+## 没有「选没选对工具」的用例集 —— 工具数过 12,或第一次实测选错时
+
+现在两批用例都测不到工具选择:
+
+| | 测什么 | 发请求 | 确定 |
+|---|---|---|---|
+| `cases/adversarial.jsonl` | 纯函数(`classify` / `slugify`) | ❌ | ✅ |
+| `cases/injection.jsonl` | 模型**拒绝**的行为 | ✅ | ❌ |
+| **缺的第三批** | 一句话 → **该调哪个工具、什么参数** | ✅ | ❌ |
+
+第三批和 injection 同一性质:花钱、会抖、不能进 CI。但它是唯一能把
+「工具多了准确率掉没掉」变成一个**数**的东西 —— 没有它,加第 15 个工具时
+只能凭感觉说「好像还行」。分组 / 子 agent 那些手段得等有了这个数再谈。
+
+**已经踩过的坑就是这类问题的样板**,见[地图坐标那条](#地图坐标曾经全是编的--已修留个记录):
+prompt 让模型做一件它拿不到输入的事,**它不报错,它编**。
+
+手上已有的、真正管用的手段(按有效性排,都不是 prompt 技巧):
+
+1. **能不给模型的决定权就别给** —— `slugify`(`save-plan.ts:36`)、`resolveLocations()`
+2. **不给它填不准的参数** —— `search-hotel.ts:6`「给个 `priceLevel` 参数等于在 schema 里对模型撒谎」。
+   **schema 里每多一个填不准的字段,就多一条编造路径。**
+3. 参数校验 + 错误回灌(`loop.ts:189`)—— 选错参数能自我修正
+4. 重名装配期就炸(`registry.ts:26`)—— 「调了 A 却执行了 B」在源头排除
+
+**上游的做法值得直接抄**:`packages/evals/` 是一套 model-backed 的行为 eval,
+用 `vitest-evals` 跑真 `AgentSession`,断言直接落在 `toolCalls` 上
+(`src/extensions.eval.ts:79`:「有没有一次成功的 `hello({name:"Bob"})`」)。
+关键是它**不用 pass/fail**:`evalHarnessTable` 带 `repetitions`,`judgeThreshold: null`,
+比的是 baseline 和 candidate 的 **pass-rate lift**(README「Writing comparative eval sets」)。
+「低分是一次观察,不是一次失败」—— 这正好是 injection 那批一直缺的框架。
+
 ## 地图坐标曾经全是编的 —— 已修,留个记录
 
 2026-08-28 查清楚的:`search_poi` 的 content 里**从来没有经纬度**

@@ -82,6 +82,7 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   ├── prompt.md             每次发给模型的三块:systemPrompt / tools / messages
 │   ├── prompt-cache.md       缓存为什么归零的排查记录(方法比结论重要)
 │   ├── answers/              ★ 八个问题的答案,每篇引用自己代码的行号
+│   │   └── for_interview.md  工具这一层的五问:报错/重试/schema 占多少/渐进式加载/选对工具(含 pi 上游做法)
 │   └── debugging.md          Step 9 产出:幻觉 vs agent bug 判据表
 ├── cases/
 │   ├── adversarial.jsonl     Step 8a/8b:不发请求的用例(ood/benign/known-gap/length/path)

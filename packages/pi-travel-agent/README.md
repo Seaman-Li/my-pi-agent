@@ -8,7 +8,8 @@
 [跨会话记忆](docs/memory.md) ·
 [每次发给模型的 prompt 里有什么](docs/prompt.md) ·
 [prompt 缓存排查](docs/prompt-cache.md) ·
-[八个问题的答案](docs/answers/)。
+[八个问题的答案](docs/answers/) ·
+[面试向：工具这一层的五个问题](docs/answers/for_interview.md)。
 
 ## 跑
 
