@@ -77,13 +77,15 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   ├── agent1-travel-plan.md      实施计划
 │   ├── agent1-dev-workflow.md     本文件:文件结构与开发流程
 │   ├── glossary.md           ★ 变量与概念速查,按层分
+│   ├── guard.md              Step 8 产出:什么时候拦、哪个文件干什么活(含高德 key 为什么特殊)
 │   ├── memory.md             Step 6 产出:什么时候记、怎么影响上下文
 │   ├── prompt.md             每次发给模型的三块:systemPrompt / tools / messages
 │   ├── prompt-cache.md       缓存为什么归零的排查记录(方法比结论重要)
 │   ├── answers/              ★ 八个问题的答案,每篇引用自己代码的行号
 │   └── debugging.md          Step 9 产出:幻觉 vs agent bug 判据表
 ├── cases/
-│   └── adversarial.jsonl     Step 8a 的固定对抗用例(ood / benign / known-gap / length)
+│   ├── adversarial.jsonl     Step 8a/8b:不发请求的用例(ood/benign/known-gap/length/path)
+│   └── injection.jsonl       Step 8b:提示注入用例,**真发请求**,每条跑两遍
 ├── prompts/
 │   ├── system.md
 │   ├── extract.md            Step 6:从转录里抽长期偏好的规则(域知识,不进 memory/)
@@ -92,6 +94,7 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   ├── core/                 ★ 通用层,不含任何「旅行」字样,Agent 2 直接搬
 │   │   ├── types.ts          Tool / ToolResult / TurnEndReason + 两个 exhaustive 归类函数
 │   │   ├── estimate.ts       Step 8a:发之前估多大,自校准(真值来自 provider,估值来自字符数)
+│   │   ├── redact.ts         Step 8b:把已知密钥从文本里抹掉。兜底,不是主力
 │   │   ├── model.ts          模型配置 + 取 key + 唯一的 pi-ai 调用点
 │   │   ├── registry.ts       工具注册表
 │   │   ├── hooks.ts          Hook 注册表(4 个挂载点;beforeStep/beforeToolCall 可短路)
@@ -107,7 +110,7 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   ├── features/             ★ 一个文件 = 一块积木,只通过 hooks 挂进去
 │   │   ├── memory.ts         Step 6:记忆 → systemPrompt,挂 beforeStep
 │   │   ├── compaction.ts     Step 7:阈值判定 + 切点 + 摘要,挂 afterStep
-│   │   ├── guard.ts          Step 8a:域外黑名单 + 单条输入上限,挂 beforeStep(8b 再加出口/路径/预算)
+│   │   ├── guard.ts          Step 8:四件事两个方向 —— 域外/长度(beforeStep)、预算(beforeToolCall)、标注+脱敏(afterToolCall)
 │   │   ├── confirm.ts        不可逆的工具先问人 —— Step 8 权限确认的原型
 │   │   └── trace.ts          Step 9:trace + replay
 │   ├── tools/                ★ 旅行域
@@ -271,7 +274,7 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
 | 5 | v3-session | 多轮对话 + 会话持久化 | 2 ✅ | 退出重进,历史还在 |
 | 6 ✅ | v4-memory | 跨会话记忆 | 1 ✅ | 新会话不推荐爬山 —— **但验收地点要选对**,见下 |
 | 7 ✅ | v5-compaction | 上下文压缩 | 1 ✅ | 触发压缩;压缩后跟的是**新**意图 —— **但要让被问的东西只可能来自摘要**,见下 |
-| 8 | v6-guard | 边界与拒答 | 2(8a ✅) | 对抗用例集全部被挡 |
+| 8 ✅ | v6-guard | 边界与拒答 | 2 ✅ | 32 条免费用例 + 5 条注入用例 |
 | 9 | v7-debug | 可定位:trace + replay | 1 | 同一 session 能重放,结论可复现 |
 | 10 | v8-mcp | MCP 对照实验(选做) | 1 | 两条路径同一问题输出一致 |
 
@@ -286,7 +289,7 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
 | 5 | 5a ✅ | REPL 多轮,`messages` 跨轮累积(仍在内存)+ `terminal.ts` 收口 stdin + 断链修补 | ✅ 能连着聊 |
 | 5 | 5b ✅ | `session/types.ts` + `store.ts` JSONL(parentId 树)+ `--resume` + 四层校验 | ✅ 退出重进历史还在 |
 | 8 ✅ | 8a | 域外拦截:`beforeStep` 廉价闸 + 拒答话术 + **对抗用例集** + 单条输入上限 | ✅ 问 transformer 被拒,`in 0 / out 0`;28 条用例全过 |
-| 8 | 8b | 注入标注 + 出口域名白名单 + 路径限制 + 调用预算 | ✅ 注入用例被挡,超预算停 |
+| 8 ✅ | 8b | 注入标注 + 调用预算 + 脱敏(出口白名单/路径限制**没有入口**,见 Q6) | ✅ 带标注 5 条全过,不带那列会抖;第 4 次调用被预算换掉 |
 
 > Step 5 的 REPL 是补进来的 —— 原计划漏了。没有多轮就没有「历史」,`--resume` 也就无从谈起。
 >
@@ -503,7 +506,7 @@ Step 8a 的主要产出不是那道闸,是**一组固定的对抗用例**(域外
 | 3 | 工具调用怎么执行 | Step 3(3b) | `core/loop.ts` 的 execute 段 | 原计划把并行和 abort 放进「选做」,现在提到 Step 3b——否则这题只能答一半 |
 | 4 ✅ | 长上下文怎么压缩 | Step 7 | `features/compaction.ts` + **`docs/answers/q4-compaction.md`** | 窗口调到 12k 真触发了 3 次。阈值取在 `contextWindow − maxTokens` 上而不是整个窗口 —— 后者对 `maxTokens` 384K 的 provider 不成立。**最值钱的是那个写错的闸**:「压不动就永久关掉压缩」看着显然正确,实测第 2 轮就撞阈值、那时压不动,于是后面三次压缩一次都不会发生,还不报错 |
 | 5 ✅ | session 怎么持久化和恢复 | Step 5(5b) | `session/store.ts` + **`docs/answers/q5-session.md`**(27 处行号引用,有脚本校验) | 四种手改都验过了:非法 JSON(报行号)、id 重复(报行号)、`parentId` 指向不存在的 id、删掉 toolResult 再把链接好。**四种全部报错,一种都不跳过**。`/new` 用换父节点表达,旧分支一条不删 —— 这是「树」这个设计唯一被真正用到的地方 |
-| 6 | 安全边界怎么设计,和沙箱是不是一回事 | Step 8(8a 拒答 / 8b 边界) | `features/guard.ts` | 见下。域外拦截和注入是两个方向,详见[意图与拒答](#三五意图与拒答) |
+| 6 ✅ | 安全边界怎么设计,和沙箱是不是一回事 | Step 8(8a 拒答 / 8b 边界) | `features/guard.ts` + **`docs/answers/q6-boundary.md`** | 做完才看清的对称:**两个方向的第一层都是 system prompt,第二层才是 hook**;域外那边第二层买的是**钱**(`in 0/out 0` vs `$0.0001`,结果一样),注入那边买的是**稳定性**(带标注 4 次全过,不带 5 次漏 4 次)。路径穿越和 SSRF 都是「**没有入口**」而不是「挡住了」 |
 | 7 | 出错了怎么定位,幻觉还是 agent bug | Step 9 | `--trace` / `--replay` | 见下 |
 | 8 | 用不用 MCP,无状态和有状态什么区别 | Step 10 | MCP 版 weather | 见下 |
 

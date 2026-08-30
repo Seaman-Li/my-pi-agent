@@ -297,6 +297,16 @@ async function main(): Promise<number> {
 	 * 而压缩救不了这种(一条消息没法自己压自己)。
 	 */
 	const maxUserTokens = Math.floor(usableTokens(spec) * 0.25);
+	/**
+	 * 工具调用预算。**和 `max_steps` 不是一回事** —— 那个数的是请求轮数,
+	 * 这个数的是调用次数:一步里并行六个 POI 搜索只算一步,却是六次外部请求,而花钱的是后者。
+	 *
+	 * 两个数都照着实测定:一次完整的「兰州+武威 5 天自驾」用了 **14 次**
+	 * (weather 4 / search_poi 7 / search_hotel 2 / save_plan 1)。
+	 * 单轮 24 留了七成余量,够任何一次正常规划;单会话 300 是**跑飞的兜底**,不是配额。
+	 */
+	const TOOL_CALLS_PER_TURN = 24;
+	const TOOL_CALLS_PER_SESSION = 300;
 	// 一个进程一个实例:校准比值是会话级的,而这个进程只服务一个会话。
 	const meter = createTokenMeter();
 
@@ -315,7 +325,17 @@ async function main(): Promise<number> {
 			trace: args.trace,
 			asker: terminal && isInteractive() ? createTerminalAsker(terminal) : undefined,
 			memory: memory && { store: memory, basePrompt: systemPrompt },
-			guard: args.guard ? { meter, maxUserTokens } : undefined,
+			guard: args.guard
+				? {
+						meter,
+						maxUserTokens,
+						maxToolCallsPerTurn: TOOL_CALLS_PER_TURN,
+						maxToolCallsPerSession: TOOL_CALLS_PER_SESSION,
+						// **兜底而不是主力**:key 本来就只在 amap.ts 和 model.ts 出现。
+						// 高德那个可能没配(不用地图也能跑),空串会被 redactor 自己丢掉。
+						secrets: [apiKey, process.env.AMAP_KEY ?? ""],
+					}
+				: undefined,
 			// **没有 session 就不装压缩。** 单轮模式不建会话文件(见 BACKLOG),
 			// 而压缩必须留下压缩点 —— 一段历史被换掉却没人记下来,是查不回来的信息丢失。
 			compaction:

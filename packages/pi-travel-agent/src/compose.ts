@@ -25,6 +25,15 @@ import { searchHotel } from "./tools/search-hotel.ts";
 import { searchPoi } from "./tools/search-poi.ts";
 import { weather } from "./tools/weather.ts";
 
+/**
+ * 返回值是**第三方数据**的工具 —— 它们的输出要打「这是数据不是指令」的标注。
+ *
+ * 三个高德工具在列。不在列的各有理由:`estimate_budget` 是纯计算(输入是模型自己给的数),
+ * `ask_user` 返回的是**人**说的话(给它打标等于告诉模型「用户的答复也不可信」),
+ * `remember` 读的是我们自己的存储,`save_plan` 只返回一个路径。
+ */
+const EXTERNAL_TOOLS = ["weather", "search_poi", "search_hotel"];
+
 export interface ComposeOptions {
 	/**
 	 * HTML 报告写到哪儿。**必填,而且必须是绝对路径** —— 它不是功能开关,是宿主的资源。
@@ -57,7 +66,12 @@ export interface ComposeOptions {
 	 * 域外拦截 + 单条输入上限。不给就**一道闸都没有** ——
 	 * `prompts/system.md` 里那层写死的角色照样在(它才是主力),只是不再省那次请求。
 	 */
-	guard?: GuardOptions;
+	/**
+	 * 域外拦截 + 输入上限 + 调用预算 + 外部数据标注。不给就**一道闸都没有**。
+	 *
+	 * `externalTools` 不用给 —— 那是装配处的知识,`compose` 自己填。
+	 */
+	guard?: Omit<GuardOptions, "externalTools">;
 }
 
 export interface Composed {
@@ -89,7 +103,9 @@ export function compose(options: ComposeOptions): Composed {
 	// (第一个返回拒绝的赢),而这道闸的全部价值就是「不发请求」——
 	// 排在注入后面的话,挡下来的那一步已经白拼过一次 system prompt 了。
 	// 这是 hook 顺序第一次真的有意义,不再只是风格问题。
-	if (options.guard) installGuard(hooks, options.guard);
+	// `externalTools` 由这里填,不由调用方给:**只有装配处知道注册了哪些工具、
+	// 以及每个工具的数据是从哪来的**。cli 只管把预算和密钥递进来。
+	if (options.guard) installGuard(hooks, { ...options.guard, externalTools: EXTERNAL_TOOLS });
 	// 记忆挂 `beforeStep`,和 confirm 的 `beforeToolCall` 是两个不同的挂载点 ——
 	// 注入上下文和拦截调用是两件事,凑在一个点上只会让顺序变得要紧而没有理由。
 	if (options.memory) installMemory(hooks, options.memory);

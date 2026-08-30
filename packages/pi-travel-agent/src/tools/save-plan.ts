@@ -33,7 +33,7 @@ export interface SavePlanOptions {
  * 写成「过滤掉 `..`」那种黑名单是另一回事:总有下一个没想到的写法(`....//`、URL 编码、
  * NUL 截断),而白名单不需要想全。
  */
-function slugify(title: string): string {
+export function slugify(title: string): string {
 	const kept = title
 		.normalize("NFKC")
 		.replace(/\s+/gu, "-")
