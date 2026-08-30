@@ -79,15 +79,59 @@ export function textOf(content: (TextContent | ImageContent)[]): string {
 
 /**
  * turn 为什么结束。**默认是停,继续才需要理由** —— 只有「模型要调工具而且这条消息是完整的」
- * 才继续下一步,其余全部落进这五种之一。
+ * 才继续下一步,其余全部落进这六种之一。
  *
  * - `completed`  模型没再要工具,正常说完
  * - `truncated`  这条回复被 maxTokens 截断了,里面的工具参数不可信
  * - `aborted`    Ctrl-C 或上游取消
  * - `error`      模型侧失败
  * - `max_steps`  步数触顶,防死循环的闸
+ * - `rejected`   `beforeStep` 上的闸把这一步挡了,**请求根本没发出去**(Step 8a)
+ *
+ * **加成员时看下面那两个函数。** 这个类型是字符串联合,`reason === "completed"` 这种比较
+ * 加一个成员**不会报任何错** —— 新成员只会静悄悄落进别人的 else 分支。所以「怎么归类」
+ * 不散在各处写,收在下面两个 exhaustive switch 里,漏一个 TS 会说「不是所有路径都有返回值」。
  */
-export type TurnEndReason = "completed" | "truncated" | "aborted" | "error" | "max_steps";
+export type TurnEndReason = "completed" | "truncated" | "aborted" | "error" | "max_steps" | "rejected";
+
+/**
+ * 多轮会话里,这一轮算不算**故障**(决定 REPL 的退出码)。
+ *
+ * `aborted` 不算 —— 那是用户按的 Ctrl-C,是决定不是故障。
+ * `rejected` 也不算 —— 那是我们主动挡的,闸正常工作恰恰说明没出事。
+ */
+export function isTurnFailure(reason: TurnEndReason): boolean {
+	switch (reason) {
+		case "completed":
+		case "aborted":
+		case "rejected":
+			return false;
+		case "truncated":
+		case "error":
+		case "max_steps":
+			return true;
+	}
+}
+
+/**
+ * 单轮模式里,这一次**给出完整答案了吗**(决定进程退出码)。
+ *
+ * 判据和上面那个**不一样,是有意的**:单轮问的是「我这次问答拿到东西了吗」,
+ * 多轮问的是「这个会话出过故障吗」。所以这里 `aborted` 也算没拿到 ——
+ * 一次性问答被打断,脚本调用方该知道结果不可用。
+ */
+export function isAnswerComplete(reason: TurnEndReason): boolean {
+	switch (reason) {
+		case "completed":
+			return true;
+		case "rejected":
+		case "aborted":
+		case "truncated":
+		case "error":
+		case "max_steps":
+			return false;
+	}
+}
 
 /**
  * 对外事件。UI 只认这一层。
@@ -104,6 +148,7 @@ export type AgentEvent =
 	| { type: "assistant_event"; event: AssistantMessageEvent }
 	| { type: "tool_start"; toolCallId: string; name: string; args: unknown }
 	| { type: "tool_end"; toolCallId: string; name: string; text: string; isError: boolean; ms: number }
+	| { type: "rejected"; message: string }
 	| { type: "turn_end"; reason: TurnEndReason; steps: number }
 	| { type: "error"; message: string };
 

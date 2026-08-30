@@ -82,16 +82,19 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   ├── prompt-cache.md       缓存为什么归零的排查记录(方法比结论重要)
 │   ├── answers/              ★ 八个问题的答案,每篇引用自己代码的行号
 │   └── debugging.md          Step 9 产出:幻觉 vs agent bug 判据表
+├── cases/
+│   └── adversarial.jsonl     Step 8a 的固定对抗用例(ood / benign / known-gap / length)
 ├── prompts/
 │   ├── system.md
 │   ├── extract.md            Step 6:从转录里抽长期偏好的规则(域知识,不进 memory/)
 │   └── compact.md            Step 7:摘要要留下什么(同上,域知识不进 features/)
 ├── src/
 │   ├── core/                 ★ 通用层,不含任何「旅行」字样,Agent 2 直接搬
-│   │   ├── types.ts          Tool / ToolResult / StepContext / Hook 上下文
+│   │   ├── types.ts          Tool / ToolResult / TurnEndReason + 两个 exhaustive 归类函数
+│   │   ├── estimate.ts       Step 8a:发之前估多大,自校准(真值来自 provider,估值来自字符数)
 │   │   ├── model.ts          模型配置 + 取 key + 唯一的 pi-ai 调用点
 │   │   ├── registry.ts       工具注册表
-│   │   ├── hooks.ts          Hook 注册表(4 个挂载点)
+│   │   ├── hooks.ts          Hook 注册表(4 个挂载点;beforeStep/beforeToolCall 可短路)
 │   │   ├── context.ts        messages 形状的不变量(toolCall 必须配对)—— Step 5a
 │   │   └── loop.ts           ★ agent loop —— Step 2 之后只读
 │   ├── session/              ★ harness:一次会话是什么,和终端无关 —— Step 5b
@@ -104,7 +107,7 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   ├── features/             ★ 一个文件 = 一块积木,只通过 hooks 挂进去
 │   │   ├── memory.ts         Step 6:记忆 → systemPrompt,挂 beforeStep
 │   │   ├── compaction.ts     Step 7:阈值判定 + 切点 + 摘要,挂 afterStep
-│   │   ├── guard.ts          Step 8:出口白名单/路径/预算/外部数据标注
+│   │   ├── guard.ts          Step 8a:域外黑名单 + 单条输入上限,挂 beforeStep(8b 再加出口/路径/预算)
 │   │   ├── confirm.ts        不可逆的工具先问人 —— Step 8 权限确认的原型
 │   │   └── trace.ts          Step 9:trace + replay
 │   ├── tools/                ★ 旅行域
@@ -116,6 +119,7 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   │   ├── estimate-budget.ts
 │   │   ├── remember.ts       Step 6:记忆的显式写入口(记 / 忘)
 │   │   └── save-plan.ts
+│   ├── run-cases.ts          ★ 入口②:跑对抗用例,不发请求
 │   ├── report.ts             TripPlan → 自包含 HTML
 │   ├── compose.ts            ★ 唯一接线处
 │   ├── terminal.ts           ★ 唯一碰 stdin/readline 的文件 —— Step 5a
@@ -267,7 +271,7 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
 | 5 | v3-session | 多轮对话 + 会话持久化 | 2 ✅ | 退出重进,历史还在 |
 | 6 ✅ | v4-memory | 跨会话记忆 | 1 ✅ | 新会话不推荐爬山 —— **但验收地点要选对**,见下 |
 | 7 ✅ | v5-compaction | 上下文压缩 | 1 ✅ | 触发压缩;压缩后跟的是**新**意图 —— **但要让被问的东西只可能来自摘要**,见下 |
-| 8 | v6-guard | 边界与拒答 | 2 | 对抗用例集全部被挡 |
+| 8 | v6-guard | 边界与拒答 | 2(8a ✅) | 对抗用例集全部被挡 |
 | 9 | v7-debug | 可定位:trace + replay | 1 | 同一 session 能重放,结论可复现 |
 | 10 | v8-mcp | MCP 对照实验(选做) | 1 | 两条路径同一问题输出一致 |
 
@@ -281,7 +285,7 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
 | 3 | 3b | `search_hotel` + `estimate_budget` + `ask_user` + **重写 system prompt** + 并行执行 + abort 贯穿 + 参数 Convert→Check | ✅ 能出完整行程,信息不全会问 |
 | 5 | 5a ✅ | REPL 多轮,`messages` 跨轮累积(仍在内存)+ `terminal.ts` 收口 stdin + 断链修补 | ✅ 能连着聊 |
 | 5 | 5b ✅ | `session/types.ts` + `store.ts` JSONL(parentId 树)+ `--resume` + 四层校验 | ✅ 退出重进历史还在 |
-| 8 | 8a | 域外拦截:`beforeStep` 廉价闸 + 拒答话术 + **对抗用例集** | ✅ 问 transformer 被拒 |
+| 8 ✅ | 8a | 域外拦截:`beforeStep` 廉价闸 + 拒答话术 + **对抗用例集** + 单条输入上限 | ✅ 问 transformer 被拒,`in 0 / out 0`;28 条用例全过 |
 | 8 | 8b | 注入标注 + 出口域名白名单 + 路径限制 + 调用预算 | ✅ 注入用例被挡,超预算停 |
 
 > Step 5 的 REPL 是补进来的 —— 原计划漏了。没有多轮就没有「历史」,`--resume` 也就无从谈起。

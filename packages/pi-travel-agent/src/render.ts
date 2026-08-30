@@ -48,6 +48,12 @@ export function createRenderer(): EventSink {
 				process.stdout.write(`${DIM}  ${mark} ${oneLine(agentEvent.text)} (${agentEvent.ms}ms)${RESET}\n`);
 				return;
 			}
+			case "rejected":
+				// **正文颜色打,不是灰的。** 这句话是用户这一轮唯一收到的回答 ——
+				// 灰字在这个终端里表示「元信息」(工具调用、账单、提示),
+				// 而它是助手真的在回他的话,和模型正常吐出来的正文同一个身份。
+				process.stdout.write(`${agentEvent.message}\n`);
+				return;
 			case "turn_start":
 			case "step_start":
 			case "turn_end":

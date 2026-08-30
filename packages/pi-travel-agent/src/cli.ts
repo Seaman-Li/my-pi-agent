@@ -12,7 +12,9 @@ import { fileURLToPath } from "node:url";
 import type { Context } from "@earendil-works/pi-ai";
 import { type Composed, compose } from "./compose.ts";
 import { runTurn } from "./core/loop.ts";
-import { DEFAULT_MODEL, type ModelSpec, resolveApiKey, resolveModel } from "./core/model.ts";
+import { createTokenMeter } from "./core/estimate.ts";
+import { DEFAULT_MODEL, type ModelSpec, resolveApiKey, resolveModel, usableTokens } from "./core/model.ts";
+import { isAnswerComplete } from "./core/types.ts";
 import { extractMemories } from "./memory/extract.ts";
 import { type MemoryStore, openMemory } from "./memory/store.ts";
 import { createRenderer, DIM, formatTurnSummary, RESET } from "./render.ts";
@@ -38,6 +40,7 @@ const USAGE = `用法:
   --trace               把四个挂载点的进出打到 stderr
   --no-memory           这次不读也不写 data/memory.json
   --no-compact          这次不压上下文(长了也不压,撞窗口就撞)
+  --no-guard            这次不拦域外提问、也不限单条输入长度
   --resume-full         恢复时忽略压缩点,读回压缩前的完整历史
   --help                这份说明
 `;
@@ -89,6 +92,8 @@ interface Args {
 	memory: boolean;
 	/** 上下文压缩开不开。`--no-compact` 关。 */
 	compaction: boolean;
+	/** 域外拦截 + 输入上限开不开。`--no-guard` 关。 */
+	guard: boolean;
 	/** 恢复时读压缩前的完整历史。`--resume-full` 开。 */
 	resumeFull: boolean;
 }
@@ -109,6 +114,7 @@ function parseArgs(argv: string[]): Args {
 	let sessions = false;
 	let memory = true;
 	let compaction = true;
+	let guard = true;
 	let resumeFull = false;
 	let resume: string | undefined;
 	for (let i = 0; i < argv.length; i++) {
@@ -127,6 +133,8 @@ function parseArgs(argv: string[]): Args {
 			memory = false;
 		} else if (arg === "--no-compact") {
 			compaction = false;
+		} else if (arg === "--no-guard") {
+			guard = false;
 		} else if (arg === "--resume-full") {
 			// 只影响「读回来的是哪一份历史」,不影响往后怎么记 —— 压缩点还在文件里,
 			// 这次聊的照样往后追加。
@@ -144,7 +152,20 @@ function parseArgs(argv: string[]): Args {
 			rest.push(arg);
 		}
 	}
-	return { prompt: rest.join(" "), model, thinking, trace, chat, help, sessions, resume, memory, compaction, resumeFull };
+	return {
+		prompt: rest.join(" "),
+		model,
+		thinking,
+		trace,
+		chat,
+		help,
+		sessions,
+		resume,
+		memory,
+		compaction,
+		guard,
+		resumeFull,
+	};
 }
 
 /**
@@ -179,8 +200,9 @@ async function runOnce(
 	});
 	terminal?.close();
 	process.stdout.write(`${formatTurnSummary(spec, result, context)}\n`);
-	// completed 之外都算没跑成:truncated 和 max_steps 也是「没给出完整答案」。
-	return result.reason === "completed" ? 0 : 1;
+	// 判据收在 core/types.ts 的 exhaustive switch 里,不散在这儿写 ——
+	// 加一个 TurnEndReason 成员时,那边会报错,这里不会。
+	return isAnswerComplete(result.reason) ? 0 : 1;
 }
 
 /**
@@ -267,6 +289,18 @@ async function main(): Promise<number> {
 	const memoryPath = join(PACKAGE_ROOT, "data", "memory.json");
 
 	/**
+	 * 单条用户输入的上限:**可用输入的 25%**。
+	 *
+	 * 不写死一个数,理由和压缩阈值一样 —— 它得跟着 provider 走
+	 * (本地 8K 和 deepseek 1M 差两个数量级)。25% 表达的是一句话:
+	 * **一条消息不该吃掉超过四分之一的可用空间**,否则剩下的历史和回答都没地方放,
+	 * 而压缩救不了这种(一条消息没法自己压自己)。
+	 */
+	const maxUserTokens = Math.floor(usableTokens(spec) * 0.25);
+	// 一个进程一个实例:校准比值是会话级的,而这个进程只服务一个会话。
+	const meter = createTokenMeter();
+
+	/**
 	 * 装配。`asker` 只在**有终端而且是真人在敲**时才给。
 	 *
 	 * 管道喂进来的 chat 不算:那些行是一轮一轮的**提问**,`ask_user` 一旦注册,
@@ -281,6 +315,7 @@ async function main(): Promise<number> {
 			trace: args.trace,
 			asker: terminal && isInteractive() ? createTerminalAsker(terminal) : undefined,
 			memory: memory && { store: memory, basePrompt: systemPrompt },
+			guard: args.guard ? { meter, maxUserTokens } : undefined,
 			// **没有 session 就不装压缩。** 单轮模式不建会话文件(见 BACKLOG),
 			// 而压缩必须留下压缩点 —— 一段历史被换掉却没人记下来,是查不回来的信息丢失。
 			compaction:

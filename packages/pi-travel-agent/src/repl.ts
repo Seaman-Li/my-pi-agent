@@ -12,6 +12,7 @@ import { dropEmptyAssistantMessages, repairDanglingToolCalls } from "./core/cont
 import type { Hooks } from "./core/hooks.ts";
 import type { Compactor } from "./features/compaction.ts";
 import { runTurn } from "./core/loop.ts";
+import { isTurnFailure } from "./core/types.ts";
 import type { ModelSpec } from "./core/model.ts";
 import type { Registry } from "./core/registry.ts";
 import { DIM, RESET, createRenderer, formatHistory, formatTurnSummary } from "./render.ts";
@@ -248,7 +249,7 @@ export async function runRepl(options: ReplOptions): Promise<number> {
 		ledger.input += result.usage.input;
 		ledger.output += result.usage.output;
 		ledger.cost += result.usage.cost.total;
-		if (result.reason !== "completed" && result.reason !== "aborted") failed = true;
+		if (isTurnFailure(result.reason)) failed = true;
 		if (result.reason === "aborted") process.stdout.write(`${DIM}(已中断)${RESET}\n`);
 		process.stdout.write(`${formatTurnSummary(spec, result, context, ledger.turns)}\n`);
 	}

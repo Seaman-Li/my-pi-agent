@@ -50,8 +50,27 @@ export interface ToolCallOverride {
 	isError?: boolean;
 }
 
+/**
+ * `beforeStep` 想把这一步挡下来时返回的东西。返回它 = **这次请求根本不发**,turn 就此结束。
+ *
+ * 只有一个字段,而且它是**给模型也给人看的那句话**:它会作为一条 assistant 消息
+ * 进历史(loop.ts),用户在终端上看到的就是它。所以写的时候当成「助手会怎么回绝」,
+ * 不是「系统错误信息」。
+ *
+ * **为什么值得为它改 loop。** `runBeforeStep` 原来返回 `void`,handler 只能改 context,
+ * 没法说「这步别发了」。而域外拦截和输入上限这两件事的**全部价值就在于不发请求** ——
+ * 发出去再判断,省不下钱也省不下延迟。「改 loop 的唯一合法理由是增加挂载点能力」,
+ * 这条属于那一类,Step 2b 建骨架时就记在 BACKLOG 里免得到时候当成意外。
+ */
+export interface StepRejection {
+	message: string;
+}
+
 export interface Hooks {
-	beforeStep: ((ctx: StepContext) => Promise<void> | void)[];
+	// 和 `beforeToolCall` 同一个形状:返回值 = 拦下来,什么都不返回 = 放行。
+	// void 是必需的,理由见下面那条注释。
+	// biome-ignore lint/suspicious/noConfusingVoidType: 见 beforeToolCall
+	beforeStep: ((ctx: StepContext) => Promise<StepRejection | void> | StepRejection | void)[];
 	// 这里的 void 是必需的:只观察不拦截的 handler 得能「什么都不返回」;
 	// 换成 undefined 就要求每个观察者显式 `return undefined`。
 	// biome-ignore lint/suspicious/noConfusingVoidType: 见上
@@ -65,9 +84,22 @@ export function emptyHooks(): Hooks {
 	return { beforeStep: [], beforeToolCall: [], afterToolCall: [], afterStep: [] };
 }
 
-/** 按注册顺序串行跑 `beforeStep`。串行不是性能问题:后一个 handler 要看到前一个改过的 context。 */
-export async function runBeforeStep(hooks: Hooks, ctx: StepContext): Promise<void> {
-	for (const handler of hooks.beforeStep) await handler(ctx);
+/**
+ * 按注册顺序串行跑 `beforeStep`,**第一个返回拒绝的赢,后面的不再跑**。
+ *
+ * 串行不是性能问题:后一个 handler 要看到前一个改过的 context。
+ * 短路和 `beforeToolCall` 同一条理由 —— 拦不拦是个单点决策,两个 handler 同时说
+ * 「我来拒」没有合理的合并方式。只想注入上下文的 handler 什么都别返回。
+ *
+ * **顺序因此变得有意义了**:闸要挂在注入前面。挡下来的那一步不发请求,
+ * 后面那些注入白做 —— 而这正是那道闸存在的理由。装配顺序在 compose.ts 里定。
+ */
+export async function runBeforeStep(hooks: Hooks, ctx: StepContext): Promise<StepRejection | undefined> {
+	for (const handler of hooks.beforeStep) {
+		const rejection = await handler(ctx);
+		if (rejection) return rejection;
+	}
+	return undefined;
 }
 
 /**

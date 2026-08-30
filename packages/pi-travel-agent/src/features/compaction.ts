@@ -8,9 +8,10 @@
  *       摘要怎么写是域知识,由入口从 `prompts/compact.md` 读了传进来,不写在这儿。
  */
 
-import type { Context, Message, Usage } from "@earendil-works/pi-ai";
+import type { Context, Message } from "@earendil-works/pi-ai";
+import { promptTokensOf } from "../core/estimate.ts";
 import type { AfterStepContext, Hooks } from "../core/hooks.ts";
-import { type ModelSpec, stream } from "../core/model.ts";
+import { type ModelSpec, stream, usableTokens } from "../core/model.ts";
 import { textOf } from "../core/types.ts";
 import type { Session } from "../session/store.ts";
 import type { CompactionEntry } from "../session/types.ts";
@@ -70,23 +71,6 @@ export interface CompactionOptions {
 	session: Session;
 	/** 压完了说一声。features 自己不打印,由入口决定怎么显示。 */
 	notify?: (outcome: CompactionOutcome) => void;
-}
-
-/**
- * 这次请求的 prompt 实际有多大。
- *
- * **三项相加,不能只看 `input`**:`input` 是**减出来**的
- * (`prompt_tokens − cached_tokens − cache_write_tokens`,见 docs/prompt-cache.md)。
- * DeepSeek 上缓存命中率能到 96%,只看 `input` 会把 12000 token 的上下文当成 500,
- * 阈值永远不触发 —— 而这恰恰是最需要压的那条路。
- */
-export function promptTokensOf(usage: Usage): number {
-	return usage.input + usage.cacheRead + usage.cacheWrite;
-}
-
-/** 真正能留给输入的空间:总信封减掉可能吐出来的输出。`resolveModel` 已经保证它是正数。 */
-export function usableTokens(spec: ModelSpec): number {
-	return spec.model.contextWindow - spec.model.maxTokens;
 }
 
 /** 该压了没有。 */

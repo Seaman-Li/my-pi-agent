@@ -13,6 +13,7 @@ import { Registry } from "./core/registry.ts";
 import type { Asker } from "./core/types.ts";
 import { type CompactionOptions, type Compactor, installCompaction } from "./features/compaction.ts";
 import { installConfirm } from "./features/confirm.ts";
+import { type GuardOptions, installGuard } from "./features/guard.ts";
 import { installMemory } from "./features/memory.ts";
 import { installTrace } from "./features/trace.ts";
 import type { MemoryStore } from "./memory/store.ts";
@@ -52,6 +53,11 @@ export interface ComposeOptions {
 	 * 所以**没有会话记录的运行(单轮模式)压根不装这块积木**。
 	 */
 	compaction?: CompactionOptions;
+	/**
+	 * 域外拦截 + 单条输入上限。不给就**一道闸都没有** ——
+	 * `prompts/system.md` 里那层写死的角色照样在(它才是主力),只是不再省那次请求。
+	 */
+	guard?: GuardOptions;
 }
 
 export interface Composed {
@@ -77,8 +83,13 @@ export function compose(options: ComposeOptions): Composed {
 	if (options.memory) tools.register(createRemember(options.memory.store));
 
 	const hooks = emptyHooks();
-	// trace 先挂:它只观察不拦截,得让它先把这次调用记下来,再轮到 confirm 决定放不放。
+	// trace 先挂:它只观察不拦截,得让它先把这次调用记下来,再轮到别人决定放不放。
 	if (options.trace) installTrace(hooks);
+	// **guard 必须排在 memory 前面。** Step 8a 之后 `beforeStep` 会短路
+	// (第一个返回拒绝的赢),而这道闸的全部价值就是「不发请求」——
+	// 排在注入后面的话,挡下来的那一步已经白拼过一次 system prompt 了。
+	// 这是 hook 顺序第一次真的有意义,不再只是风格问题。
+	if (options.guard) installGuard(hooks, options.guard);
 	// 记忆挂 `beforeStep`,和 confirm 的 `beforeToolCall` 是两个不同的挂载点 ——
 	// 注入上下文和拦截调用是两件事,凑在一个点上只会让顺序变得要紧而没有理由。
 	if (options.memory) installMemory(hooks, options.memory);

@@ -247,8 +247,34 @@ export async function runTurn(options: TurnOptions): Promise<TurnResult> {
 		}
 		steps++;
 		await sink?.({ type: "step_start", step: steps });
-		// 决定模型看到什么。memory 注入挂这里 —— 对应 dsh 的 agent/pre-step。
-		await runBeforeStep(hooks, { step: steps, context });
+		// 决定模型看到什么(memory 注入),以及**要不要发**(Step 8a 的闸)。
+		// 对应 dsh 的 agent/pre-step:可以改 context,也可以 reject 掉整个 step。
+		const rejection = await runBeforeStep(hooks, { step: steps, context });
+		if (rejection) {
+			// **把拒答话术当成 assistant 消息记进历史。** 不记的话,历史里会留下一条
+			// 没人回答的 user 消息 —— 下一轮模型看到它,多半会去把它答了,
+			// 那道闸等于只挡住了一步。
+			//
+			// 这条消息是我们编的,不是模型说的:`usage` 全 0(确实一分钱没花)、
+			// `stopReason` 是 stop、`model`/`provider` 记的是**本来要问的那个模型**。
+			// 记它的理由和 `context.ts` 里「补断链的 toolResult」一样 ——
+			// **历史要对得上用户眼睛看到的东西**,他屏幕上收到的就是这句话。
+			// 代价是 `--resume` 之后它和真回复长得一样,只能靠 TurnEntry 的 reason 分辨。
+			const refusal: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: rejection.message }],
+				api: spec.model.api,
+				provider: spec.model.provider,
+				model: spec.model.id,
+				usage: emptyUsage(),
+				stopReason: "stop",
+				timestamp: Date.now(),
+			};
+			context.messages.push(refusal);
+			await sink?.({ type: "rejected", message: rejection.message });
+			reason = "rejected";
+			break;
+		}
 
 		const message = await stream(spec, { context, apiKey, signal, sink, reasoning: options.reasoning });
 		context.messages.push(message);

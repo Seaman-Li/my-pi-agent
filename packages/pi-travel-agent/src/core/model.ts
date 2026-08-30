@@ -268,6 +268,17 @@ export function resolveModel(name: string = DEFAULT_MODEL): ModelSpec {
 }
 
 /**
+ * 真正能留给**输入**的空间:总信封减掉可能吐出来的输出。
+ *
+ * `checkWindow` 已经保证它是正数。放 core 不放 features:它只是关于一个 `ModelSpec`
+ * 的算术,而现在压缩阈值和 guard 的单条输入上限**两块积木都要用它** ——
+ * 留在其中一块里就成了积木互相 import。
+ */
+export function usableTokens(spec: ModelSpec): number {
+	return spec.model.contextWindow - spec.model.maxTokens;
+}
+
+/**
  * 窗口和 maxTokens 的关系检查。
  *
  * `contextWindow` 是**总信封**,输入和输出都得装进去(qwen 的模型卡写得最清楚:

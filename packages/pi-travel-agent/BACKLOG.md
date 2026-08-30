@@ -14,17 +14,52 @@ Step 2a 实测:想让模型故意用非法参数调工具触发 `execute` 抛错
 它们都需要「不依赖模型配合」的手段。Step 9 的 `--replay` 正好提供这个:
 喂一段固定的 assistant 消息进 loop,不发真请求。到那一步一起补。
 
-## `beforeStep` 需要能拒绝 —— Step 8a
+## pi-ai 的 4096 安全余量在小窗口上占比过大 —— 有需要再说
 
-Step 8a 的域外拦截要做的是「用户问 transformer → 直接拒答,不发请求」,该挂 `beforeStep`。
-但现在 `runBeforeStep` 返回 `void`,handler 只能改 `context`,**没法说「这步别发了」**。
+`clampMaxTokensToContext`(`packages/ai/src/api/simple-options.ts:15`)每次请求都会拿
+`contextWindow` 夹一次 `max_tokens`,里面有个写死的 `CONTEXT_SAFETY_TOKENS = 4096`:
 
-到 8a 时给它加返回值(参考 dsh 的 `agent/pre-step`:waterfall,可以 reject 掉整个 step)。
-返回值具体长什么样等真做的时候再定 —— 现在提前加是猜。
+```
+available  = contextWindow − estimateContextTokens(context) − 4096
+max_tokens = min(maxTokens, max(1, available))
+```
 
-**这是一次计划内的 `loop.ts` 修改。** 「loop 只读」的准确含义是:
-改 loop 的唯一合法理由是**增加挂载点**;为了加功能而改 loop 不合法。
-这条属于前者,记在这里免得到时候当成意外。
+实测(本地假服务器截真实请求体,`est = 1475`):
+
+| `LOCAL_CONTEXT_WINDOW` | 实际发出的 `max_tokens` |
+|---|---|
+| 8192 / 16384 | 2048 |
+| **4096** | **1** |
+
+`contextWindow = 4096` 时光保险就吃光了整个窗口,模型每次只被允许吐 1 个 token。
+拿小模型测压缩之前要先算一下:**要让我们的压缩阈值抢在这个 clamp 前面生效,
+需要 `contextWindow − maxTokens > 20480`**(`0.8u < u − 4096`)。8192 的本地窗口差得远。
+
+现在没炸,是因为 pi-ai 那个估算器(`CHARS_PER_TOKEN = 4`)在中文上低估 3.5 倍,把 clamp 顺带架空了 ——
+**换成英文或代码(coding agent 场景)就会先撞上它,而不是撞上我们的压缩。**
+我们自己那个自校准的估算器(`core/estimate.ts`)不受影响,它只管我们自己那道闸。
+
+## 长度闸在冷启动那一下是松的 —— Step 9
+
+`core/estimate.ts` 的比值初值是 1(等于 pi-ai 那个 `CHARS_PER_TOKEN = 4`),
+一步之后才被 provider 真值顶掉。而**一个新进程的第一条消息正是最可能超长的那条**(粘贴)。
+
+实测 8a:粘 19517 个中文字符,估出来 4880 token,真实约 17000 —— **偏低 3.5 倍**。
+那次仍然被拦下了(4880 > 上限 3488),但一条 12000 字符的粘贴会估成 3000、放行,
+而它真实约 10500 token。也就是**冷启动时长度闸实际宽 3.5 倍**。
+
+不打算靠调常数补:调成 3.5 就在英文上过严了,这正是当初决定自校准的理由。
+正经做法是把比值**存进会话记录**,`--resume` 时恢复 —— 那样只有「全新会话的第一条」才是冷的。
+等 Step 9 做 replay、要给会话存更多元数据时一起。
+
+## 估算器的校准挂在 guard 上 —— 有需要再说
+
+`meter.calibrate()` 是 `installGuard` 挂的 `afterStep` handler 在调。所以 `--no-guard` 跑的时候
+**比值永远停在初值**。现在没有后果(只有 guard 用它),但哪天 turn 内压缩也要用估算器,
+就会出现「关掉 guard 导致压缩估不准」这种毫无道理的耦合。
+
+到那时把校准从 guard 里拿出来,单独挂一个 handler(或者让 `compose` 直接挂)。
+现在不动是因为多一块只为一行代码存在的积木,比这个耦合更难解释。
 
 ## 三条 Step 8 的小账 —— Step 8
 
@@ -187,85 +222,6 @@ execute(params: Static<S>, ctx: ToolContext): Promise<ToolResult>
 **留这条记录是因为它是一类问题的样板**:抄上游的配置表会连它的**时效**一起抄进来。
 `DEEPSEEK_COST` 一开始是照抄 pi 的 `packages/ai/src/providers/data/deepseek.json`,
 那张表停在 2026-04-24 那版,比涨价早 13 天 —— 抄的时候两边都对,过一阵就只有一边对了。
-
-## 用户输入是唯一没有上限的输入 —— Step 8
-
-工具输出全都截断了(`search-poi.ts:16` 的 `CONTENT_LIMIT = { maxLines: 12, maxBytes: 1200 }`),
-可 `repl.ts:204` 把用户那一行**原样 push 进上下文,没有任何长度检查**。
-
-这是查「怎么写 prompt 能触发压缩」时掉出来的:答案是靠工具输出堆不出来
-(一个 turn 封顶 5.6 万 token,而阈值 49–75 万),**唯一的杠杆就是粘一大段进去**。
-实测粘 12345 字符,一条消息就把 16000 的窗口顶到阈值以上。
-
-**麻烦的是压缩救不了这一种**:
-
-1. 只有一条 user 消息时 `findCutIndex` 恒为 0 —— 一条消息没法自己压自己
-2. 就算再聊两轮让 `cut > 0`,那条巨型消息会落进要摘要的那段,
-   于是**摘要请求自己又超窗口**,`summarize` 返回 `undefined`,还是不压
-
-死在同一个地方两次。真粘一段比窗口还大的东西进去,表现是 provider 甩 400,而且怎么聊都好不了。
-
-放 Step 8 是因为它本质是**入口的输入约束**,和「域外拦截」「调用预算」同一类:
-该在 `beforeStep` 上量一下、超了就拒绝并告诉用户「这段太长了,分几次说」,
-而不是发出去等 provider 报错。等 8a 给 `beforeStep` 加上返回值之后顺手做掉
-(见[`beforeStep` 需要能拒绝](#beforestep-需要能拒绝--step-8a))。
-
-## 缺一个「发之前就知道多大」的估算器 —— Step 8
-
-现在整套压缩只用 **provider 事后返回的 usage**:准、零猜测,但**永远晚一步**。
-判定用的是「上一次请求多大」,而会出事的是「下一次请求多大」——
-中间隔着的正是那次可能撞窗口的请求。窗口 1M 时无所谓,窗口 8K 时那一步就是撞墙的那一步。
-
-撞上去的表现还分 provider,**最坏的那种没有任何信号**:
-
-| | 撞窗口时 |
-|---|---|
-| ollama(本地) | **静默截断,不报错**。模型看不到开头,屏幕上一切正常 |
-| dashscope / deepseek | 400,这一轮 `end error`,整轮白跑 |
-
-两个真正的消费者,都还没做:
-
-- **Step 8 的输入上限**(见[用户输入是唯一没有上限的输入](#用户输入是唯一没有上限的输入--step-8))——
-  要在 `beforeStep` 上量一下就拒绝,发出去就晚了
-- **turn 内压缩 / 工具结果驱逐** —— 同样只能在发之前判
-
-### 放哪、怎么写
-
-`src/core/estimate.ts`,纯函数 `estimateTokens(context): number`。放 core 不放 features:
-两个消费者分属 guard 和 compaction 两块独立积木,共用的东西不能住在其中一块里面。
-
-**别抄 pi-ai 那个固定比例。** `packages/ai/src/utils/estimate.ts:14` 是 `CHARS_PER_TOKEN = 4`,
-实测中文低估 **3.5 倍**(1160 字符 → 估 290,真实约 1018)。拿它做「发之前拒绝」会该拒的不拒。
-
-我们有个 pi-ai 那个函数没有的条件:**每一步都同时拿得到「估的」和「真的」** ——
-`estimateTokens(context)` 在请求前,`promptTokensOf(usage)` 在请求后,同一个上下文的两个读数。
-所以做成**自校准**:用上一步的 `真 / 估` 比值缩放下一步的估计。中文 3.5、英文 1.0、代码另一个值,
-**不用猜,量出来**。冷启动用 4 做初值,一步之后就校准好了。
-
-### 顺带记一个已经在咬人的地方
-
-`clampMaxTokensToContext`(`packages/ai/src/api/simple-options.ts:15`)每次请求都会拿
-`contextWindow` 夹一次 `max_tokens`,里面有个写死的 `CONTEXT_SAFETY_TOKENS = 4096`:
-
-```
-available  = contextWindow − estimateContextTokens(context) − 4096
-max_tokens = min(maxTokens, max(1, available))
-```
-
-实测(拿本地假服务器截真实请求体,`est = 1475`):
-
-| `LOCAL_CONTEXT_WINDOW` | 实际发出的 `max_tokens` |
-|---|---|
-| 8192 / 16384 | 2048 |
-| **4096** | **1** |
-
-**小窗口上那个 4096 占比太大**:`contextWindow = 4096` 时,光保险就吃光了整个窗口,
-模型每次只被允许吐 1 个 token。所以拿小模型测压缩之前要先算一下 ——
-要让我们的压缩阈值抢在这个 clamp 前面生效,需要 `contextWindow − maxTokens > 20480`
-(`0.8u < u − 4096`)。8192 的本地窗口差得远。
-
-现在没炸是因为估算器在中文上低估 3.5 倍,把 clamp 顺带也架空了 ——
-**换成英文或代码(coding agent 场景)就会先撞上它,而不是撞上我们的压缩。**
 
 ## 压缩只做了两种触发原因 —— Step 9
 

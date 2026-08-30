@@ -87,7 +87,8 @@ max_tokens = min(MAX_TOKENS, max(1, available))
 |---|---|---|
 | **step** | 一次模型请求 + 它要的那批工具 | 单位是「请求」 |
 | **turn** | 若干 step,直到模型不再要工具 | `runTurn` 的范围。**loop 不知道有「上一轮」** |
-| `TurnEndReason` | ⚠️（truncated和aborted不太熟）turn 为什么结束,五种:`completed` / `truncated` / `aborted` / `error` / `max_steps` | **默认是停,继续才需要理由** |
+| `TurnEndReason` | ⚠️（truncated和aborted不太熟）turn 为什么结束,六种:`completed` / `truncated` / `aborted` / `error` / `max_steps` / `rejected` | **默认是停,继续才需要理由**。⚠️ 它是字符串联合,**加成员不会让任何比较报错** —— 所以归类收在 `isTurnFailure` / `isAnswerComplete` 两个 exhaustive switch 里,漏一个 TS 才会拦你 |
+| `isTurnFailure` / `isAnswerComplete` | 两个归类函数,**判据不同是有意的** | 多轮问「出过故障吗」(`aborted` 不算);单轮问「拿到答案了吗」(`aborted` 也算没拿到) |
 | `TurnResult` | `{ reason, steps, usage }` | `usage` 是这一 turn **所有 step 的和** |
 | `DEFAULT_MAX_STEPS` | 20(`core/loop.ts:32`) | 防死循环的闸,也是「一个 turn 能堆多大上下文」的上限之一 |
 | `Context` | pi-ai 的类型:`{ systemPrompt, tools, messages }` | **每一步全量重发**,不是增量 |
@@ -105,7 +106,11 @@ max_tokens = min(MAX_TOKENS, max(1, available))
 | `beforeStep` | 每步**发请求之前** | 记忆注入 |
 | `beforeToolCall` | 每个工具执行之前,**第一个返回值的赢** | 危险操作确认 |
 | `afterToolCall` | 每个工具执行之后,可原地改结果 | (空) |
-| `afterStep` | 一步的请求**和它的工具**都跑完了 | 压缩判定、trace |
+| `afterStep` | 一步的请求**和它的工具**都跑完了 | 压缩判定、估算器校准、trace |
+
+⚠️ **`beforeStep` 和 `beforeToolCall` 会短路**:第一个返回值的赢,后面的 handler 不再跑。
+所以**装配顺序有意义** —— guard 必须排在 memory 前面,不然挡下来的那一步已经白拼过一次 system prompt。
+`afterStep` / `afterToolCall` 不短路,它们是观察点。
 
 ⚠️StepContext AfterStepContext等这几个hook的入参为什么不直接在loop中import，而是在loop中拼好，这么做的设计目的是什么
 ⚠️需要举一个`beforeToolCall` 想拦下这次调用时的例子方便理解
@@ -114,6 +119,7 @@ max_tokens = min(MAX_TOKENS, max(1, available))
 | `StepContext` | `{ step, context }` | `context` 可以原地改 —— 「注入上下文」就是改它 |
 | `AfterStepContext` | 多两样:`message`(模型这步说了什么)、`results`(这步的工具结果) | ⚠️ `results` 就是为压缩留的:只看 `message` 会严重低估这一步吃掉多少上下文 |
 | `ToolCallOverride` | `beforeToolCall` 想拦下调用时返回的东西 | 包一层是因为拦截既可能是「拒绝」也可能是「命中缓存」 |
+| `StepRejection` | `beforeStep` 想把这一步挡下来时返回的东西,只有一句 `message` | ⚠️ 那句话**会作为 assistant 消息进历史**,用户看到的就是它。不记的话历史里会留一条没人回答的 user 消息,下一轮模型多半会去把它答了 |
 
 ### 模型
 ⚠️AgentEvent EventSink还没搞透彻
@@ -226,6 +232,28 @@ max_tokens = min(MAX_TOKENS, max(1, available))
 | `lastPromptTokens` | 最近一次请求的 prompt 有多大,`afterStep` 每步更新 | ⚠️ 初值 `null`(不知道)。判定用的是**上一次**请求的大小,而会撞窗口的是**下一次** |
 | `Compactor` | 手动触发入口,`/compact` 用 | 和自动那条是**同一段逻辑**,不是两份 |
 | `warnedStuck` | 「压不动」只说一次的标记 | ⚠️ **不是开关**。第一版写成「压不动就永久关掉」,实测第 2 轮就撞阈值、那时压不动,于是后面一次都不压 |
+
+
+### guard 和估算器的词(Step 8a)
+
+| | 是什么 | 最容易搞错 |
+|---|---|---|
+| `classify(text)` | 域外判定,**纯函数**。命中返回 `{ rule, message }`,没命中返回 `undefined` | ⚠️ 它是纯函数正是那套对抗用例**一次请求都不发**的原因 —— 用例测的是它,不是整个 agent |
+| `RULES` | 域外黑名单,5 条 | ⚠️ 写成「动词 + 宾语」的**意图形状**不是关键词。关键词会把「我想参观 AI 实验室」「成都有家餐厅叫代码人生」全冤枉了 |
+| `rule` | 命中了哪条规则的名字 | 用例断言到规则名,不只断言「被拦了」—— 不然一条用例从「被 A 拦」变成「被 B 误伤」,测试照样绿 |
+| `maxUserTokens` | 单条用户输入的上限 = `(contextWindow − maxTokens) × 0.25` | 按**单条**不按整个上下文:上下文长了有压缩管,而一条超长消息**压缩救不了** |
+| `TokenMeter` | 会自校准的估算器。`estimate(context)` / `estimateText(text)` / `calibrate(promptTokens)` | ⚠️ `estimate()` 有**副作用**:它记下这次的原始值,`calibrate()` 才有东西配对。少调它,比值永远停在初值 1 而且不报错 |
+| `ratio` | 真值 ÷ 按字符数算的原始值 | 中文约 3.5、英文约 1。**冷启动是 1**,所以一个新进程的第一条消息按偏低 3.5 倍估 —— 长度闸那一下是松的 |
+| `INITIAL_CHARS_PER_TOKEN` | 4,冷启动的字符/token 比 | 抄 pi-ai 的常数,但**只抄初值不抄做法** —— 它在中文上低估 3.5 倍 |
+
+**四类对抗用例**(`cases/adversarial.jsonl`):
+
+| kind | 断言 |
+|---|---|
+| `ood` | 该拦,而且要被**指定的那条规则**拦 |
+| `benign` | **绝不能拦**。误伤守卫,这套用例最值钱的一半 |
+| `known-gap` | 明知拦不住,**预期就是放行** —— 写下来是为了把边界钉死 |
+| `length` | 长度闸,冷启动和校准后两档都测 |
 
 ---
 
