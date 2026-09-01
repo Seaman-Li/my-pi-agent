@@ -111,8 +111,9 @@ export function createRenderer(): EventSink {
  * **不把它打出来,`in` 会看着莫名其妙地变小** ——
  * 实测 `qwen3.7-plus` 第二轮 `in` 从 2677 掉到 507,不是历史变短了,是 2000 多进了 cacheRead。
  *
- * **模型名不是可省的**:同一份代码在 `qwen3.6-plus` 上这一项恒为 0(它根本不返回
- * `cached_tokens` 字段),在 DeepSeek 上又能到 96%。见 docs/prompt-cache.md。
+ * **模型名不是可省的**:同一份代码在 `qwen3.6-plus` 上这一项**实测**恒为 0
+ * (响应里从没出现过 `cached_tokens`,原因未查清 —— 见 docs/prompt-cache.md 的 09-01 修正),
+ * 在 DeepSeek 上又能到 96%。同一行数字在两个模型上差一个数量级,不写模型名就没法比。
  */
 export function formatTurnSummary(spec: ModelSpec, result: TurnResult, context: Context, turn?: number): string {
 	const { usage } = result;

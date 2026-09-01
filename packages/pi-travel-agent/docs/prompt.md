@@ -217,9 +217,13 @@ turn 2  step 1  beforeStep → systemPrompt = base + 记忆块（turn 1 里调�
 上面三个 session 的 `cacheRead` **全是 0**,包括黄山那个 turn 内前缀完全重合的 step 2 和 step 3。
 但 Step 5 实测过命中:第二轮 `in` 从 2677 掉到 507,2000 多进了 `cacheRead`。
 
-**不是缓存时好时坏,是换模型了。** `qwen3.7-plus` 会返回 `cached_tokens`,
-`qwen3.6-plus` 连这个字段都不返回(键不存在,不是值为 0)—— 08-28 换模型是因为 3.7
-免费额度用完了,缓存数从那一刻起全归零。
+**不是缓存时好时坏,是换模型了。** `qwen3.7-plus` 的响应里有 `cached_tokens`,
+换到 `qwen3.6-plus` 之后**一次都没出现过**(键不存在,不是值为 0)—— 08-28 换模型是因为
+3.7 免费额度用完了,缓存数从那一刻起全归零,时间点完全对得上。
+
+**但「3.6 不返回这个字段」是个推论,而且是错的**:dashscope 的隐式缓存默认开着,
+`cached_tokens` 只在命中时才出现,所以键缺失说的是「这次没命中」。
+为什么没命中还没查清 —— 见 [`prompt-cache.md`](prompt-cache.md) 的修正。
 
 换成 DeepSeek 就回来了,而且很高:同一句话 `in 270 / cache 6656`,96% 走缓存价。
 

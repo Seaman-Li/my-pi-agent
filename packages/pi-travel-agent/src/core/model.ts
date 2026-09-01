@@ -94,8 +94,9 @@ const DEEPSEEK_COMPAT: OpenAICompletionsCompat = {
 /**
  * 价格,**美元 / 百万 token**(`calculateCost` 就是按这个单位除的,models.ts:892)。
  *
- * qwen 那边全填 0,DeepSeek 这边填真数 —— 因为它是这个项目里**第一个会上报
- * `cached_tokens` 的 provider**(qwen3.6-plus 连这个字段都不返回)。`cacheRead` 比 `input`
+ * qwen 那边全填 0,DeepSeek 这边填真数 —— 因为它是这个项目里**第一个真见到
+ * `cached_tokens` 的 provider**(qwen3.6-plus 上一次都没出现过,原因未查清,
+ * 见 docs/prompt-cache.md 的 09-01 修正)。`cacheRead` 比 `input`
  * 便宜 31 倍,不填真价的话,摘要行里那个 `$` 看不出缓存到底省了多少。
  *
  * **这里填的是 off-peak 价,而账因此是偏低的。** 一开始是照抄 pi 的
