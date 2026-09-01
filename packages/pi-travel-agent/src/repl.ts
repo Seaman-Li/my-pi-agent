@@ -17,7 +17,7 @@ import type { ModelSpec } from "./core/model.ts";
 import type { Registry } from "./core/registry.ts";
 import { DIM, RESET, createRenderer, formatHistory, formatTurnSummary } from "./render.ts";
 import type { Session } from "./session/store.ts";
-import type { Ledger } from "./session/types.ts";
+import type { AuxLedger, Ledger } from "./session/types.ts";
 import type { Terminal } from "./terminal.ts";
 
 export interface ReplOptions {
@@ -35,6 +35,11 @@ export interface ReplOptions {
 	session: Session;
 	/** `--resume` 恢复出来的账。不给就从 0 开始。 */
 	ledger?: Ledger;
+	/**
+	 * 辅助请求的账(摘要、抽记忆)。**不给就不显示** —— repl 自己不发这些请求,
+	 * 它只是碰巧是那行会话总结的主人。
+	 */
+	aux?: AuxLedger;
 	/**
 	 * 手动压一次上下文。不给就**没有 `/compact` 这个命令** ——
 	 * 和 `ask_user`、`remember` 同一条:能力不在,入口也不该在。
@@ -132,7 +137,7 @@ async function handleCommand(
 export async function runRepl(options: ReplOptions): Promise<number> {
 	const { spec, apiKey, context, tools, hooks, terminal, session } = options;
 	// `--resume` 时从文件里恢复出来的账接着往下记,不然「这个会话花了多少」永远算不对。
-	const ledger: Ledger = options.ledger ?? { turns: 0, input: 0, output: 0, cost: 0 };
+	const ledger: Ledger = options.ledger ?? { turns: 0, input: 0, output: 0, cost: 0, partial: 0 };
 	/** 有没有出现过「既不是正常说完、也不是用户主动中断」的结局。决定退出码。 */
 	let failed = false;
 	/** broken 只报一次 —— 一直失败一直报,只会把正经输出淹掉。 */
@@ -249,16 +254,32 @@ export async function runRepl(options: ReplOptions): Promise<number> {
 		ledger.input += result.usage.input;
 		ledger.output += result.usage.output;
 		ledger.cost += result.usage.cost.total;
+		// 加进去的是个**偏小**的数(中断那一步的 usage 拿不到)。补不了,但记一笔
+		// 「这本账有几处不准」,总结那行才能显式说自己不准。见 Ledger.partial。
+		if (result.reason === "aborted") ledger.partial++;
 		if (isTurnFailure(result.reason)) failed = true;
 		if (result.reason === "aborted") process.stdout.write(`${DIM}(已中断)${RESET}\n`);
 		process.stdout.write(`${formatTurnSummary(spec, result, context, ledger.turns)}\n`);
 	}
 
 	terminal.close();
-	const cost = ledger.cost > 0 ? ` / $${ledger.cost.toFixed(4)}` : "";
+	// `+` = 这本账偏小,有 N 轮被中断、用量没收全(见 Ledger.partial)。
+	const more = ledger.partial > 0 ? "+" : "";
+	const cost = ledger.cost > 0 ? ` / $${ledger.cost.toFixed(4)}${more}` : "";
+	const partial = ledger.partial > 0 ? `(${ledger.partial} 轮被中断,用量没收全)` : "";
 	process.stdout.write(
-		`${DIM}[会话结束] ${ledger.turns} turn / in ${ledger.input} / out ${ledger.output}` +
-			` / ctx ${context.messages.length}${cost}\n接着聊:node src/cli.ts --resume=${session.id}${RESET}\n`,
+		`${DIM}[会话结束] ${ledger.turns} turn / in ${ledger.input}${more} / out ${ledger.output}${more}` +
+			` / ctx ${context.messages.length}${cost}${partial}${RESET}\n`,
 	);
+	// **辅助账单独一行,而且必须写「本次运行」。** 上面那本是跨会话的(--resume 接着记),
+	// 这本不落盘、只算这个进程 —— 两个口径放同一行会被当成一回事。
+	if (options.aux && options.aux.requests > 0) {
+		const { requests, input, output } = options.aux;
+		const auxCost = options.aux.cost > 0 ? ` / $${options.aux.cost.toFixed(4)}` : "";
+		process.stdout.write(
+			`${DIM}[辅助请求] 本次运行 ${requests} 次压缩摘要 / in ${input} / out ${output}${auxCost}${RESET}\n`,
+		);
+	}
+	process.stdout.write(`${DIM}接着聊:node src/cli.ts --resume=${session.id}${RESET}\n`);
 	return failed ? 1 : 0;
 }

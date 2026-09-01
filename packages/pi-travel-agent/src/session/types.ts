@@ -58,8 +58,9 @@ export interface MessageEntry extends EntryBase {
  * 一轮的结算:这轮转了几步、花了多少、怎么结束的。
  *
  * 不存它也能恢复对话 —— 但恢复不了**账**。`--resume` 之后总账从 0 开始的话,
- * 「这个会话到现在花了多少」就永远算不对了。而且 Step 9 的 `--replay`
- * 要靠它对齐「第几轮对应哪几条消息」。这类字段的特点是**事后补不上**:
+ * 「这个会话到现在花了多少」就永远算不对了。`reason` 还兼着两件事:
+ * 算 `Ledger.partial`(哪几轮的用量不全),以及将来**真重放**对齐
+ * 「第几轮对应哪几条消息」。这类字段的特点是**事后补不上**:
  * 老会话里没有就是没有,所以宁可现在多存。
  */
 export interface TurnEntry extends EntryBase {
@@ -142,4 +143,64 @@ export interface Ledger {
 	input: number;
 	output: number;
 	cost: number;
+	/**
+	 * 有几轮的用量是**不全的**(被 Ctrl-C 打断的那些)。
+	 *
+	 * usage 只在流正常收尾时才拿得到,中断的那一步一个数都没有 —— 可 token 是真花了。
+	 * 于是这本账天然偏小,**而且偏小的正好是最贵的那几轮**(跑得久才会想中断)。
+	 *
+	 * 存这个数不是为了把账补准(补不了,按字符估更不可信),是为了让上面三个数
+	 * **能显式说自己不准**:大于 0 时打印成 `in 18234+`。和
+	 * `CompactionEntry.tokensBefore` 那条同一个调子 —— 宁可说「至少这么多」,
+	 * 也不让一个偏小的数看着像精确值。
+	 *
+	 * 它是从 `TurnEntry.reason` **算出来的**,不单独落盘,所以老会话文件照样读得动。
+	 */
+	partial: number;
+}
+
+/**
+ * 辅助请求的账:**不是对话**的那些模型请求,现在只有压缩摘要一种。
+ *
+ * **抽记忆那次不在这本账里,是有意的。** 它跑在 `runRepl` 返回之后
+ * (`cli.ts` 的 `harvest`),那时候「会话结束」那行已经打完了 —— 加进来只能靠往回补,
+ * 而一个事后追加的数字没人对得上它是什么时候花的。所以它打在自己那行 `[记忆]` 上:
+ * **花在什么时候、花了多少,并排摆着**。一次会话只抽一次,也不需要累加。
+ *
+ * **为什么不并进 `Ledger`。** 那个的语义是「这个会话和模型聊了多少」,而且它的每一笔
+ * 都对应一条 `TurnEntry` —— `--resume` 正是靠遍历 TurnEntry 把账接着往下记的
+ * (`store.ts` 的 `resumeSession`)。辅助请求没有对应的 TurnEntry,混进去会让恢复出来的
+ * 账对不上,**而且对不上的方向是「凭空多出来一笔」**,比少一笔更难查。
+ *
+ * **它不落盘,所以只统计本次运行。** 要落盘就得新增一种 Entry,而那牵扯到
+ * 「`rebuild` 读到不认识的 Entry 怎么办」—— 是真重放那一批的事,见 BACKLOG。
+ * 打印的时候必须带上「本次运行」四个字,不然它和旁边那本跨会话的账会被当成一回事。
+ */
+export interface AuxLedger {
+	requests: number;
+	input: number;
+	output: number;
+	cost: number;
+}
+
+/** 一本空的辅助账。 */
+export function emptyAux(): AuxLedger {
+	return { requests: 0, input: 0, output: 0, cost: 0 };
+}
+
+/**
+ * 记一笔辅助请求。
+ *
+ * `aux` 允许是 `undefined`(没人要这本账),这样调用点不用写 `if` ——
+ * 摘要和抽取都在「顺手记一下」的位置上,那儿多一个分支只会碍事。
+ *
+ * **失败的请求也记。** 一次 500 或者一次超时,input 那部分往往已经计费了;
+ * 真是 0 的话加上去也不影响,而漏记会让「这次压缩到底花了多少」永远偏小。
+ */
+export function addAux(aux: AuxLedger | undefined, usage: Usage): void {
+	if (!aux) return;
+	aux.requests++;
+	aux.input += usage.input;
+	aux.output += usage.output;
+	aux.cost += usage.cost.total;
 }

@@ -20,6 +20,7 @@ import { type MemoryStore, openMemory } from "./memory/store.ts";
 import { createRenderer, DIM, formatTurnSummary, RESET } from "./render.ts";
 import { runRepl } from "./repl.ts";
 import { createSession, hashPrompt, listSessions, resumeSession, type Session } from "./session/store.ts";
+import { emptyAux } from "./session/types.ts";
 import { isInteractive, openTerminal, type Terminal } from "./terminal.ts";
 import { createTerminalAsker } from "./terminal-asker.ts";
 
@@ -240,7 +241,14 @@ async function harvest(setup: {
 			store: setup.store,
 			signal: AbortSignal.any([controller.signal, AbortSignal.timeout(EXTRACT_TIMEOUT_MS)]),
 		});
-		process.stdout.write(`${DIM}[记忆] ${result.note}(现有 ${setup.store.items().length} 条)${RESET}\n`);
+		// **抽取是一次真花钱的模型请求,而它不在任何一本账里** —— 它跑在 runRepl 返回之后,
+		// 那时「会话结束」那行已经打完了。所以不往回补,就打在它自己这行上:
+		// 花在什么时候、花了多少,一眼对得上。没发请求时 usage 是 undefined,这半句整个不出现。
+		const usage = result.usage;
+		const spend = usage
+			? ` / 抽取 in ${usage.input} / out ${usage.output}${usage.cost.total > 0 ? ` / $${usage.cost.total.toFixed(4)}` : ""}`
+			: "";
+		process.stdout.write(`${DIM}[记忆] ${result.note}(现有 ${setup.store.items().length} 条)${spend}${RESET}\n`);
 	} catch (error) {
 		process.stderr.write(`[记忆] 这次没收成:${error instanceof Error ? error.message : String(error)}\n`);
 	} finally {
@@ -346,11 +354,15 @@ async function main(): Promise<number> {
 							prompt: readFileSync(join(PACKAGE_ROOT, "prompts", "compact.md"), "utf8"),
 							session,
 							notify: (outcome) => process.stdout.write(`${DIM}[压缩] ${outcome.note}${RESET}\n`),
+							aux,
 						}
 					: undefined,
 		});
 
 	const reasoning = args.thinking ? ("low" as const) : undefined;
+	// 辅助请求的账。**装配处持有它**,因为花这笔钱的两块积木(压缩、抽记忆)分别住在
+	// features 和 memory 里,谁都不该知道另一个的存在 —— 只有这儿同时认识它俩。
+	const aux = emptyAux();
 
 	// 两条路各自决定要不要终端。单轮 + 管道两头不沾,根本不开 ——
 	// 开着就得记得关(readline 不关,Node 不肯退),不开就没这回事。
@@ -401,6 +413,7 @@ async function main(): Promise<number> {
 		seed: args.prompt || undefined,
 		session,
 		ledger: restored?.ledger,
+		aux,
 		compact: composed.compact,
 	});
 	if (memory && context.messages.length > 0) await harvest({ spec, apiKey, store: memory, context });

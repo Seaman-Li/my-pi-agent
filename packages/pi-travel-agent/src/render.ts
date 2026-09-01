@@ -114,14 +114,32 @@ export function createRenderer(): EventSink {
  * **模型名不是可省的**:同一份代码在 `qwen3.6-plus` 上这一项**实测**恒为 0
  * (响应里从没出现过 `cached_tokens`,原因未查清 —— 见 docs/prompt-cache.md 的 09-01 修正),
  * 在 DeepSeek 上又能到 96%。同一行数字在两个模型上差一个数量级,不写模型名就没法比。
+ *
+ * **被 Ctrl-C 打断的那一轮,这几个数是不全的。** usage 只在流正常收尾时才拿得到,
+ * 中断的那一步一个数都没有 —— 可模型已经吐了正文和工具调用,token 是真花了。
+ * 原来照直打 `in 0 / out 0`,看着像「这轮真没花钱」,而**被中断的往往正是最贵的几轮**
+ * (跑得久才会想中断)。假数据比没数据更糟:没有你会去查,假的你会信。
+ *
+ * 所以分两种,因为它们**能提供的信息不一样**:
+ *
+ * | 情况 | 打成 | 意思 |
+ * |---|---|---|
+ * | 中断,而且一个数都没拿到 | `in ? / out ?` | 完全不知道 |
+ * | 中断,但前面几步收全了 | `in 1234+ / out 56+` | **至少**这么多,缺最后那步 |
+ *
+ * 不去按字符数估补上那一步:估错的后果是「一个看着精确的错数」,比 `?` 差远了。
  */
 export function formatTurnSummary(spec: ModelSpec, result: TurnResult, context: Context, turn?: number): string {
 	const { usage } = result;
 	const head = turn === undefined ? "" : `turn ${turn} / `;
-	const cache = usage.cacheRead > 0 ? ` / cache ${usage.cacheRead}` : "";
-	const cost = usage.cost.total > 0 ? ` / $${usage.cost.total.toFixed(4)}` : "";
+	const partial = result.reason === "aborted";
+	const unknown = partial && usage.input === 0 && usage.output === 0;
+	const more = partial && !unknown ? "+" : "";
+	const num = (value: number) => (unknown ? "?" : `${value}${more}`);
+	const cache = usage.cacheRead > 0 ? ` / cache ${num(usage.cacheRead)}` : "";
+	const cost = usage.cost.total > 0 ? ` / $${usage.cost.total.toFixed(4)}${more}` : "";
 	return (
-		`${DIM}[${spec.model.id}] ${head}${result.steps} step / in ${usage.input}${cache} / out ${usage.output}` +
+		`${DIM}[${spec.model.id}] ${head}${result.steps} step / in ${num(usage.input)}${cache} / out ${num(usage.output)}` +
 		` / ctx ${context.messages.length}${cost} / end ${result.reason}${RESET}`
 	);
 }

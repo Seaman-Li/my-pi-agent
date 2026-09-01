@@ -6,7 +6,7 @@
  *       解析不了都只返回一句话,绝不抛 —— 它跑在用户已经说完再见之后。
  */
 
-import type { Context, Message } from "@earendil-works/pi-ai";
+import type { Context, Message, Usage } from "@earendil-works/pi-ai";
 import { type ModelSpec, stream } from "../core/model.ts";
 import type { MemoryStore } from "./store.ts";
 import { MAX_ITEMS, MEMORY_KINDS, type MemoryItem, type MemoryKind } from "./types.ts";
@@ -37,6 +37,14 @@ export interface ExtractResult {
 	added: MemoryItem[];
 	/** 给人看的一句话。**没发请求时也有** —— 「跳过了」和「没抽到」得分得开。 */
 	note: string;
+	/**
+	 * 这次抽取花了多少。**没发请求时是 `undefined`,不是一堆 0** ——
+	 * 「跳过了」和「发了但没花钱」是两回事,而 0 把它们抹平了。
+	 *
+	 * 用返回值而不是像压缩那样传一本账进来:抽取一次会话只发一次请求,
+	 * 没有「累加」可言,而返回值天然说清了「这一次」。
+	 */
+	usage?: Usage;
 }
 
 /**
@@ -129,9 +137,12 @@ export async function extractMemories(options: ExtractOptions): Promise<ExtractR
 	};
 
 	const message = await stream(options.spec, { context, apiKey: options.apiKey, signal: options.signal });
-	if (message.stopReason === "aborted") return { added: [], note: "抽取被中断,这次没记" };
+	// **从这行往下每一条 return 都带 usage。** 请求已经发出去了,不管抽没抽到东西,
+	// 钱都花了 —— 中断和报错那两条尤其要带,不然「跑失败还收费」这件事永远看不见。
+	const usage = message.usage;
+	if (message.stopReason === "aborted") return { added: [], note: "抽取被中断,这次没记", usage };
 	if (message.stopReason === "error") {
-		return { added: [], note: `抽取没跑成:${message.errorMessage ?? "没给原因"}` };
+		return { added: [], note: `抽取没跑成:${message.errorMessage ?? "没给原因"}`, usage };
 	}
 
 	const answer = message.content
@@ -139,12 +150,13 @@ export async function extractMemories(options: ExtractOptions): Promise<ExtractR
 		.map((block) => block.text)
 		.join("");
 	const drafts = parseDrafts(answer).slice(0, MAX_PER_SESSION);
-	if (drafts.length === 0) return { added: [], note: "没抽到值得长期记的东西" };
+	if (drafts.length === 0) return { added: [], note: "没抽到值得长期记的东西", usage };
 
 	const result = options.store.add(drafts);
-	if (result.added.length === 0) return { added: [], note: "抽到的都已经记过了" };
+	if (result.added.length === 0) return { added: [], note: "抽到的都已经记过了", usage };
 	return {
 		added: result.added,
 		note: `记住了 ${result.added.map((item) => `「${item.text}」`).join("")}`,
+		usage,
 	};
 }

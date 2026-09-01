@@ -14,7 +14,7 @@ import type { AfterStepContext, Hooks } from "../core/hooks.ts";
 import { type ModelSpec, stream, usableTokens } from "../core/model.ts";
 import { textOf } from "../core/types.ts";
 import type { Session } from "../session/store.ts";
-import type { CompactionEntry } from "../session/types.ts";
+import { type AuxLedger, addAux, type CompactionEntry } from "../session/types.ts";
 
 /**
  * 阈值取「可用输入」的百分之多少。
@@ -71,6 +71,14 @@ export interface CompactionOptions {
 	session: Session;
 	/** 压完了说一声。features 自己不打印,由入口决定怎么显示。 */
 	notify?: (outcome: CompactionOutcome) => void;
+	/**
+	 * 摘要那次请求记到哪本辅助账上。不给就不记 —— 这块积木自己不打印任何东西。
+	 *
+	 * **它是真花钱的一次请求,而 `ledger` 收不到它**(那本账只加 `runTurn` 的返回值)。
+	 * 实测一次五轮的会话:对话账 `$0.0058`,而那中间 3 次摘要另花了 `$0.0023` ——
+	 * 加上散场抽记忆的 `$0.0004`,**屏幕上原来那个数比真实花费少 32%**。
+	 */
+	aux?: AuxLedger;
 }
 
 /** 该压了没有。 */
@@ -178,6 +186,9 @@ export function installCompaction(hooks: Hooks, options: CompactionOptions): Com
 			apiKey: options.apiKey,
 			signal: AbortSignal.timeout(SUMMARY_TIMEOUT_MS),
 		});
+		// **记在 return 之前**:超时或报错的那次请求,input 往往已经计费了。
+		// 只在成功时记账,等于让「压缩失败」这种最该看见成本的情况反而不花钱。
+		addAux(options.aux, message.usage);
 		if (message.stopReason === "aborted" || message.stopReason === "error") return undefined;
 		const text = message.content
 			.filter((block) => block.type === "text")

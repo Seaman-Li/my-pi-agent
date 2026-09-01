@@ -459,13 +459,16 @@ export function resumeSession(dir: string, options: { id?: string; promptHash: s
 	const messages = rebuild(chain, full);
 	checkToolCallsPaired(messages, path);
 
-	const ledger: Ledger = { turns: 0, input: 0, output: 0, cost: 0 };
+	const ledger: Ledger = { turns: 0, input: 0, output: 0, cost: 0, partial: 0 };
 	for (const entry of chain) {
 		if (entry.type !== "turn") continue;
 		ledger.turns++;
 		ledger.input += entry.usage.input;
 		ledger.output += entry.usage.output;
 		ledger.cost += entry.usage.cost.total;
+		// 被中断那轮的 usage 拿不全(见 Ledger.partial)。**从 reason 算,不新存字段** ——
+		// 老会话文件里就有 reason,所以这个数对历史记录一样成立。
+		if (entry.reason === "aborted") ledger.partial++;
 	}
 
 	// nextId 取**整个文件**的最大值 + 1,不是这条链的 —— 别的分支占过的 id 不能再用,
