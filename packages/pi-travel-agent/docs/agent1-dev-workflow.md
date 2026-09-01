@@ -86,6 +86,7 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   └── debugging.md          Step 9 产出:幻觉 vs agent bug 判据表
 ├── cases/
 │   ├── adversarial.jsonl     Step 8a/8b:不发请求的用例(ood/benign/known-gap/length/path)
+│   ├── loop.jsonl            Step 9:loop 自己的行为,靠假 provider 而不是模型配合,也不发请求
 │   └── injection.jsonl       Step 8b:提示注入用例,**真发请求**,每条跑两遍
 ├── prompts/
 │   ├── system.md
@@ -113,7 +114,7 @@ packages/pi-travel-agent/          ← 在 pi 仓库内，和 packages/agent 同
 │   │   ├── compaction.ts     Step 7:阈值判定 + 切点 + 摘要,挂 afterStep
 │   │   ├── guard.ts          Step 8:四件事两个方向 —— 域外/长度(beforeStep)、预算(beforeToolCall)、标注+脱敏(afterToolCall)
 │   │   ├── confirm.ts        不可逆的工具先问人 —— Step 8 权限确认的原型
-│   │   └── trace.ts          Step 9:trace + replay
+│   │   └── trace.ts          --trace,还没落盘(要真重放时才需要)
 │   ├── tools/                ★ 旅行域
 │   │   ├── amap.ts           高德 REST 客户端(不是 tool)
 │   │   ├── truncate.ts       双限制截断
@@ -243,7 +244,7 @@ main ──┬── v1-chat        (Step 1-2)  能对话、能调工具
        ├── v4-memory      (Step 6)    跨会话偏好
        ├── v5-compaction  (Step 7)    上下文压缩
        ├── v6-guard       (Step 8)    安全边界
-       ├── v7-debug       (Step 9)    trace / replay
+       ├── v7-debug       (Step 9)    假模型 provider + 第三批用例(真重放另算)
        └── v8-mcp         (Step 10)   MCP 对照实验(选做)
 ```
 
@@ -508,7 +509,7 @@ Step 8a 的主要产出不是那道闸,是**一组固定的对抗用例**(域外
 | 4 ✅ | 长上下文怎么压缩 | Step 7 | `features/compaction.ts` + **`docs/answers/q4-compaction.md`** | 窗口调到 12k 真触发了 3 次。阈值取在 `contextWindow − maxTokens` 上而不是整个窗口 —— 后者对 `maxTokens` 384K 的 provider 不成立。**最值钱的是那个写错的闸**:「压不动就永久关掉压缩」看着显然正确,实测第 2 轮就撞阈值、那时压不动,于是后面三次压缩一次都不会发生,还不报错 |
 | 5 ✅ | session 怎么持久化和恢复 | Step 5(5b) | `session/store.ts` + **`docs/answers/q5-session.md`**(27 处行号引用,有脚本校验) | 四种手改都验过了:非法 JSON(报行号)、id 重复(报行号)、`parentId` 指向不存在的 id、删掉 toolResult 再把链接好。**四种全部报错,一种都不跳过**。`/new` 用换父节点表达,旧分支一条不删 —— 这是「树」这个设计唯一被真正用到的地方 |
 | 6 ✅ | 安全边界怎么设计,和沙箱是不是一回事 | Step 8(8a 拒答 / 8b 边界) | `features/guard.ts` + **`docs/answers/q6-boundary.md`** | 做完才看清的对称:**两个方向的第一层都是 system prompt,第二层才是 hook**;域外那边第二层买的是**钱**(`in 0/out 0` vs `$0.0001`,结果一样),注入那边买的是**稳定性**(带标注 4 次全过,不带 5 次漏 4 次)。路径穿越和 SSRF 都是「**没有入口**」而不是「挡住了」 |
-| 7 | 出错了怎么定位,幻觉还是 agent bug | Step 9 | `--trace` / `--replay` | 见下 |
+| 7 | 出错了怎么定位,幻觉还是 agent bug | Step 9 | `--trace` / `cases/loop.jsonl` | 见下。Step 9 补的是**「是不是 agent bug」那一半**:loop 的失败路径原来只有代码没有验收,因为真模型不肯配合(三种问法都拒绝)。换掉 provider 之后九条路径都钉住了,而且每条都做过变异验收 |
 | 8 | 用不用 MCP,无状态和有状态什么区别 | Step 10 | MCP 版 weather | 见下 |
 
 ### Q6 补充:旅行助手的安全边界怎么划

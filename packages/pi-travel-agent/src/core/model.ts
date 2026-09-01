@@ -8,7 +8,14 @@
  */
 
 import { execFileSync } from "node:child_process";
-import type { AssistantMessage, Context, Model, OpenAICompletionsCompat, ThinkingLevel } from "@earendil-works/pi-ai";
+import type {
+	AssistantMessage,
+	Context,
+	Model,
+	OpenAICompletionsCompat,
+	StopReason,
+	ThinkingLevel,
+} from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import type { EventSink } from "./types.ts";
 
@@ -16,6 +23,13 @@ export interface ModelSpec {
 	model: Model<"openai-completions">;
 	/** key 的取法。`!<cmd>` 执行命令取 stdout,`env:<NAME>` 读环境变量。沿用 pi 的约定。 */
 	apiKeySource: string;
+	/**
+	 * 只有假模型有(见 `scriptedSpec`)。有它 `stream()` 就整条 pi-ai 的路都不走。
+	 *
+	 * 放在 `ModelSpec` 上而不是另开一个类型:**假模型是一个 provider**,
+	 * 而 provider 之间本来就该有差别 —— `compat` 也是这么放的。
+	 */
+	script?: ScriptedRun;
 }
 
 /**
@@ -327,6 +341,134 @@ export function resolveApiKey(source: string): string {
 	throw new Error(`不认识的 apiKeySource:${source}(只支持 !<cmd> 和 env:<NAME>)`);
 }
 
+/**
+ * 剧本里的一步:这一步假模型吐什么。
+ *
+ * 三个字段都可以不给,默认是「什么都没说,收工」。真正常用的是 `toolCalls` ——
+ * 要补验收的那几条路径全在工具这一段上。
+ *
+ * `stopReason` 平时不用给(有工具就 `toolUse`,没有就 `stop`)。显式给是为了测
+ * `turnEndReason` 里那两条**和内容对不上**的分支 —— 比如「stopReason 是 length,
+ * 但工具调用看着完整」,那正是截断最危险的样子:参数是从半截 JSON 里抢救出来的,
+ * 「解析成功」不等于「内容完整」,所以 loop 必须不执行它。
+ */
+export interface ScriptedStep {
+	text?: string;
+	/** `name` 可以是**根本不存在的工具** —— 那是要测的路径之一,不是笔误。 */
+	toolCalls?: { name: string; arguments?: Record<string, unknown> }[];
+	stopReason?: StopReason;
+	errorMessage?: string;
+}
+
+/**
+ * 一次运行的剧本 + 游标。
+ *
+ * **游标是可变的,而一个 `ModelSpec` 就是一次运行** —— 跑两个 turn 要两个 spec。
+ * 不做成不可变的理由很实在:`stream()` 的签名是 `(spec, request)`,
+ * 没有第三个地方能放「现在该吐第几条」,而改签名就要改 `loop.ts`。
+ */
+export interface ScriptedRun {
+	steps: ScriptedStep[];
+	cursor: number;
+}
+
+/**
+ * 拼一个假模型的 `ModelSpec`:不发请求,按剧本一步一步吐 assistant 消息。
+ *
+ * **它是一个 provider,不是给 loop 开的测试后门。** 本文件开头写着
+ * 「换 provider、换模型、哪天想自己手写适配层,都只动这里」—— 假模型正是那句话指的东西。
+ * 所以 `core/loop.ts` 一个字不用动,`git diff -- src/core/loop.ts` 照样是空的。
+ *
+ * 它买到的东西:loop 有三条失败路径**只有代码没有验收**(工具抛异常 / 工具名不存在 /
+ * `max_steps` 触顶),因为真模型不肯配合 —— 它会读 schema 的 description 自行拦截,
+ * 三种问法都试过。假模型不读 schema,让它吐什么就吐什么。
+ *
+ * `contextWindow` / `maxTokens` 填的是**够大但不离谱**的数:压缩阈值和长度闸都读它们,
+ * 填 0 会让别的积木在假模型上表现得和真模型完全不同(见 `checkWindow`)。
+ *
+ * `apiKeySource` 故意填了个取不出来的值:假模型不读 key,谁要是去 `resolveApiKey` 它,
+ * 说明这条路走错了,**该当场炸**而不是静默拿到个空串。
+ *
+ * @throws 剧本是空的时候抛 —— 空剧本跑起来是「第一步就没得吐」,
+ *         那多半是用例文件写漏了,比默默吐一条空消息好查。
+ */
+export function scriptedSpec(steps: ScriptedStep[]): ModelSpec {
+	if (steps.length === 0) throw new Error("剧本是空的:scriptedSpec 至少要一步");
+	return {
+		model: {
+			id: "script",
+			name: "script",
+			api: "openai-completions",
+			provider: "script",
+			// 不会被用到 —— scriptedStream 压根不 fetch。填个非法域名而不是真地址,
+			// 万一哪天走漏到真请求上,报的是 DNS 失败而不是把测试流量打到线上。
+			baseUrl: "http://scripted.invalid",
+			reasoning: false,
+			input: ["text"],
+			contextWindow: 32768,
+			maxTokens: 4096,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		},
+		apiKeySource: "env:SCRIPTED_MODEL_NEEDS_NO_KEY",
+		script: { steps, cursor: 0 },
+	};
+}
+
+/** 零成本。假模型确实一分钱没花,所以这里是真的 0,不是「还不知道」。 */
+const EMPTY_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+
+/**
+ * 按剧本吐一条 assistant 消息。**不发请求、不读 key、一个事件都不推。**
+ *
+ * 不推事件是有意的:`AgentEvent` 那条路是给终端渲染看的,而假模型要验的是 loop 的行为。
+ * 代价是假模型在终端上没有正文可看 —— 所以现在**没有** `--model script` 这个开关,
+ * 只有 `run-cases.ts loop` 用它。要加那个开关就得先补事件合成,见 BACKLOG。
+ *
+ * **剧本跑完之后重复最后一条。** `max_steps` 触顶就靠这个:一条「永远调同一个工具」
+ * 的剧本就够跑满上限,不用在用例文件里把同一步抄二十遍。
+ *
+ * `usage` 全 0,而且**不填假数**。假模型确实一分钱没花,编个数会让「账」这件事
+ * 在测试里说谎 —— 和 `CompactionEntry.tokensBefore` 那条同一个教训:
+ * 没有数你会去查,假的你会信。
+ */
+function scriptedStream(spec: ModelSpec, run: ScriptedRun, signal?: AbortSignal): AssistantMessage {
+	const base = {
+		role: "assistant" as const,
+		api: spec.model.api,
+		provider: spec.model.provider,
+		model: spec.model.id,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: EMPTY_COST },
+		timestamp: Date.now(),
+	};
+	// 先看 signal,**再动游标**:被中断的那一步不算消费掉剧本。
+	// 真 provider 也是这个行为(pi-ai 把中断编码进流,不是吐半条消息)。
+	if (signal?.aborted) return { ...base, content: [], stopReason: "aborted" };
+
+	// 越界就取最后一条,不是报错 —— 见上面「重复最后一条」。
+	const step = run.steps[Math.min(run.cursor, run.steps.length - 1)] as ScriptedStep;
+	const at = run.cursor++;
+
+	const content: AssistantMessage["content"] = [];
+	if (step.text) content.push({ type: "text", text: step.text });
+	for (const [index, call] of (step.toolCalls ?? []).entries()) {
+		content.push({
+			type: "toolCall",
+			// id 只要在一次运行里唯一。带上步号和序号,红了的时候一眼看得出是哪一步的哪一个。
+			id: `script-${at}-${index}`,
+			name: call.name,
+			arguments: call.arguments ?? {},
+		});
+	}
+
+	const hasToolCalls = content.some((block) => block.type === "toolCall");
+	return {
+		...base,
+		content,
+		stopReason: step.stopReason ?? (hasToolCalls ? "toolUse" : "stop"),
+		errorMessage: step.errorMessage,
+	};
+}
+
 export interface StreamRequest {
 	context: Context;
 	apiKey: string;
@@ -343,6 +485,9 @@ export interface StreamRequest {
  * 调用方读 stopReason,不靠捕异常。
  */
 export async function stream(spec: ModelSpec, request: StreamRequest): Promise<AssistantMessage> {
+	// 假模型:整条 pi-ai 的路都不走。放在这儿而不是让调用方自己分叉,是为了
+	// **loop 一个字都不用改** —— 它只认 `stream()`,不认这个 spec 是真是假。
+	if (spec.script) return scriptedStream(spec, spec.script, request.signal);
 	const events = streamSimple(spec.model, request.context, {
 		apiKey: request.apiKey,
 		signal: request.signal,

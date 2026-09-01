@@ -231,8 +231,11 @@ turn 1  ctx 16
 ## 八、还没做的
 
 - **overflow 触发没做。** 计划里三种触发原因(manual / threshold / overflow),只做了前两种。
-  overflow 是「provider 说这次请求超窗口了」,要靠捕获错误路径 —— 和
-  [BACKLOG 里 loop 失败路径那条](../../BACKLOG.md)一样,不依赖模型配合才测得了,等 Step 9 的 `--replay`。
+  原来这条写的是「和 loop 失败路径那条一样,不依赖模型配合才测得了」—— **定性错了**。
+  那三条是**代码写了但验不了**(Step 9 的假模型已经补上);这条是**代码压根没写**,
+  而且写它要给 loop 加重试能力:`overflow` 发生时 `turnEndReason` 已经返回 `error`、
+  turn 就地结束了,「压一下再试一次」得让 loop 重跑这一步,那是**改 loop**不是挂 feature。
+  见 BACKLOG。
 - **摘要那次请求不进账。** 它走 `stream()` 而不是 `runTurn`,`ledger` 收不到 ——
   和散场抽记忆是同一个口子,记在 BACKLOG 里了。
 - **单轮模式没有压缩。** 没有 session 就不装这块积木,而单轮不建会话文件。

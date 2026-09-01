@@ -34,12 +34,25 @@ BACKLOG 第一条说的是**这三条路径没有验收手段**。Step 2a 试过
 
 `max_steps`(`loop.ts:32`,上限 20)那条更极端 —— 要真烧掉 20 步才碰得到。
 
-Step 9 的 `--replay` 买的就是这个:**喂一段固定的 assistant 消息进 loop,不发真请求**,
-三条路径立刻变成确定的、免费的断言,和 `cases/adversarial.jsonl` 一个性质。
+**Step 9 已经补上了,而且不是靠 `--replay`。** 办法是**换掉 provider**:
+`core/model.ts` 的 `scriptedSpec` 拼一个按剧本吐消息的假模型 —— 喂一段固定的
+assistant 消息进 loop,不发真请求。假模型不读 schema,让它吐什么就吐什么。
 
-**一个现在就能摘的果子**:参数校验那条不用等 Step 9。`validateArguments` 是纯函数,
-`{"days": "三天"}` → 抛什么消息,今天就能写进 `adversarial.jsonl`。
-只有「execute 抛异常」和「工具名不存在」需要 replay。
+关键是它落在哪:`stream()` 里加一个分叉,**`src/core/loop.ts` 一个字没改**。
+这不是绕过「loop 只读」那条规矩,而是那条规矩本来指的地方 —— `model.ts` 的边界写着
+「换 provider、换模型、哪天想自己手写适配层,都只动这里」,**假模型就是一个 provider**。
+
+产出是第三批用例 `cases/loop.jsonl`(`node src/run-cases.ts loop`),9 条,免费、确定、
+能进 CI —— 和 `cases/adversarial.jsonl` 一个性质。覆盖的比原来那三条多:除了
+「execute 抛异常 / 工具名不存在 / `max_steps` 触顶」,还钉住了「截断的消息一条工具都不跑」
+「并行发保序回」「拒答话术进历史」。
+
+**九条都做过变异验收** —— 挨个把 `loop.ts` 改坏一处,确认对应那条真的变红,九次全中。
+第一次就全绿的测试等于没测。
+
+顺带说清一件当时没分开的事:BACKLOG 里「`--replay`」这个词指过两件成本差一个数量级的事,
+**假模型**(不发请求跑 loop)和**真重放**(从 JSONL 把一次真实运行完整重跑)。
+Step 9 做的是前者;后者要先把会话记录补全,还没做,见 BACKLOG 的排期那条。
 
 ---
 

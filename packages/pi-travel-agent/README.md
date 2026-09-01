@@ -42,6 +42,7 @@ node src/cli.ts [--model <名字>] [--thinking] [--trace] [--chat] ["你的问�
 | `node src/cli.ts --resume=<id>` | 接着指定会话聊 |
 | `node src/cli.ts --sessions` | 列出最近的会话 |
 | `node src/run-cases.ts` | 跑域外拦截/落盘名/长度闸的固定用例,**不发请求** |
+| `node src/run-cases.ts loop` | 跑 loop 自己的用例(失败路径/并行保序/触顶),**不发请求** |
 | `node src/run-cases.ts injection` | 跑提示注入用例,**真发请求**(每条跑两遍:带标注 / 不带) |
 
 | 开关 | 作用 | 备注 |
@@ -178,7 +179,8 @@ id=5 parent=1   user: "我是王五…"   ← 挂回了会话头，不是挂在 
 落盘写不下去（权限、磁盘满）**不会打断对话**：打一句 `[会话记录写不下去了] <原因>`，
 之后不再重试，聊天照常。聊天比记账重要，但也绝不能静默。
 
-**单轮模式（`node src/cli.ts "一句话"`）不记会话**——见 BACKLOG，Step 9 做 `--replay` 时一起补。
+**单轮模式（`node src/cli.ts "一句话"`）不记会话**——见 BACKLOG,等**真重放**那一批一起补
+(Step 9 做的是假模型,不是真重放,两件事)。
 
 管道也能跑多轮，一行一轮，这也是验收表里多轮那几条的跑法：
 
@@ -488,6 +490,55 @@ node src/cli.ts --model local --trace "成都和重庆明天天气怎么样，�
 同一句话跑两遍只差一个开关，就是一次现成的对照实验。实测 9B Q4 本地模型能跑通全链路
 （4 step、一次并行发 6 个工具、`save_plan` 出完整报告），代价是单步输入更重。
 
+### loop 自己的用例:换掉 provider,不改 loop
+
+`node src/run-cases.ts loop`。**第三批用例**,和前两批性质都不一样:
+
+| | `run-cases.ts` | `run-cases.ts loop` | `run-cases.ts injection` |
+|---|---|---|---|
+| 测什么 | `classify()` 这个**纯函数** | **loop 自己的行为** | **模型在注入下的行为** |
+| 发请求吗 | ❌ | ❌ | ✅ |
+| 进 CI | ✅ | ✅ | ❌ |
+
+**中间那一格原来是空的。** loop 既不是纯函数(有状态、有 hooks、有并行),
+也不该靠模型配合 —— Step 2a 实测过,想让模型故意用非法参数调工具,**三种问法它都拒绝**
+(它读 schema 里的 description 自行拦截)。于是 loop 的失败路径长期只有代码,没有验收。
+
+补法是**换掉 provider**:`core/model.ts` 的 `scriptedSpec` 拼一个按剧本吐消息的假模型,
+`stream()` 见到 `spec.script` 就整条 pi-ai 的路都不走。
+
+```ts
+scriptedSpec([{ text: "我查一下", toolCalls: [{ name: "no_such_tool", arguments: {} }] }, { text: "换个说法" }])
+```
+
+**`src/core/loop.ts` 一个字没改** —— `git diff -- src/core/loop.ts` 照样是空的。
+这不是绕过「loop 只读」那条规矩,是那条规矩本来指的地方:`model.ts` 的边界写着
+「换 provider、换模型、哪天想自己手写适配层,都只动这里」,而**假模型就是一个 provider**。
+
+剧本跑完之后重复最后一条 —— `max_steps` 触顶靠的就是这个,不用在用例文件里抄二十遍。
+`usage` 全 0 而且不填假数:假模型确实没花钱,编个数会让「账」在测试里说谎。
+
+九条用例钉住的东西(`cases/loop.jsonl`):
+
+| 用例 | 钉住的 |
+|---|---|
+| `unknown-tool` | 工具名不存在,而且**回灌**给模型 |
+| `tool-throws` | 错误**原文**进结果,不是一句「工具失败了」 |
+| `bad-args` | 校验失败是「结果」不是「异常」(`Convert` 救得回 `"3"`,救不回 `"abc"`) |
+| `max-steps` | 触顶 → `max_steps`,不是 error |
+| `truncated-drops-tools` | `stopReason=length` 时**一条工具都不跑** |
+| `error-stops-turn` | provider 报错不抛异常,变成 reason |
+| `parallel-keeps-order` | 并行发、**保序回**(第一个故意慢 60ms) |
+| `rejected-writes-history` | 拒答话术进历史 —— 8a 唯一不发请求就能验的部分 |
+| `multi-step` | 基线。一批只测异常的用例有盲区 |
+
+**九条都做过变异验收**:挨个把 `loop.ts` 改坏一处,确认对应那条真的变红,九次全中。
+第一次就全绿的测试等于没测,这一步不能省。
+
+终端上**没有** `--model script` 这个开关:`scriptedStream` 一个事件都不推
+(`AgentEvent` 那条路是给渲染看的),接上去会是「有工具行、有末行摘要、没有正文」。
+想要就得先补事件合成,见 BACKLOG。
+
 ## 接一个新模型
 
 `src/core/model.ts` 的 `PROVIDERS` 是唯一要改的地方。但**别直接写代码再跑 agent** ——
@@ -570,7 +621,7 @@ node src/cli.ts --model <新模型> "帮我规划成都2天行程，预算3000�
 ```
 
 **看不到 agent 真正发出去的完整请求体** —— `--trace` 只打 hook 和工具的进出，不打 body。
-那是 Step 9 `--replay` 的事。在那之前想看，临时在 `src/core/model.ts:144` 前面加一句
+那是**真重放**的事(Step 9 做的假模型解决的是另一半)。在那之前想看，临时在 `src/core/model.ts` 的 `stream()` 里加一句
 `console.error(JSON.stringify(request.context, null, 1))`。
 
 ## 验收表
@@ -651,6 +702,10 @@ node src/cli.ts --model <新模型> "帮我规划成都2天行程，预算3000�
 | 7 | 任意会话加 `--no-compact` 跑，再 `/compact` | 一次都不压；`/compact` 报「这次运行没开压缩(--no-compact)」 |
 | local | `node src/cli.ts --model local "成都和重庆明天天气怎么样，对比一下"` | 同一 step 并行两个 `weather`，**没有 `[思考]` 段**（有就是 `reasoning_effort` 没生效） |
 | local | `node src/cli.ts --model local "帮我规划成都2天行程，8月28号出发，2个人，预算3000，最后存成报告"` | 4 step 跑完，`out/*.html` 七个区块齐全 |
+| 9 | `node src/run-cases.ts loop` | 9 条全过,退出码 0。**一次请求都不发**,`.env` 也不读 |
+| 9 | 把 `loop.ts` 的 `if (message.stopReason === "length") return "truncated";` 改成 `if (false)`,再跑上面那条 | `truncated-drops-tools` 变红(`工具结果 1 条(预期 0 条)`)——**用例真的会红**。九条各变异一次全中,改完记得 `git checkout -- src/core/loop.ts` |
+| 9 | `git diff -- src/core/loop.ts` | **空的**。假模型是个 provider,不是给 loop 开的测试后门 |
+| 9 | `node src/cli.ts "用一句话说你能干什么"` | 真 provider 那条路照常(`1 step / end completed`)——`stream()` 加了分叉,得确认没把真请求带歪 |
 
 ## 八个问题的答案
 
@@ -677,13 +732,13 @@ done
 src/
 ├── core/          通用层，不出现「旅行」字样，Agent 2 直接搬
 │   ├── types.ts   Tool / ToolResult / AgentEvent / EventSink / TurnEndReason / textOf
-│   ├── model.ts   ★ 唯一 import pi-ai 函数的文件
+│   ├── model.ts   ★ 唯一 import pi-ai 函数的文件；scriptedSpec 是不发请求的假 provider
 │   ├── registry.ts 工具注册表
 │   ├── hooks.ts   四个挂载点 + 串接规则
 │   ├── validate.ts 参数 Convert → Check
 │   └── loop.ts    ★ agent loop —— 只读，想改它说明缺 hook
 ├── features/      一个文件 = 一块积木，只通过 hooks 挂进去
-│   ├── trace.ts   --trace，Step 9 扩成完整版
+│   ├── trace.ts   --trace，还没落盘（要真重放时才需要）
 │   ├── confirm.ts 不可逆的工具执行前先问人 ★ 硬闸，挂 beforeToolCall
 │   └── memory.ts  跨会话记忆 → systemPrompt ★ 唯一改写 systemPrompt 的地方，挂 beforeStep
 ├── tools/         旅行域
@@ -710,7 +765,13 @@ src/
 ├── terminal-asker.ts  Asker 的终端实现，只管「问题排版成什么样」
 ├── render.ts      事件 → 终端文字；单轮和多轮共用同一份格式
 ├── repl.ts        多轮驱动 ★ 「轮次」这个概念只存在于这里
+├── run-cases.ts   入口 ②：三批用例（纯函数 / loop 行为 / 模型行为）
 └── cli.ts         入口：参数、资源、路由（单轮 or 多轮）
+
+cases/             用例。前两批不发请求，第三批发
+├── adversarial.jsonl  域外拦截 / 落盘名 / 长度闸 —— 测 classify() 这个纯函数
+├── loop.jsonl         loop 的失败路径 / 并行保序 / 触顶 —— 靠假 provider，不靠模型配合
+└── injection.jsonl    提示注入 —— 必须发真请求，会抖，不进 CI
 ```
 
 `core/` 下 Step 5 新增 `context.ts`：`messages` 形状的不变量（toolCall 必须有 toolResult 配对）。

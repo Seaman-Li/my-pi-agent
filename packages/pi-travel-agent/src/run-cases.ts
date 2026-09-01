@@ -1,18 +1,24 @@
 /**
- * 入口 ②:跑对抗用例。两批,**性质完全不同**:
+ * 入口 ②:跑用例。三批,**性质完全不同**:
  *
- * | | `node src/run-cases.ts` | `node src/run-cases.ts injection` |
- * |---|---|---|
- * | 文件 | `cases/adversarial.jsonl` | `cases/injection.jsonl` |
- * | 测什么 | `classify()` 这个**纯函数**的判定边界 | **模型在注入下的行为** |
- * | 发请求吗 | ❌ 免费、确定 | ✅ 花钱,而且结果会抖 |
- * | 什么时候跑 | 每次收尾 | 改了标注措辞才跑 |
+ * | | `run-cases.ts` | `run-cases.ts loop` | `run-cases.ts injection` |
+ * |---|---|---|---|
+ * | 文件 | `cases/adversarial.jsonl` | `cases/loop.jsonl` | `cases/injection.jsonl` |
+ * | 测什么 | `classify()` 这个**纯函数**的判定边界 | **loop 自己的行为** | **模型在注入下的行为** |
+ * | 发请求吗 | ❌ 免费、确定 | ❌ 免费、确定 | ✅ 花钱,而且结果会抖 |
+ * | 什么时候跑 | 每次收尾 | 每次收尾 | 改了标注措辞才跑 |
+ *
+ * **中间那一格原来是空的。** loop 既不是纯函数(有状态、有 hooks、有并行),
+ * 也不该靠模型配合 —— 想让真模型故意用非法参数调工具,三种问法它都拒绝
+ * (它读 schema 的 description 自行拦截)。于是 loop 的失败路径长期只有代码没有验收。
+ * 补法是**换掉 provider**:`core/model.ts` 的 `scriptedSpec` 拼一个按剧本吐消息的
+ * 假模型,`loop.ts` 一个字不用改。所以第二批和第一批一样能进 CI。
  *
  * 层:入口 —— 和 cli.ts 平级的第二个驱动,只是它驱动的不是对话,是判定。
- * 边界:第一批一个环境变量都不读;第二批要 `.env`(它得真发请求)。
- *       两批放同一个文件是因为它们回答的是同一个问题(边界在哪),
- *       但**表格里那四行差别必须一直摆在最前面** —— 把它们当成同一种测试用是会出事的:
- *       一个可以进 CI 反复跑,另一个跑一次要钱、而且绿了不代表下次还绿。
+ * 边界:前两批一个环境变量都不读;第三批要 `.env`(它得真发请求)。
+ *       三批放同一个文件是因为它们回答的是同一个问题(边界在哪),
+ *       但**表格里那几行差别必须一直摆在最前面** —— 把它们当成同一种测试用是会出事的:
+ *       前两批可以进 CI 反复跑,第三批跑一次要钱、而且绿了不代表下次还绿。
  */
 
 import { readFileSync } from "node:fs";
@@ -22,10 +28,10 @@ import type { Context } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { createTokenMeter } from "./core/estimate.ts";
 import { emptyHooks } from "./core/hooks.ts";
-import { runTurn } from "./core/loop.ts";
-import { resolveApiKey, resolveModel } from "./core/model.ts";
+import { runTurn, type TurnResult } from "./core/loop.ts";
+import { resolveApiKey, resolveModel, type ScriptedStep, scriptedSpec } from "./core/model.ts";
 import { Registry } from "./core/registry.ts";
-import type { Tool } from "./core/types.ts";
+import { type Tool, type TurnEndReason, textOf } from "./core/types.ts";
 import { checkLength, classify, installGuard } from "./features/guard.ts";
 import { slugify } from "./tools/save-plan.ts";
 import { DIM, RESET } from "./render.ts";
@@ -136,6 +142,169 @@ function runCase(item: Case): Outcome {
 		return { ...base, ok: false, note: `${label}:被 ${verdict.rule} 拦了` };
 	}
 	return { ...base, ok: true, note: "放行" };
+}
+
+/**
+ * 一条 loop 用例:一段剧本 + 一组对结局的断言。
+ *
+ * `script` 喂给假模型(`scriptedSpec`),`expect` 断言 turn 跑完之后的样子。
+ * 断言分两头是有理由的:`reason`/`steps` 是 `runTurn` 的**返回值**,
+ * `results`/`lastAssistantContains` 看的是它往 `context.messages` 里**留下了什么** ——
+ * 后者才是下一轮模型真正会看到的东西,而 loop 的几条失败路径全靠它才说得清。
+ */
+interface LoopCase {
+	id: string;
+	kind?: "note";
+	why: string;
+	script: ScriptedStep[];
+	/** 不给就用 loop 的默认值。`max-steps` 那条压到 3,免得为了验机制跑满二十步。 */
+	maxSteps?: number;
+	/** 给了就在第几步让 `beforeStep` 返回拒绝 —— 8a 那道闸唯一不发请求就能验的部分。 */
+	rejectAt?: number;
+	expect: {
+		reason: TurnEndReason;
+		steps?: number;
+		/** 按顺序对 `context` 里每条 toolResult 断言。给了就连条数也一起对。 */
+		results?: { tool?: string; isError?: boolean; contains?: string }[];
+		/** 历史里最后一条 assistant 消息该含什么。验「拒答话术进了历史」用。 */
+		lastAssistantContains?: string;
+	};
+}
+
+/**
+ * 测试用的假工具。**一个工具四种行为**,比四个各干一件事的工具好读 ——
+ * 用例文件里看到的是参数差别,不用回头查哪个工具是干嘛的。
+ *
+ * - `probe({n})`               正常返回
+ * - `probe({n:"abc"})`         过不了 schema(`Convert` 救得回 `"3"`,救不回 `"abc"`)
+ * - `probe({n, fail:true})`    抛异常
+ * - `probe({n, delayMs})`      拖一会儿再返回,用来验并行保序
+ *
+ * `execute` 里**故意不写 try/catch** —— 那正是 pi 的约定,也正是 `loop.ts:206` 要接的东西。
+ *
+ * @throws `fail` 为真时抛,消息里带上 `n`,好让用例断言错误**原文**回灌了。
+ */
+function probeTool(): Tool {
+	return {
+		name: "probe",
+		description: "测试用的探针工具,不联网。",
+		parameters: Type.Object({
+			n: Type.Integer({ description: "回声数字" }),
+			fail: Type.Optional(Type.Boolean({ description: "为真时抛异常" })),
+			delayMs: Type.Optional(Type.Integer({ description: "拖延多少毫秒再返回" })),
+		}),
+		execute: async (_id, args) => {
+			const { n, fail, delayMs } = args as { n: number; fail?: boolean; delayMs?: number };
+			if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+			if (fail) throw new Error(`probe 炸了(n=${n})`);
+			return { content: [{ type: "text", text: `probe n=${n}` }] };
+		},
+	};
+}
+
+/**
+ * 跑一条 loop 用例。**一次请求都不发** —— 模型换成了剧本。
+ *
+ * @returns 这条的结局。`runTurn` 抛异常也返回结局而不是往上抛:
+ *          它的契约就是「不抛,失败变成 reason」,所以**抛了本身就是一条发现**,
+ *          不该让它冒成未捕获异常把整批带走。
+ */
+async function runLoopCase(item: LoopCase): Promise<Outcome> {
+	const base = { id: item.id, why: item.why };
+	const tools = new Registry();
+	tools.register(probeTool());
+	const hooks = emptyHooks();
+	if (item.rejectAt !== undefined) {
+		const at = item.rejectAt;
+		hooks.beforeStep.push(({ step }) => (step === at ? { message: "这次不聊这个,换个旅行相关的问题吧" } : undefined));
+	}
+	const context: Context = {
+		// 假模型不读它。填着是为了让 context 的形状和真跑一样 —— 挂在 beforeStep 上的
+		// 积木(记忆注入)会去改这个字段,形状不一样的话用例就测不到它们。
+		systemPrompt: "(loop 用例:假模型不读这段)",
+		messages: [{ role: "user", content: "跑一条 loop 用例", timestamp: Date.now() }],
+	};
+
+	let result: TurnResult;
+	try {
+		result = await runTurn({
+			spec: scriptedSpec(item.script),
+			// 假模型不读 key。这里给空串而不是 `resolveApiKey(...)`:真去取一次
+			// 就等于让这批用例依赖 .env,那它就不再是「免费、确定」的了。
+			apiKey: "",
+			context,
+			tools,
+			hooks,
+			maxSteps: item.maxSteps,
+		});
+	} catch (error) {
+		return { ...base, ok: false, note: `**runTurn 抛了**:${error instanceof Error ? error.message : String(error)}` };
+	}
+
+	// 全部问题一次收齐再报,不是遇到第一个就返回 —— 改的时候一趟能看全。
+	const problems: string[] = [];
+	if (result.reason !== item.expect.reason) problems.push(`reason=${result.reason}(预期 ${item.expect.reason})`);
+	if (item.expect.steps !== undefined && result.steps !== item.expect.steps) {
+		problems.push(`steps=${result.steps}(预期 ${item.expect.steps})`);
+	}
+
+	const results = context.messages.filter((message) => message.role === "toolResult");
+	if (item.expect.results) {
+		if (results.length !== item.expect.results.length) {
+			problems.push(`工具结果 ${results.length} 条(预期 ${item.expect.results.length} 条)`);
+		}
+		for (const [index, want] of item.expect.results.entries()) {
+			const got = results[index];
+			if (!got) continue;
+			const text = textOf(got.content);
+			if (want.tool !== undefined && got.toolName !== want.tool) {
+				problems.push(`#${index} 是 ${got.toolName}(预期 ${want.tool})`);
+			}
+			if (want.isError !== undefined && got.isError !== want.isError) {
+				problems.push(`#${index} isError=${got.isError}(预期 ${want.isError})`);
+			}
+			if (want.contains !== undefined && !text.includes(want.contains)) {
+				problems.push(`#${index} 里没有「${want.contains}」,实际是「${text.slice(0, 60)}」`);
+			}
+		}
+	}
+
+	if (item.expect.lastAssistantContains !== undefined) {
+		const last = [...context.messages].reverse().find((message) => message.role === "assistant");
+		const text = last?.role === "assistant" ? textOf(last.content.filter((block) => block.type === "text")) : "";
+		if (!text.includes(item.expect.lastAssistantContains)) {
+			problems.push(`最后一条 assistant 里没有「${item.expect.lastAssistantContains}」,实际是「${text.slice(0, 60)}」`);
+		}
+	}
+
+	return {
+		...base,
+		ok: problems.length === 0,
+		note: problems.length === 0 ? `${result.steps} step / ${result.reason} / 工具结果 ${results.length} 条` : problems.join(";"),
+	};
+}
+
+/**
+ * 跑 loop 那一批。
+ *
+ * **串行跑,不 `Promise.all`。** 每条用例自己带一个可变游标(`ScriptedRun.cursor`),
+ * 并发跑虽然也不会串,但 `parallel-keeps-order` 那条靠的是真的等 60ms ——
+ * 一批用例互相抢 CPU 的时候,「谁先返回」这件事就不确定了。
+ *
+ * @returns 退出码。0 全过;1 有红的 —— 和第一批一样能直接挂 CI。
+ */
+async function runLoopSuite(): Promise<number> {
+	const path = join(PACKAGE_ROOT, "cases", "loop.jsonl");
+	const cases = (readCases(path) as unknown as LoopCase[]).filter((item) => item.kind !== "note");
+	let failed = 0;
+	for (const item of cases) {
+		const outcome = await runLoopCase(item);
+		if (!outcome.ok) failed++;
+		process.stdout.write(`${outcome.ok ? "✓" : "✗"} ${outcome.id.padEnd(24)} ${outcome.note}\n`);
+		if (!outcome.ok) process.stdout.write(`${DIM}    ${outcome.why}${RESET}\n`);
+	}
+	process.stdout.write(`\n${cases.length} 条,${failed === 0 ? "全过" : `${failed} 条没过`}\n`);
+	return failed === 0 ? 0 : 1;
 }
 
 /** 一条注入用例。`ask` 是用户问的,`payload` 是**工具返回值里夹带的东西**。 */
@@ -269,10 +438,15 @@ function main(): number {
 	return failed.length === 0 ? 0 : 1;
 }
 
-/** 选哪一批。默认那批不发请求,所以它才是默认的。 */
+/**
+ * 选哪一批。**只有注入那批读 `.env`** —— 另外两批一个环境变量都不读,
+ * 这正是它们能进 CI 的原因,所以 `loadEnvFile` 必须留在那一支里面,不能提到外面来。
+ */
 if (process.argv[2] === "injection") {
 	process.loadEnvFile(join(PACKAGE_ROOT, ".env"));
 	process.exitCode = await runInjectionSuite();
+} else if (process.argv[2] === "loop") {
+	process.exitCode = await runLoopSuite();
 } else {
 	process.exitCode = main();
 }
