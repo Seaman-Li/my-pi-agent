@@ -706,6 +706,7 @@ node src/cli.ts --model <新模型> "帮我规划成都2天行程，预算3000�
 | 9 | 把 `loop.ts` 的 `if (message.stopReason === "length") return "truncated";` 改成 `if (false)`,再跑上面那条 | `truncated-drops-tools` 变红(`工具结果 1 条(预期 0 条)`)——**用例真的会红**。九条各变异一次全中,改完记得 `git checkout -- src/core/loop.ts` |
 | 9 | `git diff -- src/core/loop.ts` | **空的**。假模型是个 provider,不是给 loop 开的测试后门 |
 | 9 | `node src/cli.ts "用一句话说你能干什么"` | 真 provider 那条路照常(`1 step / end completed`)——`stream()` 加了分叉,得确认没把真请求带歪 |
+| 9 | 把 `amap.ts` 的 `REQUEST_TIMEOUT_MS` 临时改成 `1`,再 `node --input-type=module -e 'process.loadEnvFile("./.env"); const {fetchForecast}=await import("./src/tools/amap.ts"); await fetchForecast("成都")'` | **2.5 秒左右**抛 `高德 … 连不上:TimeoutError(重试 2 次都没成)`;消息里**没有 key 也没有 URL**。改回 `8_000` |
 
 ## 八个问题的答案
 

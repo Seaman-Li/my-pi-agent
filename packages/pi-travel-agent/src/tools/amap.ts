@@ -95,6 +95,42 @@ function buildUrl(path: string, params: Record<string, string | number | undefin
  */
 const RETRY_DELAYS = [350, 900];
 
+/**
+ * 单次请求最多等多久。
+ *
+ * **没有这个数的时候,一个连不上的高德能让整个 agent 无响应。** `signal` 是有的,
+ * 但没人去 abort 它;`max_steps`(`core/loop.ts`)数的是**步数不是时间**,救不了 ——
+ * 用户只能 Ctrl-C。这是这个项目里唯一一处「一个正常请求能把 agent 挂死」的地方。
+ *
+ * 8 秒是往宽了取的:高德 REST 正常几百毫秒回来,8 秒还没动静基本就是挂住了。
+ * **超时算可重试**,所以最坏情况是 `8 + 0.35 + 8 + 0.9 + 8 ≈ 25 秒`才抛。
+ * 那仍然是有限的,而且 Ctrl-C 全程有效 —— 和原来的「无限期」是两回事。
+ * 真要给整个 turn 一个时间预算,那是另一件事(loop 那一层),不在这儿。
+ */
+const REQUEST_TIMEOUT_MS = 8_000;
+
+/**
+ * 把调用方的 signal 和一个超时并成一个。
+ *
+ * 调用方可能没给 signal(工具在别处被直接调用),所以要分两种拼法 ——
+ * `AbortSignal.any([undefined, ...])` 是会炸的。
+ */
+function withTimeout(signal?: AbortSignal): AbortSignal {
+	const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+	return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+/**
+ * HTTP 状态码值不值得再试一次。
+ *
+ * 判据抄上游的 `isRetryableProviderError`(`packages/ai/src/utils/provider-retry.ts:23`):
+ * 408 超时、409 冲突、429 限流、5xx 服务端 —— 全是**这次不行下次可能行**的。
+ * 4xx 里其余的(400 参数错、401 key 错)重试三遍还是错,只是把一次失败拖成三次。
+ */
+function isRetryableStatus(status: number): boolean {
+	return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
 /** 睡一会儿,能被 abort 打断。@throws 等待期间被取消时抛。 */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve, reject) => {
@@ -131,7 +167,16 @@ function isRateLimited(info: string): boolean {
  * 那一路的结果就整条没了,模型只能拿剩下的凑,而看输出的人根本看不出少了什么。
  * 「并行发」和「不重试」这两条同时成立就是个 bug,而并行不该退。
  *
- * @throws HTTP 层失败、重试完仍然超限、或高德返回其它 `status !== "1"` 时抛。
+ * **三类瞬时故障都重试,判据各不相同**:高德应用层的 QPS(`isRateLimited`)、
+ * HTTP 层的 408/409/429/5xx(`isRetryableStatus`)、以及 `fetch` 自己抛
+ * (DNS 抖动、ECONNRESET、TLS、超时)—— 最后这类原来**根本没进重试循环**。
+ * 上游对它的处理是「`error.status === undefined` 也重试」(`provider-retry.ts:28`),
+ * 同一个道理:连响应都没拿到,说明失败发生在能重试的那一层。
+ *
+ * **唯独用户按的 Ctrl-C 不重试。** 它和超时在 `fetch` 那儿长得一模一样(都是 abort),
+ * 靠 `signal.aborted` 分开 —— 重试一个用户明确不想要的请求,是把「取消」变成「更慢的取消」。
+ *
+ * @throws HTTP 层失败、连不上、重试完仍然超限、或高德返回其它 `status !== "1"` 时抛。
  *         **抛出的消息里只有 path 和高德的 info/infocode,没有 URL** ——
  *         URL 带 key,而错误消息会被 loop 包成 toolResult 回灌给模型、再进 session 文件。
  */
@@ -142,8 +187,26 @@ async function request<T>(
 ): Promise<T> {
 	const url = buildUrl(path, params);
 	for (let attempt = 0; ; attempt++) {
-		const response = await fetch(url, { signal });
+		const canRetry = attempt < RETRY_DELAYS.length;
+		let response: Response;
+		try {
+			response = await fetch(url, { signal: withTimeout(signal) });
+		} catch (error) {
+			// 用户取消的不算故障,别重试也别包装成「连不上」——那会让 Ctrl-C 看着像高德挂了。
+			if (signal?.aborted) throw new Error(`高德 ${path} 请求已取消`);
+			if (canRetry) {
+				await sleep(RETRY_DELAYS[attempt] as number, signal);
+				continue;
+			}
+			// 原始错误只取 name/message:它可能带 URL(有些运行时会把 URL 塞进 cause),而 URL 带 key。
+			const why = error instanceof Error ? error.name : "未知错误";
+			throw new Error(`高德 ${path} 连不上:${why}(重试 ${RETRY_DELAYS.length} 次都没成)`);
+		}
 		if (!response.ok) {
+			if (isRetryableStatus(response.status) && canRetry) {
+				await sleep(RETRY_DELAYS[attempt] as number, signal);
+				continue;
+			}
 			throw new Error(`高德 ${path} 请求失败:HTTP ${response.status}`);
 		}
 		const body = (await response.json()) as AmapEnvelope & T;

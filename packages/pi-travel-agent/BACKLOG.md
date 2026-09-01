@@ -114,30 +114,46 @@ max_tokens = min(maxTokens, max(1, available))
 Step 8b 做完之后这条更要紧了一点:`beforeToolCall` 上现在挂着**两个** handler
 (预算 + 确认),准备阶段比 Step 5b 时长。但只要确认闸不弹,量级还是微秒,先记着。
 
-## amap 的重试只覆盖 QPS,而且没有超时 —— 有需要再说,超时那条优先
+## amap 的重试只覆盖 QPS,而且没有超时 —— 已补,留个记录
 
-`tools/amap.ts:138` 的 `request()` 现在只在一种情况下重试:高德返回 `status !== "1"`
-且 `info` 里含 "QPS"(`:121`),退避 350ms / 900ms(`:96`)。这个判断本身是对的
-(日配额用完等到明天也是白等,见那段注释),但**三种同样瞬时的故障一次都不重试**:
+原来 `tools/amap.ts` 的 `request()` 只在一种情况下重试:高德返回 `status !== "1"` 且
+`info` 里含 "QPS",退避 350ms / 900ms。这个判断本身是对的(日配额用完等到明天也是白等),
+但**三种同样瞬时的故障一次都不重试**,其中一种能让整个 agent 挂死。
 
-| 缺口 | 现在的行为 | 位置 |
+| 缺口 | 原来的行为 | 现在 |
 |---|---|---|
-| HTTP 5xx / 502 / 504 | `!response.ok` 直接抛 | `:146` |
-| `fetch` 自己抛(DNS 抖动、ECONNRESET、TLS) | 根本没进重试循环 | `:145` |
-| **没有 per-request 超时** | 连接挂住就无限期卡着 | 整个 `request()` |
+| **没有 per-request 超时** | 连接挂住就无限期卡着 | `REQUEST_TIMEOUT_MS = 8000`,和调用方的 signal 并成一个 |
+| HTTP 5xx / 408 / 409 / 429 | `!response.ok` 直接抛 | `isRetryableStatus()` 判,可重试的走退避 |
+| `fetch` 自己抛(DNS 抖动、ECONNRESET、TLS) | 根本没进重试循环 | 进了,而且**用户按的 Ctrl-C 不重试** |
 
-第三条最要紧,而且是唯一一个**会让 agent 完全无响应**的:有 `signal` 但没有超时,
-`max_steps`(`loop.ts:32`)数的是步数不是时间,救不了。用户只能 Ctrl-C。
+**超时那条是这里唯一的真 bug**,别的只是「少救一次」:有 `signal` 但没人去 abort 它,
+而 `max_steps` 数的是**步数不是时间**,救不了 —— 用户只能 Ctrl-C。
 
-**上游有现成的判据可以抄**:`packages/ai/src/utils/provider-retry.ts:23` 的
-`isRetryableProviderError` —— 408 / 409 / 429 / ≥500 重试,而且
-**`error.status === undefined` 也重试**(`:28`),那正是「fetch 自己抛了」这一类。
-它还认 `retry-after` 头(`:51`),退避带 jitter(`:66`)。
+判据抄上游 `packages/ai/src/utils/provider-retry.ts:23` 的 `isRetryableProviderError`:
+408 / 409 / 429 / ≥500 重试,而且 **`error.status === undefined` 也重试**(`:28`)——
+那正是「fetch 自己抛了」这一类(连响应都没拿到,说明失败在能重试的那一层)。
+没抄的是 `retry-after` 头(`:51`)和 jitter(`:66`):高德不发前者,而我们最多重试两次,
+两个客户端同时退避 350ms 撞在一起的概率不值得为它加代码。
+
+**超时和 Ctrl-C 在 `fetch` 那儿长得一模一样**(都是 abort),靠 `signal.aborted` 分开。
+不分的话,用户按 Ctrl-C 会触发两次重试 —— 把「取消」变成「更慢的取消」。
+
+实测(把 `REQUEST_TIMEOUT_MS` 临时改成 1ms):
+
+```
+高德 /v3/weather/weatherInfo 连不上:TimeoutError(重试 2 次都没成)   ← 2.57 秒抛出
+```
+
+消息里**没有 key 也没有 URL** —— 原始错误只取 `error.name`,因为有些运行时会把 URL
+塞进 `cause`,而 URL 带 key,这条消息又会被包成 toolResult 回灌给模型、再进 session 文件。
+
+代价写清楚:超时算可重试,所以最坏情况是 `8 + 0.35 + 8 + 0.9 + 8 ≈ 25 秒`才抛。
+有限,而且 Ctrl-C 全程有效。**真要给整个 turn 一个时间预算,那是 loop 那一层的事**,
+不在这儿 —— 现在没有这个东西,也还没被它咬过。
 
 **重试为什么不能挪到 loop 里**:loop 不知道哪个工具幂等。`weather` / `search_poi` 重试无害,
 `save_plan` 重试会落两份文件,`ask_user` 重试等于把同一个问题问人两遍。
-上游也是这么分的 —— 重试全在 provider 层,`core/tools/*.ts` 里一条 retry 都没有
-(它的工具是本地的,没得重试)。
+上游也是这么分的 —— 重试全在 provider 层,`core/tools/*.ts` 里一条 retry 都没有。
 
 顺带记一笔:**还有一层重试是不用写代码的** —— 错误被包成 toolResult 回灌(`loop.ts:206`),
 模型自己改参数再调。语义类错误(城市名不对)靠的全是这个。
