@@ -577,12 +577,6 @@ Step 6 实测:转录里说「**我妈**膝盖不好走不了太多路」,抽出�
 已经全部撤回了 —— **格式化扫描不该混进一个功能批次**,不然「这批到底改了什么」就答不上来。
 真要做就单开一个只有格式化的 commit。
 
-## 参数校验 —— Step 3b
-
-`loop.ts` 的 `executeToolCalls` 里,`toolCall.arguments` 目前未经校验直接透传给 `execute`。
-Step 3b 补 `Value.Convert` → `Check`:模型经常把数字写成字符串,Convert 能救回来。
-位置已经在代码里标好了。
-
 ## `--model` 之外的开关没有严格校验 —— 有需要再说
 
 `parseArgs` 对不认识的 `--xxx` 不报错,会把它当成 prompt 的一部分吞掉。
