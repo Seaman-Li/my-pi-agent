@@ -1,0 +1,279 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "pi:一次 prompt 怎么跑完",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "happy",
+        "label": "顺利那条路",
+        "focus": [
+          "input",
+          "prompt",
+          "stream",
+          "decide",
+          "exec",
+          "turnend",
+          "answer"
+        ],
+        "note": "外层等 followUp,内层转「工具 + steering」,两层都停了才 agent_end。"
+      },
+      {
+        "id": "steering",
+        "label": "工具跑着时说的话去哪了",
+        "focus": [
+          "inject",
+          "drain",
+          "turnend"
+        ],
+        "note": "队列只在 toolResults 全部回填之后 drain —— 那是唯一的合法缝。"
+      },
+      {
+        "id": "guard",
+        "label": "截断与错误",
+        "focus": [
+          "stream",
+          "decide",
+          "exec"
+        ],
+        "note": "stopReason=length 时整批工具调用直接失败,不执行。"
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "ui",
+      "label": "客户端 / TUI"
+    },
+    {
+      "id": "agent",
+      "label": "agent-loop.ts"
+    },
+    {
+      "id": "io",
+      "label": "模型与工具"
+    },
+    {
+      "id": "queue",
+      "label": "steer / followUp 队列",
+      "variant": "exception"
+    }
+  ],
+  "mainPath": [
+    "input",
+    "prompt",
+    "inject",
+    "stream",
+    "decide",
+    "exec",
+    "drain",
+    "turnend",
+    "answer"
+  ],
+  "semanticChecks": {
+    "allowedRoots": [
+      "input"
+    ],
+    "allowedTerminals": [
+      "answer",
+      "provider"
+    ]
+  },
+  "nodes": [
+    {
+      "id": "input",
+      "lane": "ui",
+      "col": 0,
+      "type": "external",
+      "label": "用户消息",
+      "sublabel": "prompt / steer / followUp",
+      "width": 186
+    },
+    {
+      "id": "answer",
+      "lane": "ui",
+      "col": 5,
+      "type": "frontend",
+      "label": "agent_end",
+      "sublabel": "两层队列都空了",
+      "width": 186
+    },
+    {
+      "id": "prompt",
+      "lane": "agent",
+      "col": 1,
+      "type": "backend",
+      "label": "turn 开始",
+      "sublabel": "turn_start",
+      "width": 186
+    },
+    {
+      "id": "stream",
+      "lane": "agent",
+      "col": 2,
+      "type": "backend",
+      "label": "streamAssistant",
+      "sublabel": "一次请求,失败编码进流",
+      "width": 186
+    },
+    {
+      "id": "decide",
+      "lane": "agent",
+      "col": 3,
+      "type": "backend",
+      "label": "有 toolCalls 吗",
+      "sublabel": "顺带看 stopReason",
+      "width": 186
+    },
+    {
+      "id": "turnend",
+      "lane": "agent",
+      "col": 5,
+      "type": "backend",
+      "label": "turn_end",
+      "sublabel": "prepareNextTurn",
+      "width": 186
+    },
+    {
+      "id": "provider",
+      "lane": "io",
+      "col": 2,
+      "type": "cloud",
+      "label": "LLM Provider",
+      "sublabel": "重试全在这一层",
+      "width": 186
+    },
+    {
+      "id": "exec",
+      "lane": "io",
+      "col": 4,
+      "type": "messagebus",
+      "label": "executeToolCalls",
+      "sublabel": "截断则整批直接失败",
+      "width": 186
+    },
+    {
+      "id": "inject",
+      "lane": "queue",
+      "col": 1,
+      "type": "security",
+      "label": "注入排队的消息",
+      "sublabel": "push 进 messages",
+      "width": 186
+    },
+    {
+      "id": "drain",
+      "lane": "queue",
+      "col": 4,
+      "type": "security",
+      "label": "drain steering",
+      "sublabel": "toolResults 全部回填之后",
+      "tag": "早一步就 400",
+      "width": 186
+    }
+  ],
+  "edges": [
+    {
+      "id": "user-prompt",
+      "from": "input",
+      "to": "prompt"
+    },
+    {
+      "id": "prompt-inject",
+      "from": "prompt",
+      "to": "inject",
+      "label": "先看队列",
+      "variant": "security"
+    },
+    {
+      "id": "inject-stream",
+      "from": "inject",
+      "to": "stream",
+      "label": "进上下文",
+      "variant": "emphasis"
+    },
+    {
+      "id": "stream-provider",
+      "from": "stream",
+      "to": "provider",
+      "label": "HTTPS"
+    },
+    {
+      "id": "stream-decide",
+      "from": "stream",
+      "to": "decide",
+      "variant": "emphasis"
+    },
+    {
+      "id": "decide-exec",
+      "from": "decide",
+      "to": "exec",
+      "label": "有工具",
+      "variant": "emphasis"
+    },
+    {
+      "id": "decide-turnend",
+      "from": "decide",
+      "to": "turnend",
+      "label": "没有工具",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "exec-drain",
+      "from": "exec",
+      "to": "drain",
+      "label": "结果先回填",
+      "variant": "security"
+    },
+    {
+      "id": "drain-turnend",
+      "from": "drain",
+      "to": "turnend"
+    },
+    {
+      "id": "turnend-prompt",
+      "from": "turnend",
+      "to": "prompt",
+      "label": "内层:还有工具或 steering",
+      "variant": "dashed",
+      "role": "return",
+      "channelY": 170
+    },
+    {
+      "id": "turnend-answer",
+      "from": "turnend",
+      "to": "answer",
+      "label": "外层也空了",
+      "labelDx": -70
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "两层循环",
+      "items": [
+        "内层:还有工具或 steering",
+        "外层:再看 followUp 队列"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "只能在那儿 drain",
+      "items": [
+        "toolCall 必须配 toolResult",
+        "中间插 user:DeepSeek 400"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "从不留断链",
+      "items": [
+        "截断:整批直接失败",
+        "中断:补 Operation aborted"
+      ]
+    }
+  ]
+}

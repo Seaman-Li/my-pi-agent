@@ -1,0 +1,334 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "旅行助手:一个 turn 怎么跑完",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "happy",
+        "label": "顺利那条路",
+        "focus": [
+          "input",
+          "step",
+          "stream",
+          "decide",
+          "tools",
+          "after",
+          "answer"
+        ],
+        "note": "一个 turn = 若干 step,每个 step = 一次模型请求 + 它要的工具。"
+      },
+      {
+        "id": "gates",
+        "label": "四个挂载点上挂着什么",
+        "focus": [
+          "beforestep",
+          "rejected",
+          "confirm",
+          "annotate"
+        ],
+        "note": "闸全在 hooks 上,loop 一个字都不认识它们。"
+      },
+      {
+        "id": "exits",
+        "label": "六种结束方式",
+        "focus": [
+          "decide",
+          "after",
+          "answer",
+          "rejected"
+        ],
+        "note": "completed / truncated / aborted / error / max_steps / rejected。"
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "ui",
+      "label": "终端"
+    },
+    {
+      "id": "agent",
+      "label": "core/loop.ts(只读)"
+    },
+    {
+      "id": "io",
+      "label": "模型与工具"
+    },
+    {
+      "id": "gate",
+      "label": "hooks 上挂的闸",
+      "variant": "exception"
+    }
+  ],
+  "groups": [
+    {
+      "id": "stepcycle",
+      "label": "一个 step",
+      "lane": "agent",
+      "fromCol": 1,
+      "toCol": 5,
+      "variant": "emphasis"
+    },
+    {
+      "id": "gatework",
+      "label": "拦下就不发请求",
+      "lane": "gate",
+      "fromCol": 1,
+      "toCol": 2,
+      "variant": "security"
+    }
+  ],
+  "mainPath": [
+    "input",
+    "step",
+    "beforestep",
+    "stream",
+    "decide",
+    "confirm",
+    "tools",
+    "annotate",
+    "after",
+    "answer"
+  ],
+  "nodes": [
+    {
+      "id": "input",
+      "lane": "ui",
+      "col": 0,
+      "type": "external",
+      "label": "用户一行",
+      "sublabel": "terminal 行缓冲",
+      "width": 150
+    },
+    {
+      "id": "answer",
+      "lane": "ui",
+      "col": 5,
+      "type": "frontend",
+      "label": "正文 + 末行摘要",
+      "sublabel": "step / in / out / end",
+      "width": 150
+    },
+    {
+      "id": "step",
+      "lane": "agent",
+      "col": 1,
+      "type": "backend",
+      "label": "step 开始",
+      "sublabel": "steps++,先查 signal",
+      "width": 150
+    },
+    {
+      "id": "stream",
+      "lane": "agent",
+      "col": 2,
+      "type": "backend",
+      "label": "stream()",
+      "sublabel": "一次模型请求",
+      "tag": "失败编码进流,不抛",
+      "width": 150
+    },
+    {
+      "id": "decide",
+      "lane": "agent",
+      "col": 3,
+      "type": "backend",
+      "label": "turnEndReason",
+      "sublabel": "这一步之后要不要停",
+      "width": 150
+    },
+    {
+      "id": "after",
+      "lane": "agent",
+      "col": 5,
+      "type": "backend",
+      "label": "afterStep",
+      "sublabel": "压缩判定挂这里",
+      "width": 150
+    },
+    {
+      "id": "beforestep",
+      "lane": "gate",
+      "col": 1,
+      "type": "security",
+      "label": "beforeStep",
+      "sublabel": "域外闸 · 长度闸 · 记忆注入",
+      "tag": "闸排在注入前面",
+      "width": 150
+    },
+    {
+      "id": "rejected",
+      "lane": "gate",
+      "col": 2,
+      "type": "security",
+      "label": "rejected",
+      "sublabel": "拒答话术当 assistant 记进历史",
+      "width": 150
+    },
+    {
+      "id": "confirm",
+      "lane": "gate",
+      "col": 3,
+      "type": "security",
+      "label": "beforeToolCall",
+      "sublabel": "调用预算 · 写文件先问人",
+      "width": 150
+    },
+    {
+      "id": "annotate",
+      "lane": "gate",
+      "col": 4,
+      "type": "security",
+      "label": "afterToolCall",
+      "sublabel": "外部数据标注 · key 脱敏",
+      "width": 150
+    },
+    {
+      "id": "provider",
+      "lane": "io",
+      "col": 2,
+      "type": "cloud",
+      "label": "LLM Provider",
+      "sublabel": "dashscope · DeepSeek · Ollama",
+      "width": 150
+    },
+    {
+      "id": "tools",
+      "lane": "io",
+      "col": 4,
+      "type": "messagebus",
+      "label": "并行执行工具",
+      "sublabel": "Promise.all,保序返回",
+      "tag": "所以 amap 必须重试 QPS",
+      "width": 150
+    }
+  ],
+  "edges": [
+    {
+      "id": "user-step",
+      "from": "input",
+      "to": "step"
+    },
+    {
+      "id": "step-gate",
+      "from": "step",
+      "to": "beforestep",
+      "label": "先过闸",
+      "variant": "security"
+    },
+    {
+      "id": "gate-reject",
+      "from": "beforestep",
+      "to": "rejected",
+      "label": "拦下:一次请求都不发",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "gate-pass",
+      "from": "beforestep",
+      "to": "stream",
+      "label": "放行",
+      "variant": "emphasis"
+    },
+    {
+      "id": "stream-provider",
+      "from": "stream",
+      "to": "provider",
+      "label": "HTTPS"
+    },
+    {
+      "id": "stream-decide",
+      "from": "stream",
+      "to": "decide",
+      "variant": "emphasis"
+    },
+    {
+      "id": "decide-confirm",
+      "from": "decide",
+      "to": "confirm",
+      "label": "有工具调用",
+      "variant": "security"
+    },
+    {
+      "id": "decide-after",
+      "from": "decide",
+      "to": "after",
+      "label": "没有工具 = completed",
+      "variant": "emphasis"
+    },
+    {
+      "id": "confirm-tools",
+      "from": "confirm",
+      "to": "tools",
+      "label": "放行才执行",
+      "variant": "emphasis"
+    },
+    {
+      "id": "tools-annotate",
+      "from": "tools",
+      "to": "annotate"
+    },
+    {
+      "id": "annotate-after",
+      "from": "annotate",
+      "to": "after",
+      "label": "结果回灌上下文"
+    },
+    {
+      "id": "after-answer",
+      "from": "after",
+      "to": "answer",
+      "label": "turn 结束",
+      "labelDx": -70
+    },
+    {
+      "id": "after-step",
+      "from": "after",
+      "to": "step",
+      "variant": "dashed",
+      "role": "return",
+      "channelY": 170,
+      "label": "下一步(上限 20)"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "六种结束方式",
+      "items": [
+        "completed:这步没发工具调用",
+        "max_steps:reason 初值没被改写"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "截断时不跑工具",
+      "items": [
+        "参数是从半截 JSON 抢救的",
+        "解析成功 ≠ 内容完整"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "闸买的是什么",
+      "items": [
+        "域外闸买的是钱",
+        "标注买的是稳定性"
+      ]
+    }
+  ],
+  "semanticChecks": {
+    "allowedRoots": [
+      "input"
+    ],
+    "allowedTerminals": [
+      "answer",
+      "rejected",
+      "provider"
+    ]
+  }
+}

@@ -1,3 +1,4 @@
 data/
 out/
 .env
+docs/diagrams/*.visual-check.*

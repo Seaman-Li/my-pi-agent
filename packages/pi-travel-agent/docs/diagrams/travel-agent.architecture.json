@@ -1,0 +1,433 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "旅行助手 Agent 架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Seaman-Li/my-pi-agent",
+      "revision": "0804573ffa49594c550e4f2be1b2c975dd77bf14"
+    },
+    "viewBox": [
+      1340,
+      700
+    ],
+    "views": [
+      {
+        "id": "runtime",
+        "label": "一次请求走过哪些地方",
+        "focus": [
+          "terminal",
+          "cli",
+          "loop",
+          "model",
+          "provider"
+        ],
+        "note": "终端读一行 → cli 路由 → loop 转步 → model 是唯一的 provider 边界。"
+      },
+      {
+        "id": "assembly",
+        "label": "积木怎么挂上去",
+        "focus": [
+          "compose",
+          "hooks",
+          "features",
+          "loop"
+        ],
+        "note": "compose 是唯一装配处;loop 只认 hooks,不认识任何一块具体积木。"
+      },
+      {
+        "id": "secrets",
+        "label": "key 与落盘",
+        "focus": [
+          "model",
+          "amap",
+          "session",
+          "memory"
+        ],
+        "note": "两个 key 出口、两份 harness:一份只往尾巴加,一份整体重写。"
+      }
+    ]
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [
+      40,
+      60
+    ],
+    "cols": 5,
+    "cellW": 200,
+    "cellH": 78,
+    "gapX": 72,
+    "gapY": 150
+  },
+  "components": [
+    {
+      "id": "terminal",
+      "type": "frontend",
+      "label": "terminal.ts",
+      "sublabel": "行缓冲 + 锁 + Ctrl-C",
+      "tag": "唯一碰 stdin",
+      "row": 0,
+      "col": 0,
+      "sources": [
+        {
+          "path": "packages/pi-travel-agent/src/terminal.ts",
+          "line": 41,
+          "label": "openTerminal"
+        }
+      ],
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "cli.ts / repl.ts",
+      "sublabel": "路由:单轮 or 多轮",
+      "row": 0,
+      "col": 1,
+      "sources": [
+        {
+          "path": "packages/pi-travel-agent/src/cli.ts",
+          "line": 357,
+          "label": "单轮 / 多轮分叉"
+        }
+      ],
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "loop",
+      "type": "backend",
+      "label": "core/loop.ts",
+      "sublabel": "一个 turn = 若干 step",
+      "tag": "只读",
+      "row": 0,
+      "col": 2,
+      "sources": [
+        {
+          "path": "packages/pi-travel-agent/src/core/loop.ts",
+          "line": 230,
+          "label": "runTurn()"
+        }
+      ],
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "model",
+      "type": "security",
+      "label": "core/model.ts",
+      "sublabel": "ModelSpec + stream()",
+      "tag": "唯一 import pi-ai",
+      "row": 0,
+      "col": 3,
+      "sources": [
+        {
+          "path": "packages/pi-travel-agent/src/core/model.ts",
+          "line": 344,
+          "label": "stream()"
+        }
+      ],
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "provider",
+      "type": "external",
+      "label": "LLM Provider",
+      "sublabel": "dashscope · DeepSeek · Ollama",
+      "row": 0,
+      "col": 4,
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "compose",
+      "type": "backend",
+      "label": "compose.ts",
+      "sublabel": "按开关拼出这次运行",
+      "tag": "唯一装配处",
+      "row": 1,
+      "col": 1,
+      "sources": [
+        {
+          "path": "packages/pi-travel-agent/src/compose.ts",
+          "line": 89,
+          "label": "compose()"
+        }
+      ],
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "hooks",
+      "type": "messagebus",
+      "label": "core/hooks.ts",
+      "sublabel": "before/after × step/toolCall",
+      "tag": "四个挂载点",
+      "row": 1,
+      "col": 2,
+      "sources": [
+        {
+          "path": "packages/pi-travel-agent/src/core/hooks.ts",
+          "line": 68,
+          "label": "Hooks"
+        }
+      ],
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "features",
+      "type": "backend",
+      "label": "features/",
+      "sublabel": "五块积木,只经 hooks 挂进来",
+      "row": 1,
+      "col": 3,
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "memory",
+      "type": "database",
+      "label": "memory/",
+      "sublabel": "整体读整体写",
+      "tag": "会被推翻",
+      "row": 1,
+      "col": 0,
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "session",
+      "type": "database",
+      "label": "session/",
+      "sublabel": "JSONL,只往尾巴加",
+      "tag": "说过的话不能改",
+      "row": 2,
+      "col": 0,
+      "sources": [
+        {
+          "path": "packages/pi-travel-agent/src/session/store.ts",
+          "line": 215,
+          "label": "createSession"
+        }
+      ],
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "tools",
+      "type": "backend",
+      "label": "registry + tools/",
+      "sublabel": "7 个工具,schema 占 67%",
+      "row": 2,
+      "col": 2,
+      "sources": [
+        {
+          "path": "packages/pi-travel-agent/src/core/registry.ts",
+          "line": 49,
+          "label": "schemas()"
+        }
+      ],
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "amap",
+      "type": "security",
+      "label": "tools/amap.ts",
+      "sublabel": "REST 客户端,不是 tool",
+      "tag": "AMAP_KEY 只在这里",
+      "row": 2,
+      "col": 3,
+      "sources": [
+        {
+          "path": "packages/pi-travel-agent/src/tools/amap.ts",
+          "line": 138,
+          "label": "request()"
+        }
+      ],
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "amapapi",
+      "type": "external",
+      "label": "高德 REST API",
+      "sublabel": "天气 · POI · 酒店",
+      "row": 2,
+      "col": 4,
+      "size": [
+        180,
+        68
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "core/ —— 不出现「旅行」字样,Agent 2 直接搬",
+      "wraps": [
+        "loop",
+        "model",
+        "hooks",
+        "tools"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "key 只在这两个文件里出现",
+      "wraps": [
+        "model",
+        "amap"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "read-line",
+      "from": "terminal",
+      "to": "cli",
+      "label": "读一行"
+    },
+    {
+      "id": "run-turn",
+      "from": "cli",
+      "to": "loop",
+      "label": "runTurn()",
+      "variant": "emphasis"
+    },
+    {
+      "id": "loop-stream",
+      "from": "loop",
+      "to": "model",
+      "label": "stream()",
+      "variant": "emphasis"
+    },
+    {
+      "id": "model-http",
+      "from": "model",
+      "to": "provider",
+      "label": "HTTPS",
+      "variant": "emphasis"
+    },
+    {
+      "id": "assemble",
+      "from": "cli",
+      "to": "compose",
+      "label": "按开关装配",
+      "variant": "dashed",
+      "labelDy": 24
+    },
+    {
+      "id": "install-hooks",
+      "from": "compose",
+      "to": "hooks",
+      "label": "install×5",
+      "variant": "dashed"
+    },
+    {
+      "id": "loop-hooks",
+      "from": "loop",
+      "to": "hooks",
+      "label": "四个挂载点",
+      "labelDy": 24
+    },
+    {
+      "id": "hooks-features",
+      "from": "hooks",
+      "to": "features",
+      "label": "串行回调"
+    },
+    {
+      "id": "hooks-tools",
+      "from": "hooks",
+      "to": "tools",
+      "label": "调用前拦 / 返回后标注",
+      "labelDy": 24
+    },
+    {
+      "id": "tools-amap",
+      "from": "tools",
+      "to": "amap"
+    },
+    {
+      "id": "amap-rest",
+      "from": "amap",
+      "to": "amapapi",
+      "label": "8s 超时 + 退避"
+    },
+    {
+      "id": "compose-memory",
+      "from": "compose",
+      "to": "memory",
+      "label": "递 store",
+      "variant": "dashed"
+    },
+    {
+      "id": "compose-session",
+      "from": "compose",
+      "to": "session",
+      "label": "递 session:没它不装压缩",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "只读的那一个",
+      "items": [
+        "loop.ts 从 Step 2b 起进入只读",
+        "改它的唯一合法理由是增加挂载点",
+        "五块积木:guard / memory / compaction / confirm / trace",
+        "hooks 串行短路:第一个返回拒绝的赢"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "唯一的那几处",
+      "items": [
+        "compose.ts 唯一装配处 —— 同一处 register 了 7 个工具",
+        "model.ts 唯一 import pi-ai 函数",
+        "terminal.ts 唯一碰 process.stdin"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "两份 harness,两种写法",
+      "items": [
+        "session/ append-only:说过的话不能改",
+        "memory/ 整体重写:记住的事会被推翻",
+        "两者都不认识「旅行」"
+      ]
+    }
+  ]
+}

@@ -9,7 +9,8 @@
 [每次发给模型的 prompt 里有什么](docs/prompt.md) ·
 [prompt 缓存排查](docs/prompt-cache.md) ·
 [八个问题的答案](docs/answers/) ·
-[面试向：工具这一层的五个问题](docs/answers/for_interview.md)。
+[面试向：工具这一层的五个问题](docs/answers/for_interview.md) ·
+[四张图](docs/diagrams/)（本项目和 pi 上游各一套架构图 + 工作流图）。
 
 ## 跑
 

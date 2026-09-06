@@ -1,0 +1,345 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "pi 自己的 coding agent 架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Seaman-Li/my-pi-agent",
+      "revision": "0804573ffa49594c550e4f2be1b2c975dd77bf14"
+    },
+    "viewBox": [
+      1340,
+      700
+    ],
+    "views": [
+      {
+        "id": "layers",
+        "label": "三层怎么分",
+        "focus": [
+          "cli",
+          "session",
+          "agentcore",
+          "ai",
+          "provider"
+        ],
+        "note": "pi-ai 是 provider 边界,pi-agent-core 是通用 loop,coding-agent 才是域。"
+      },
+      {
+        "id": "capability",
+        "label": "能力从哪来",
+        "focus": [
+          "tools",
+          "skills",
+          "extensions"
+        ],
+        "note": "工具只有 7 个;要按需展开的东西做成 skill,不做成工具。"
+      },
+      {
+        "id": "durable",
+        "label": "记录与渲染",
+        "focus": [
+          "harness",
+          "tui",
+          "session"
+        ],
+        "note": "harness 记 append-only 的 records,reducer 把它还原成状态。"
+      }
+    ]
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [
+      40,
+      60
+    ],
+    "cols": 5,
+    "cellW": 200,
+    "cellH": 78,
+    "gapX": 72,
+    "gapY": 150
+  },
+  "components": [
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "coding-agent/cli",
+      "sublabel": "interactive · print · rpc",
+      "tag": "默认只开 4 个工具",
+      "row": 0,
+      "col": 0,
+      "size": [
+        180,
+        68
+      ],
+      "sources": [
+        {
+          "path": "packages/coding-agent/src/core/sdk.ts",
+          "line": 245,
+          "label": "defaultActiveToolNames"
+        }
+      ]
+    },
+    {
+      "id": "session",
+      "type": "backend",
+      "label": "AgentSession",
+      "sublabel": "一次会话的编排",
+      "tag": "steer / followUp",
+      "row": 0,
+      "col": 1,
+      "size": [
+        180,
+        68
+      ],
+      "sources": [
+        {
+          "path": "packages/coding-agent/src/core/agent-session.ts",
+          "line": 1343,
+          "label": "steer()"
+        }
+      ]
+    },
+    {
+      "id": "agentcore",
+      "type": "backend",
+      "label": "pi-agent-core",
+      "sublabel": "agent-loop:外层 + 内层",
+      "tag": "通用,不认识 coding",
+      "row": 0,
+      "col": 2,
+      "size": [
+        180,
+        68
+      ],
+      "sources": [
+        {
+          "path": "packages/agent/src/agent-loop.ts",
+          "line": 174,
+          "label": "内层循环"
+        }
+      ]
+    },
+    {
+      "id": "ai",
+      "type": "security",
+      "label": "pi-ai",
+      "sublabel": "适配 + compat + 重试",
+      "tag": "重试只在这一层",
+      "row": 0,
+      "col": 3,
+      "size": [
+        180,
+        68
+      ],
+      "sources": [
+        {
+          "path": "packages/ai/src/utils/provider-retry.ts",
+          "line": 23,
+          "label": "isRetryableProviderError"
+        }
+      ]
+    },
+    {
+      "id": "provider",
+      "type": "external",
+      "label": "LLM Provider",
+      "sublabel": "Anthropic · OpenAI · …",
+      "row": 0,
+      "col": 4,
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "tui",
+      "type": "frontend",
+      "label": "pi-tui",
+      "sublabel": "终端渲染,零依赖",
+      "row": 1,
+      "col": 0,
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "harness",
+      "type": "database",
+      "label": "agent/harness",
+      "sublabel": "records + reducer",
+      "tag": "append-only",
+      "row": 1,
+      "col": 1,
+      "size": [
+        180,
+        68
+      ]
+    },
+    {
+      "id": "tools",
+      "type": "backend",
+      "label": "core/tools",
+      "sublabel": "7 个,默认开 4 个",
+      "tag": "bash 覆盖后三个",
+      "row": 1,
+      "col": 2,
+      "size": [
+        180,
+        68
+      ],
+      "sources": [
+        {
+          "path": "packages/coding-agent/src/core/tools/index.ts",
+          "line": 83,
+          "label": "ToolName"
+        }
+      ]
+    },
+    {
+      "id": "skills",
+      "type": "cloud",
+      "label": "core/skills.ts",
+      "sublabel": "prompt 里只放三行索引",
+      "tag": "正文用 read 工具读",
+      "row": 1,
+      "col": 3,
+      "size": [
+        180,
+        68
+      ],
+      "sources": [
+        {
+          "path": "packages/coding-agent/src/core/skills.ts",
+          "line": 344,
+          "label": "用 read 加载正文"
+        }
+      ]
+    },
+    {
+      "id": "extensions",
+      "type": "messagebus",
+      "label": "core/extensions",
+      "sublabel": "外挂工具 · 命令 · hook",
+      "row": 2,
+      "col": 2,
+      "size": [
+        180,
+        68
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "通用层:换个域直接搬",
+      "wraps": [
+        "agentcore",
+        "ai",
+        "harness"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "重试与 compat 全收在 provider 边界里",
+      "wraps": [
+        "ai",
+        "provider"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "cli-session",
+      "from": "cli",
+      "to": "session",
+      "label": "起一次会话"
+    },
+    {
+      "id": "session-core",
+      "from": "session",
+      "to": "agentcore",
+      "label": "prompt()",
+      "variant": "emphasis"
+    },
+    {
+      "id": "core-ai",
+      "from": "agentcore",
+      "to": "ai",
+      "label": "streamSimple()",
+      "variant": "emphasis"
+    },
+    {
+      "id": "ai-provider",
+      "from": "ai",
+      "to": "provider",
+      "label": "408/429/5xx 重试",
+      "variant": "emphasis"
+    },
+    {
+      "id": "cli-tui",
+      "from": "cli",
+      "to": "tui",
+      "label": "渲染",
+      "labelDy": 24
+    },
+    {
+      "id": "session-harness",
+      "from": "session",
+      "to": "harness",
+      "label": "落 records",
+      "labelDy": 24
+    },
+    {
+      "id": "core-tools",
+      "from": "agentcore",
+      "to": "tools",
+      "label": "executeToolCalls",
+      "labelDy": 24
+    },
+    {
+      "id": "tools-skills",
+      "from": "tools",
+      "to": "skills",
+      "label": "read 读正文"
+    },
+    {
+      "id": "ext-tools",
+      "from": "extensions",
+      "to": "tools",
+      "label": "注册进来",
+      "variant": "dashed",
+      "labelDy": -24
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "省 schema 的办法是「工具更少」",
+      "items": [
+        "7 个工具:read bash edit write grep find ls",
+        "grep / find / ls 不在默认集里 —— bash 覆盖了它们",
+        "上游没有走「动态加载工具」这条路"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "真正的渐进式披露是 skills",
+      "items": [
+        "prompt 里只放 name / description / location 三行",
+        "正文让模型自己用 read 工具去读",
+        "索引进缓存前缀,正文按需进上下文,前缀不变"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "本图省略的两层",
+      "items": [
+        "protocol / client / server —— 同一个 agent 能跑在别处",
+        "packages/evals —— 行为 eval 用通过率,不用硬断言"
+      ]
+    }
+  ]
+}
