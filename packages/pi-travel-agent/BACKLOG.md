@@ -550,6 +550,128 @@ Step 5a 实测:Ctrl-C 打断的 turn,末行是 `1 step / in 0 / out 0 / end abor
 
 等单轮也开会话之后,这条自动就没了 —— 两条是同一个前提的两面。
 
+## `ask_user` 会把抢打的那行吃掉 —— 下一批,它现在就在错
+
+`terminal.ts` 常驻一个 `line` 监听把行接住(`:68`),`question()` 读的时候**先从缓冲里取**
+(`:130`)。实测三行在没人读的 300ms 里一条不丢:
+
+```
+$ printf 'first\nsecond\nthird\n' | (开终端 → sleep 300ms → 再读)
+  -> "first"   -> "second"   -> "third"
+```
+
+这本来是好事(TTY 上支持抢打)。**但缓冲是先到先得的,而 `ask_user` 走的是同一个
+`terminal.series`**(`terminal-asker.ts:25`)。于是:
+
+> 用户在 turn 跑到一半时随手敲了句话,而这一轮恰好触发了追问 ——
+> **那句话会变成一个他还没看见的问题的答复。**
+
+屏幕上会闪过 `? 您打算去几天?` 和一个他没打算给的答案,然后 agent 拿着错的输入接着跑。
+**静默错位,而且事后从 JSONL 里看是一次完全正常的追问。**
+
+`cli.ts:325` 早就记了管道场景的同一个坑(「`ask_user` 会把下一行当成答复吃掉,静默少跑一轮」),
+当时的结论是「管道喂进来的 chat 不算」—— 但 TTY 抢打这条路没人想到,它和管道是同一个机制。
+
+**做法**:`ask_user` 读之前把 `buffered` 清空(或者给 `series` 一个「不吃缓冲」的模式)。
+「答复一个还没显示的问题」这件事本身没有合理解释,所以清掉比留着安全。
+清掉的那几行要**打回屏幕上**说一声,不能默默丢 —— 用户敲过的字不能无声消失。
+
+**为什么排下一批**:和刚补的账目那两条一样,它不是「缺个功能」,是**现在就在给错的结果**。
+
+## 工具跑久了能不能接着聊 —— 想做再说,但先分清是哪一种
+
+2026-09-04 用户提的,来源是**拿 Claude Code 跑一个超长脚本,还没出结果就发现能接着对话**。
+
+值得先说清楚一件从外面看不出来的事:「能接着聊」至少有三种实现,**要做的东西完全不同**:
+
+| | 实际发生了什么 | 我们要做什么 |
+|---|---|---|
+| ① 排队 | 敲进去,**这轮跑完才处理** | 已经有了(见上一条) |
+| ② steering | 排队,但在**下一次 LLM 调用之前**插进去 | 一块新积木 |
+| ③ 工具本来就在后台 | 工具早返回了,对话根本没被占住 | 一套后台任务机制 |
+
+### 上限由 `messages` 的形状钉死,但「有多硬」得实测
+
+`core/context.ts:2` 那条不变量(toolCall 必须有 toolResult 配对)到底是**协议要求**
+还是**我们的洁癖**,原来这条写的是「provider 的要求,中间插 user 消息直接 400」——
+**那是没测过就写的,而且把两件事混了**。测了(2026-09-04,8 次请求,两个 provider):
+
+| 历史形状 | qwen(dashscope) | deepseek |
+|---|---|---|
+| ① `toolCall → toolResult` 正常配对 | ✅ | ✅ |
+| ② **断链**(toolCall 后面没有 toolResult) | ✅ 没报错 | ✅ 没报错 |
+| ③ **交错**(toolCall 和 toolResult 中间插 user) | ✅ 没报错 | **❌ 400** |
+| ④ **合法缝**(toolResult 之后跟 user) | ✅ | ✅ |
+
+DeepSeek 的原话:`Messages with role 'tool' must be a response to a preceding message
+with 'tool_calls'`。
+
+三条结论:
+
+- **不是「所有 provider 都 400」,是「有的会」。** 而有一家会就够了 —— 这正是 `context.ts`
+  那段注释的原话:「『这家忍了』是运气,不是契约」。**③ 这条路不能走。**
+- **qwen 那两个 ✅ 是「没报错」不是「行为对了」** —— 它把工具调用整个无视,直接去答后一句。
+  忍了 ≠ 对了,这种「静默走偏」比 400 难查得多。
+- **④ 两家都行,所以那条缝站得住。**
+
+所以**模型不可能在工具还没返回时被调用**。①②③ 里没有一种是「真并发」,
+真并发只能是两份 context、两个 loop —— 那是 subagent,不是「同一个对话里插句话」。
+
+### 上游的做法
+
+pi 把它拆成两个 API,注入点正是那条唯一的缝:
+
+| API | 什么时候送达 |
+|---|---|
+| `steer()` | 「当前这轮的工具跑完、**下一次 LLM 调用之前**」(`coding-agent/src/core/agent-session.ts:1336` 注释原文) |
+| `followUp()` | 等 agent 完全停下来 |
+
+`agent-loop.ts:182` push 进 `currentContext.messages`,队列在 `:259` drain ——
+**正好在 toolResults 全部 push 完之后**,和上面测出来的 ④ 对得上。
+
+两个细节值得抄:
+
+- `steeringMode: "all" | "one-at-a-time"`(`agent/src/agent.ts:264`)——
+  用户连打三句,是一次全塞进去,还是一轮一句。
+- **`requiresAssistantAfterToolResult`** 这个 compat 开关(`ai/src/types.ts:553`):
+  「a user message after tool results requires an assistant message in between」。
+  也就是说**有的 provider 连 ④ 都不接受**,得插一句假的 assistant 垫着 ——
+  pi 真这么干(`ai/src/api/openai-completions.ts:1094`,内容写死
+  `"I have processed the tool results."`)。默认 `false`,我们这三家都不需要,
+  **但那个开关存在就说明有人踩过**。真做 steering 时这是要留意的第二块砖,
+  好在 pi-ai 已经替我们垫好了,只要设 compat。
+
+顺带,**pi 从不产生断链,而且它补在 loop 里**:截断走
+`failToolCallsFromTruncatedMessage`(`agent-loop.ts:381`)、中断走
+`createErrorToolResult("Operation aborted")`(`:632` / `:651`),都是给每个没跑成的
+toolCall 补一条 error 结果。我们是 `repairDanglingToolCalls` 在**两轮之间**收拾 ——
+同一个不变量,位置不同,因为它的 loop 可以改而我们的只读。
+
+### 我们做 steering 不用改 loop
+
+`beforeStep` 就在那条缝上:
+
+```
+loop.ts:294   context.messages.push(...results);        ← 第 N 步的工具结果回填
+loop.ts:252   runBeforeStep(hooks, { step, context })   ← 第 N+1 步,拿到的正是回填后的 context
+loop.ts:279   stream(...)
+```
+
+而 `beforeStep` 的 handler 拿得到 `context` 并且可以改(memory 那块就在改 `systemPrompt`)。
+所以这是 `installSteering(hooks, { terminal })`,挂 `beforeStep` —— **这次不缺挂载点**。
+
+### 但要先解决:steering 会绕过 guard
+
+两道闸都**只在 `step === 1` 跑**(`guard.ts:187`),看的是 `lastUserText()`。
+steering 在第 3 步插进来的 user 消息**根本不过闸**。
+
+域外那条还好(`prompts/system.md` 是 90% 的主力)。**长度闸那条更实在** ——
+它没有第一层,是唯一防线,挡的正是「一条超长粘贴撑爆窗口,而压缩救不了
+(一条消息没法自己压自己)」。steering 一开,粘贴走这条路进来就没人看了。
+
+最省事的改法是把两道闸的判据从 `step === 1` 换成「最后一条 user 消息还没过过闸」。
+**先想清楚这个再动手** —— 不然这块积木是在给自己拆一道闸。
+
 ## turn 跑的时候敲字,提示符不会重绘 —— 想做再说
 
 终端有行缓冲(`src/terminal.ts`),所以 turn 还在跑的时候先把下一句敲进去是有效的,

@@ -24,6 +24,13 @@ import type { Context, Message, ToolCall, ToolResultMessage } from "@earendil-wo
  *   实测 dashscope 和 Ollama **都没报错**(5 次里 Ollama 有 1 次不理会新问题、
  *   把同一个工具又调了一遍)—— 但「这家忍了」是运气,不是契约。
  *   整个 core/model.ts 的存在就是为了换 provider 只动一处,不能靠某一家的宽容活着。
+ *
+ *   **2026-09-04 补测,证实了「运气」这个说法**:同样在 dashscope 和 DeepSeek 上试
+ *   「toolCall 和 toolResult 中间插一条 user 消息」——dashscope 照样不报错,
+ *   **DeepSeek 直接 400**(`Messages with role 'tool' must be a response to a preceding
+ *   message with 'tool_calls'`)。同一段畸形历史,一家忍一家不忍。
+ *   而 dashscope 那次「忍了」是把整个工具调用无视掉、直接去答后一句 ——
+ *   **忍了不等于对了,静默走偏比 400 难查得多。** 详见 BACKLOG 里 steering 那条。
  * - 语义上,模型看到自己发过调用却没有任何结果,只能猜。补一条「被中断了」
  *   是**如实告诉它发生过什么**,它下一轮才可能说「刚才查天气被打断了,要我重来吗」。
  *
