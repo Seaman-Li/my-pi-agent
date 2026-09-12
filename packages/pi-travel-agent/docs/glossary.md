@@ -41,8 +41,8 @@
 
 **`CONTEXT_WINDOW` 和 `MAX_TOKENS` 这两个数现在有三个用处**,分不清就会撞墙:
 
-1. 压缩阈值 = `(CONTEXT_WINDOW − MAX_TOKENS) × 0.8`(`features/compaction.ts:93`)
-2. 启动校验:`CONTEXT_WINDOW <= MAX_TOKENS` 直接抛(`core/model.ts:286`)
+1. 压缩阈值 = `(CONTEXT_WINDOW − MAX_TOKENS) × 0.8`(`features/compaction.ts:86`)
+2. 启动校验:`CONTEXT_WINDOW <= MAX_TOKENS` 直接抛(`core/model.ts:312`)
 3. **pi-ai 每次请求拿它俩夹一次 `max_tokens`**(`packages/ai/src/api/simple-options.ts:15`):
 
 ```
@@ -311,3 +311,127 @@ max_tokens = min(MAX_TOKENS, max(1, available))
 | `truncateLines` | 双限制截断:`{ maxLines: 12, maxBytes: 1200 }`,谁先撞上谁生效,**永不返回半行** |
 | `TripPlan` | 结构化行程的 schema。`save_plan` 的参数 |
 | `report.ts` | `TripPlan` → 自包含 HTML。每处插值要么 `esc(...)`,要么变量名以 `Html` 结尾 |
+
+---
+
+## 九、pi 自己的层级(对照用)
+
+我们这套分层是照着 pi 抄的,但**抄的是判据不是目录名**。放在这里是为了回答两个问题:
+「我这块该放哪」看不出来时去看 pi 把同类东西放哪了;以及「pi 里那个 XXX 对应我们的什么」。
+
+行数是 `wc -l` 实测(pi v0.84.1),不是估的 —— **厚度本身就是信息**:
+决策堆在哪一层,哪一层就最厚。
+
+```
+                                  人
+                                   │  按键 · 粘图 · Ctrl-C
+                                   ▼
+┌─ ① I/O 层 ───────────────────────────────────────────────────────────────
+│  packages/tui/(16202)   packages/client/   coding-agent/src/modes/(19352)
+│  认识:终端、快捷键、渲染、@补全、贴进来的图片
+│  不认识:模型是谁、工具怎么跑、会话文件长什么样
+└──────────────────────────────────┬───────────────────────────────────────
+                                   │  session.prompt("修一下这个 bug")
+                                   ▼
+┌─ ② 宿主 / 编排 ──────────────────────────────────────────────────────────
+│  coding-agent/src/core/agent-session.ts(3342)  ← 今天真正在跑的那个
+│  + session-manager.ts · model-registry.ts · config.ts · compaction/ · extensions/
+│  职责:把下面所有零件**接起来** —— 选模型、装工具、决定何时压缩、
+│        溢出了怎么重试(:1994 isContextOverflow)、事件往哪广播
+│  这是整个 pi 里最厚的一层,因为「决策」都堆在这
+└──────────────────────────────────┬───────────────────────────────────────
+                                   │  取零件 ↕
+┌─ ③ harness 零件柜 ───────────────┴───────────────────────────────────────
+│  packages/agent/src/harness/    ★ 它是**零件柜,不是框架**
+│  ┌──────────────────┬──────┬──────────────────────────────────────────┐
+│  │ session/         │ 3127 │ JSONL 会话树 · state · search · memory   │
+│  │ tools/           │ 1190 │ bash read edit write + tool-context      │
+│  │ compaction/      │ 1260 │ 压缩 + 分支摘要                          │
+│  │ skills.ts        │  375 │ 技能装载                                 │
+│  │ messages.ts      │  168 │ AgentMessage ↔ provider Message          │
+│  │ system-prompt.ts │   34 │ 系统提示词拼装                           │
+│  │ env/ utils/      │      │ Node 落地 · 输出截断                     │
+│  └──────────────────┴──────┴──────────────────────────────────────────┘
+│  ② **不是坐在它里面**,是从它里面挑 —— agent-session.ts 只 import 类型,
+│  自己另有一份 session-manager 和 compaction/(同名文件,已分叉:
+│  compaction.ts 848 vs 969,diff 657 行)
+└──────────────────────────────────┬───────────────────────────────────────
+                                   ▼
+┌─ ④ Agent:有状态的外壳 ──────────────────────────────────────────────────
+│  packages/agent/src/agent.ts(592)
+│  持有:当前 transcript · steeringQueue · followUpQueue · 事件监听器
+│  挂载点:beforeToolCall / afterToolCall / shouldStopAfterTurn /
+│          prepareNextTurn / transformContext / convertToLlm
+│  ★「工具跑久了还能接着说话」就是这一层的 steering 队列
+└──────────────────────────────────┬───────────────────────────────────────
+                                   ▼
+┌─ ⑤ runLoop:纯循环 ──────────────────────────────────────────────────────
+│  packages/agent/src/agent-loop.ts(796)
+│  while(true){ 请求 → 收流 → 执行工具 → 回填 → 排空 steering → 再来 }
+│  :167 初次取 steering  ·  :274 agent_end
+│  认识:消息、工具调用、事件  不认识:磁盘、终端、技能、压缩策略
+│  ★ 我们那份 core/loop.ts 就是照着这层写的 —— 冻住不改,只加挂载点
+└──────────────────────────────────┬───────────────────────────────────────
+                                   ▼
+┌─ ⑥ pi-ai:协议层 ────────────────────────────────────────────────────────
+│  packages/ai/(22365)
+│  api/openai-completions.ts    拼 body(:716 max_tokens 在这)
+│  api/simple-options.ts        夹 max_tokens(:15 那个 −4096)
+│  utils/overflow.ts            20+ 条正则认各家的「爆了」
+│  providers/data/*.json        ← scripts/generate-models.ts 从 models.dev 生成
+│  认识:20 多家 provider 的脾气   不认识:什么是一个 agent
+└──────────────────────────────────┬───────────────────────────────────────
+                                   ▼
+                           HTTP → DeepSeek / 通义 / Ollama …
+```
+
+### 分层的判据,三条
+
+这三条才是要抄的东西,目录名不是:
+
+```
+① 谁认识「终端」?            只有 ①。② 往下全不认识 → 所以 agent 能跑在 Slack 里
+② 谁认识「磁盘」?            ②③ 认识,④⑤⑥ 不认识 → 所以 loop 能在内存里跑测试
+③ 谁认识「provider 的脾气」? 只有 ⑥。② 只认识一个抽象的 stopReason
+```
+
+第三条正是 `*_CONTEXT_WINDOW` 那条 ⚠️ 的根:它卡在 ⑥ 里做本地算术,
+但**它描述的是 HTTP 那头的事实**。层级里没有任何一环能去核对它,所以只能靠人抄。
+
+### 我们对应到哪
+
+| pi | 我们 | 差在哪 |
+|---|---|---|
+| ①+② | `cli.ts` + `repl.ts` | 我们把 I/O 和编排合在一起了 —— 只有一种 I/O,切开没收益 |
+| ③ | `session/` `features/` `memory/` | 同构。也是零件柜,`compose()` 是取零件的地方 |
+| ④ | **没有** | 见下 |
+| ⑤ | `core/loop.ts` | 唯一一处结构完全同构 |
+| ⑥ | `core/model.ts` | 我们那层极薄:只包三个 provider,协议事实靠 `compat` 三个常量 |
+
+**我们没有 ④,这是有代价的。** pi 把「有状态外壳」单独切出来,是因为 steering 队列、
+事件广播、工具并发这些状态得有个地方住,而 `runLoop` 是个函数、住不下。
+我们现在这些状态散在 `repl.ts` 里 —— BACKLOG 里那条「工具跑久了能不能接着聊」一旦要做,
+大概率就得把这层切出来。**那不是重构,是补一层本来就该有的。**
+
+### ⚠️ `harness/` 这个目录名下住着两种东西
+
+```
+packages/agent/src/harness/agent-harness.ts(508)
+        ├── AgentLane 接口:prompt / steer / abort / compact / navigateTree …
+        ├── 22 个方法目前 throw HarnessNotImplemented   ← 骨架,不是实现
+        ├── 设计文档:packages/agent/docs/harness-v2.md
+        └── 已在用:coding-agent/src/server/create-harness.ts
+                    packages/evals/src/pi-harness.ts
+```
+
+**看到 `AgentHarness` 不要以为那是 pi 现在的主干** —— 主干是 `AgentSession`(②)。
+`harness/` 里同时住着今天就在跑的零件(`session/` `tools/` `compaction/`)
+和一个为将来准备的门面。这是读 pi 源码时最容易走错的一个岔路。
+
+v2 想解决三件事(`harness-v2.md`),对照我们:
+
+| 概念 | 一句话 | 我们有吗 |
+|---|---|---|
+| **durable run** | 崩了之后新进程能从上一个安全边界接着跑 | ❌ `--resume` 只恢复历史,恢复不了「跑到一半的 run」 |
+| **lane** | 一个 session 里多条并行的对话位置(Slack 一个 thread 一条) | ❌ 一个进程一个文件一条线 |
+| **hooks vs events** | events 只能看,hooks 能改 | ✅ `beforeStep/afterStep` 是 hooks,`EventSink` 是 events —— **这个二分抄对了** |
